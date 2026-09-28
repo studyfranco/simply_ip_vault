@@ -53,6 +53,6 @@ tempfile = "3"
 # left the whole test suite unable to compile — every gate failing before a single assertion ran.
 # A syntax checker that stops the build for reasons unrelated to syntax is worse than no checker, so
 # this one does not float.
-oxc_allocator = "0.145"
-oxc_parser = "0.145"
-oxc_span = "0.145"
+oxc_allocator = "=0.145.0"
+oxc_parser = "=0.145.0"
+oxc_span = "=0.145.0"

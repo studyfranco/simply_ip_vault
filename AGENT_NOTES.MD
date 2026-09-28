@@ -9998,3 +9998,50 @@ browser session.
 `./scripts/test_e2e.sh` **780 checks passed**, 0 failed; `./scripts/verify_convergence.sh` **63
 matching, 0 documented divergences, 0 unexplained** — peer repos pulled fresh per `AGENT.MD`
 before both the convergence run and the `.container` comparison above. `RBAC_MODEL.md` untouched.
+
+### Addendum 15 — dependency upgrade, and a pin that had quietly stopped pinning
+
+"Upgrade dependency and push" surfaced a repo mechanic worth stating plainly:
+**`Cargo.lock` is gitignored here.** `cargo update` alone therefore produces nothing to commit —
+the lockfile it rewrites was never part of the repository, so every fresh build/CI run already
+resolves each dependency's own declared requirement against whatever is newest on crates.io at
+build time. There is no repository-level "upgrade" to perform for a crate whose `Cargo.toml`
+requirement already permits its latest release, which is true of every dependency here except one.
+
+**Checked each declared requirement against `cargo info <crate>`'s latest before assuming anything
+needed a bump.** None of `axum`, `tokio`, `sea-orm`/`sea-orm-migration`, `ipnetwork`, `reqwest`,
+`tracing`/`tracing-subscriber`, `serde`/`serde_json`, `uuid`, `chrono`, `sha2`, `hmac`, `tower-http`,
+`hex`, `rand`, `thiserror`, `dotenvy`, `log`, `chacha20poly1305`, or the dev-dependency `tower` has a
+newer major/minor line than what `Cargo.toml` already declares — every one of them already tracks
+its own latest release through the requirement as written. `cargo update` (local only, not
+committed) confirmed this by refreshing ~100 transitive packages to their newest compatible patch
+versions (`sea-orm` 2.0.0 → 2.0.4 among them) with no `Cargo.toml` change needed for any of these.
+
+**The one dependency that *did* need a `Cargo.toml` change was a regression, not an upgrade.**
+Session 36 (`3ee2ddf`) deliberately pinned `oxc_allocator`/`oxc_parser`/`oxc_span`
+(`tests/frontend_syntax_test.rs`'s JS syntax checker) to an exact `=0.143.0`, specifically *because*
+`Cargo.lock` is untracked: a floating `0.x` requirement on a pre-1.0 crate is free to move under any
+build with no lockfile to hold it back, and `0.90` → `0.143` had already done exactly that once,
+renaming `ParserReturn::errors` to `diagnostics` among other breaks and failing every gate before a
+single assertion ran. Two commits on **2026-08-18** (`53ac499` "Update cargo.toml", `25a5c4d`
+"Again" — both `studyfranco`, i.e. this project's own maintainer, working directly rather than
+through an agent session) bumped the declared version twice more, `0.143` → `0.144` → `0.145`, and
+both times wrote the new version as a bare `"0.144"`/`"0.145"` — silently dropping the `=` prefix
+and reopening the exact failure mode the pin exists to close, even though the comment directly above
+it (never touched by either commit) still asserts "this is the only exact pin in the file". Found by
+`git log --follow -p -- Cargo.toml`, not assumed from the current text alone.
+
+**Fixed as part of this upgrade, not left for the next person to rediscover the same way:**
+`oxc_allocator`/`oxc_parser`/`oxc_span` restored to `"=0.145.0"` — 0.145.0 already being the newest
+release, so this is a real fix (closing the gap between the comment and the code) with no version
+change, not a downgrade. The three crates were already at 0.145.0 in the working lockfile; only the
+requirement's *shape* was wrong, not its resolved value.
+
+**Gates, run against the fully refreshed dependency tree** (not just the one `Cargo.toml` line):
+`cargo check --all-targets` clean; `cargo clippy --all-targets -- -D warnings` clean; `cargo test`
+**355 passed**, 0 failed — identical to the pre-upgrade baseline, confirming the ~100-package
+refresh introduced no behavioural change; `./scripts/test_e2e.sh` **780 checks passed**; `./scripts/
+verify_convergence.sh` **63 matching, 0 documented divergences, 0 unexplained** (peer repos
+re-pulled first, all already up to date). `RBAC_MODEL.md` untouched. `Cargo.lock` itself is not part
+of this or any commit, by the repository's own existing convention — only `Cargo.toml`'s three-line
+pin fix is.
