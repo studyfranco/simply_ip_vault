@@ -17,6 +17,7 @@ mod m20260824_093000_add_webhook_executions;
 mod m20260824_110000_webhook_execution_response_body;
 mod m20260824_140000_webhook_execution_event_context;
 mod m20260824_150000_add_query_performance_indexes;
+mod m20260926_120000_add_membership_timestamps;
 
 /// The ordered set of all schema migrations for `simply_ip_vault`.
 pub struct Migrator;
@@ -41,6 +42,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260824_110000_webhook_execution_response_body::Migration),
             Box::new(m20260824_140000_webhook_execution_event_context::Migration),
             Box::new(m20260824_150000_add_query_performance_indexes::Migration),
+            Box::new(m20260926_120000_add_membership_timestamps::Migration),
         ]
     }
 }

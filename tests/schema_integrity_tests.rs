@@ -170,6 +170,8 @@ async fn seed_record_in_group(db: &DatabaseConnection, address: &str, group: Uui
     ip_record_group_membership::Entity::insert(ip_record_group_membership::ActiveModel {
         ip_record_id: Set(id),
         group_id: Set(group),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+        updated_at: Set(chrono::Utc::now().naive_utc()),
     })
     .exec(db)
     .await
@@ -426,6 +428,8 @@ async fn deleting_a_group_cascades_to_permissions_memberships_and_webhooks() {
     ip_record_group_membership::Entity::insert(ip_record_group_membership::ActiveModel {
         ip_record_id: Set(record),
         group_id: Set(survivor),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+        updated_at: Set(chrono::Utc::now().naive_utc()),
     })
     .exec(&db)
     .await
@@ -682,6 +686,8 @@ async fn deletes_across_the_whole_schema_leave_no_orphans() {
     ip_record_group_membership::Entity::insert(ip_record_group_membership::ActiveModel {
         ip_record_id: Set(record),
         group_id: Set(group_b),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+        updated_at: Set(chrono::Utc::now().naive_utc()),
     })
     .exec(&db)
     .await
@@ -804,6 +810,8 @@ async fn deleting_a_key_and_a_group_leaves_no_orphans_in_either_join_table() {
     ip_record_group_membership::Entity::insert(ip_record_group_membership::ActiveModel {
         ip_record_id: Set(record),
         group_id: Set(surviving_group),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+        updated_at: Set(chrono::Utc::now().naive_utc()),
     })
     .exec(&db)
     .await
@@ -1078,17 +1086,23 @@ async fn the_audit_rebuild_preserved_both_indexes() {
     );
 }
 
-/// **`GET /api/ips`'s join, filtered on `is_deleted`, sorted on `updated_at` — and a group-scoped
-/// membership lookup — must use an index for both the filter and the sort, and must never fall back
-/// to a full table scan.**
+/// **`GET /api/ips`'s join, filtered on `is_deleted` and (usually) `group_id`, sorted on the
+/// *membership's* `updated_at` — and a bare group-scoped membership lookup — must use an index for
+/// the filter and the sort, and must never fall back to a full table scan.**
 ///
 /// `has_index` (above) only proves an index *exists*; it says nothing about whether the query
 /// planner actually reaches for it, which is the property that was actually missing (production
 /// logs reported 20-42s on exactly this join under load) and the property `m20260824_150000`'s own
-/// module header verified empirically before writing the migration. `EXPLAIN QUERY PLAN`'s output
-/// is the only source of truth for that — `USE TEMP B-TREE FOR ORDER BY` and `SCAN <table>` are the
-/// two lines whose *absence* this test pins, so a future migration or query rewrite that
+/// module header verified empirically before writing the migration it added. `EXPLAIN QUERY PLAN`'s
+/// output is the only source of truth for that — `USE TEMP B-TREE FOR ORDER BY` and `SCAN <table>`
+/// are the two lines whose *absence* this test pins, so a future migration or query rewrite that
 /// reintroduces either regresses loudly here rather than silently in production.
+///
+/// Updated by `m20260926_120000`: `list_ips` now sorts on `ip_record_group_memberships.updated_at`,
+/// not `ip_records.updated_at` (see that migration's module comment for why), so the query shapes
+/// pinned here changed to match. Three shapes, not two — the group-scoped shape *replaces* the old
+/// two-shape coverage; the unfiltered shape is new and pins a real, accepted trade-off rather than
+/// silently losing coverage of it.
 #[tokio::test]
 async fn list_ips_query_plan_uses_indexes_not_a_temp_b_tree_or_table_scan() {
     let tmp = TempDb::new();
@@ -1106,41 +1120,75 @@ async fn list_ips_query_plan_uses_indexes_not_a_temp_b_tree_or_table_scan() {
         }
     };
 
-    // The exact join shape `list_ips` builds via `find_also_related` + `filter(IsDeleted)` +
-    // `order_by_desc(UpdatedAt)` — reproduced as raw SQL because `EXPLAIN QUERY PLAN` has no SeaORM
-    // query-builder equivalent to prefix onto a `Select`.
-    let join_plan = plan_lines(
+    // The common, group-scoped shape: every non-master call, and every `groups=`/`group_id=`/
+    // `status=`-filtered one, carries a `group_id` predicate alongside `is_deleted`. Reproduced as
+    // raw SQL because `EXPLAIN QUERY PLAN` has no SeaORM query-builder equivalent to prefix onto a
+    // `Select`.
+    let scoped_plan = plan_lines(
         &db,
         "EXPLAIN QUERY PLAN \
          SELECT * FROM ip_record_group_memberships \
          LEFT JOIN ip_records ON ip_records.id = ip_record_group_memberships.ip_record_id \
          WHERE ip_records.is_deleted = false \
-         ORDER BY ip_records.updated_at DESC \
+         AND ip_record_group_memberships.group_id = '00000000-0000-0000-0000-000000000000' \
+         ORDER BY ip_record_group_memberships.updated_at DESC \
          LIMIT 50 OFFSET 0",
     )
     .await;
     assert!(
-        join_plan.iter().any(|l| l.contains("idx_ip_records_deleted_updated")),
-        "the join must use the composite (is_deleted, updated_at) index: {join_plan:?}"
+        scoped_plan.iter().any(|l| l.contains("idx_membership_group_updated")),
+        "a group-scoped listing must use the (group_id, updated_at) composite: {scoped_plan:?}"
     );
     assert!(
-        !join_plan.iter().any(|l| l.contains("TEMP B-TREE")),
-        "the composite index must make a separate sort step unnecessary: {join_plan:?}"
+        !scoped_plan.iter().any(|l| l.contains("TEMP B-TREE")),
+        "the composite index must make a separate sort step unnecessary for the common, \
+         group-scoped case: {scoped_plan:?}"
     );
     assert!(
-        !join_plan.iter().any(|l| l.contains("SCAN ip_records")),
-        "ip_records must be reached by SEARCH (index), never a full SCAN: {join_plan:?}"
+        !scoped_plan.iter().any(|l| l.contains("SCAN ip_record_group_memberships") || l.contains("SCAN ip_records")),
+        "neither table may be reached by a full SCAN: {scoped_plan:?}"
     );
 
-    // The group-scoped lookup every RBAC accessible-groups filter (and `groups=`/`group_id=`)
-    // performs — `WHERE group_id = ?` alone, the shape the membership table's primary key
-    // (`ip_record_id, group_id` — the *other* column order) cannot serve.
+    // The unfiltered shape: a master browsing every group at once, with no `group_id` predicate to
+    // drive either side of the join. **Documented trade-off, not a regression to chase down.** No
+    // index on `ip_record_group_memberships` can drive this query from the `ip_records` side (where
+    // `is_deleted` lives) while also supplying pre-sorted order on `updated_at` (which lives on
+    // the *other* table) — a single-table index cannot span both. Verified by trying anyway: adding
+    // a bare `(updated_at DESC)` index changed nothing about this specific plan. The old
+    // `ip_records`-driven, record-level sort avoided this by living entirely on one table, at the
+    // cost of the correctness bug `m20260926_120000` exists to fix; this is the accepted trade for
+    // that fix. Bounded in practice by `LIMIT 50` and by this being the *unfiltered* master view
+    // specifically, not the common path.
+    let unfiltered_plan = plan_lines(
+        &db,
+        "EXPLAIN QUERY PLAN \
+         SELECT * FROM ip_record_group_memberships \
+         LEFT JOIN ip_records ON ip_records.id = ip_record_group_memberships.ip_record_id \
+         WHERE ip_records.is_deleted = false \
+         ORDER BY ip_record_group_memberships.updated_at DESC \
+         LIMIT 50 OFFSET 0",
+    )
+    .await;
+    assert!(
+        unfiltered_plan.iter().any(|l| l.contains("TEMP B-TREE")),
+        "if this ever stops needing a temp b-tree, the trade-off above no longer holds and this \
+         test (and its doc comment) should be simplified rather than left describing a cost that \
+         went away: {unfiltered_plan:?}"
+    );
+
+    // The bare group-scoped lookup every RBAC accessible-groups filter (and the `full_replace`
+    // sweep) performs — `WHERE group_id = ?` alone, the shape the membership table's primary key
+    // (`ip_record_id, group_id` — the *other* column order) cannot serve. Two indexes now lead
+    // with `group_id` (the pre-existing `idx_group_memberships_lookup` and the new
+    // `idx_membership_group_updated`), and on an empty, unanalyzed test database the planner's
+    // choice between two otherwise-equivalent options isn't a property worth pinning by name —
+    // only "no full scan" is.
     let group_lookup_plan =
         plan_lines(&db, "EXPLAIN QUERY PLAN SELECT * FROM ip_record_group_memberships WHERE group_id = '00000000-0000-0000-0000-000000000000'")
             .await;
     assert!(
-        group_lookup_plan.iter().any(|l| l.contains("idx_group_memberships_lookup")),
-        "the group_id lookup must use idx_group_memberships_lookup: {group_lookup_plan:?}"
+        group_lookup_plan.iter().any(|l| l.contains("idx_group_memberships_lookup") || l.contains("idx_membership_group_updated")),
+        "the group_id lookup must use one of the group_id-leading indexes: {group_lookup_plan:?}"
     );
     assert!(
         !group_lookup_plan.iter().any(|l| l.contains("SCAN")),
@@ -1148,26 +1196,29 @@ async fn list_ips_query_plan_uses_indexes_not_a_temp_b_tree_or_table_scan() {
     );
 }
 
-/// **`list_ips`'s query, at a size where a missing index is no longer a rounding error.**
+/// **`list_ips`'s unfiltered (no `group_id`) query, at a size where a missing index is no longer a
+/// rounding error — now measuring an accepted trade-off rather than proving it away.**
 ///
 /// The reported production symptom was 20-42 *seconds*, not milliseconds — which means the bound
 /// worth asserting is "unmistakably fast", not a specific fractional-millisecond figure. A literal
 /// sub-millisecond assertion would be dishonest here: this path runs through SeaORM's query
 /// builder, sqlx's async row mapping, and a pooled connection acquisition, all of which cost more
-/// than the index lookup itself does — asserting a number that tight would either be flaky on a
-/// loaded CI runner or, worse, coincidentally pass on `sqlite::memory:`'s page cache in a way that
-/// says nothing about the indexes actually being used (that property is `EXPLAIN QUERY PLAN`'s job,
-/// pinned by the test above — this one is about wall-clock time at realistic scale, the two
-/// properties are complementary, not substitutes for each other).
+/// than the index lookup itself does.
 ///
-/// 50ms and 50,000 rows are not arbitrary — smaller values were tried first and rejected because
-/// they did not actually discriminate: at 5,000 rows this same query completed in well under 50ms
-/// *even with `idx_ip_records_deleted_updated` removed*, which would have made this a test that
-/// always passes regardless of whether the index exists — worse than no test, since it looks like
-/// coverage. Confirmed by mutation at the row count actually committed here: with the index
-/// removed, the same 50,000-row query took ~77ms (fails); restored, ~3ms (passes with room to
-/// spare) — a ~26x difference at a scale still small enough for this test to seed and run in under
-/// two seconds.
+/// This is the **one query shape** (`is_deleted` + `ORDER BY`, no `group_id` predicate — a master
+/// browsing every group at once) that `m20260926_120000` could not give a temp-b-tree-free plan:
+/// see `list_ips_query_plan_uses_indexes_not_a_temp_b_tree_or_table_scan`'s own doc comment for why
+/// no single-table index can drive this join *and* supply pre-sorted order once the filter and the
+/// sort live on opposite sides of it. That migration measured **~67ms** here (up from ~3ms when
+/// this same shape could still use `idx_ip_records_deleted_updated`, before it was removed as
+/// dead weight — see that migration's module comment). The bound below is set with real margin
+/// above that measurement, because the property worth pinning is "still nowhere near the reported
+/// 20-42 *seconds*", not "as fast as the now-impossible fully-indexed plan used to be" — this test
+/// would need rewriting, not just a smaller number, if that ever became untrue.
+///
+/// 50,000 rows is not arbitrary: a scale still small enough to seed and run in under two seconds,
+/// while large enough that a real regression (a full table scan, say) would be unmistakable rather
+/// than lost in fixed overhead.
 #[tokio::test]
 async fn list_ips_query_completes_quickly_at_realistic_scale() {
     let tmp = TempDb::new();
@@ -1208,6 +1259,8 @@ async fn list_ips_query_completes_quickly_at_realistic_scale() {
             membership_models.push(ip_record_group_membership::ActiveModel {
                 ip_record_id: Set(id),
                 group_id: Set(group_id),
+                created_at: Set(updated_at),
+                updated_at: Set(updated_at),
             });
         }
     }
@@ -1230,7 +1283,7 @@ async fn list_ips_query_completes_quickly_at_realistic_scale() {
     let page = ip_record_group_membership::Entity::find()
         .find_also_related(ip_record::Entity)
         .filter(ip_record::Column::IsDeleted.eq(false))
-        .order_by_desc(ip_record::Column::UpdatedAt)
+        .order_by_desc(ip_record_group_membership::Column::UpdatedAt)
         .limit(50)
         .offset(0)
         .all(&db)
@@ -1246,9 +1299,11 @@ async fn list_ips_query_completes_quickly_at_realistic_scale() {
 
     assert_eq!(page.len(), 50, "a full page of results at this row count");
     assert!(
-        elapsed < std::time::Duration::from_millis(50),
-        "list_ips's query took {elapsed:?} against {} seeded records — the composite index should \
-         make this fast regardless of row count, not merely tolerable",
+        elapsed < std::time::Duration::from_millis(500),
+        "list_ips's unfiltered query took {elapsed:?} against {} seeded records — measured at \
+         ~67ms on this machine (a temp-b-tree sort, the accepted trade-off this test's own doc \
+         comment explains), so 500ms is a generous margin against CI variance, not the honest \
+         average; nowhere near the reported 20-42 *seconds* either way",
         GROUPS * RECORDS_PER_GROUP
     );
 }
@@ -1323,6 +1378,8 @@ async fn list_ips_include_total_count_scales_with_the_callers_own_rows_not_the_w
             membership_models.push(ip_record_group_membership::ActiveModel {
                 ip_record_id: Set(id),
                 group_id: Set(group_id),
+                created_at: Set(updated_at),
+                updated_at: Set(updated_at),
             });
         }
     }
@@ -1425,7 +1482,7 @@ async fn list_ips_complex_filters_produce_one_group_id_predicate_not_several() {
     let data_sql = ip_record_group_membership::Entity::find()
         .find_also_related(ip_record::Entity)
         .filter(condition.clone())
-        .order_by_desc(ip_record::Column::UpdatedAt)
+        .order_by_desc(ip_record_group_membership::Column::UpdatedAt)
         .limit(50)
         .offset(0)
         .build(DbBackend::Sqlite)
@@ -1502,6 +1559,161 @@ async fn rows_written_before_the_constraint_are_backfilled_not_dropped() {
         row.client_ip.parse::<std::net::IpAddr>().is_err(),
         "the fallback must not be mistakable for a real address — a reader has to be able to tell \
          'not recorded' from 'recorded as this'"
+    );
+}
+
+/// **A production database upgrading through `m20260926_120000`, with real pre-existing data —
+/// specifically including an address that already belongs to more than one group.**
+///
+/// Every other test in this file builds its fixture *after* all migrations have run. This one
+/// does the opposite on purpose: it seeds two IP groups, an address linked into **both** of them,
+/// and a second address linked into only one, all under the schema exactly as it stood immediately
+/// before this migration (`ip_record_group_memberships` with only its two original columns,
+/// inserted via raw SQL since that shape no longer exists in `src/entities/` to build against) —
+/// then applies the migration and checks what a live upgrade would actually do to that data.
+///
+/// This is the scenario the migration's own module comment describes as "approximate": a
+/// pre-existing membership has no true creation/touch history to recover, so both columns are
+/// backfilled from the *record's* `created_at`/`updated_at`. For a record in two groups, that
+/// means **both** memberships receive the identical backfilled value — correctly, since that value
+/// is genuinely the best available answer for both, and the two are expected to diverge only from
+/// this point forward as real per-membership activity accumulates. Asserted explicitly rather than
+/// assumed, because "the fix" without this test would only have been verified for the single-group
+/// case every other fixture in this file happens to construct.
+#[tokio::test]
+async fn upgrading_a_populated_database_backfills_every_membership_including_multi_group_ones() {
+    use sea_orm_migration::MigratorTrait;
+
+    let tmp = TempDb::new();
+    let db = partial_migration_db(&tmp).await;
+
+    // Everything up to and including m20260824_150000 (the 16th migration), but not this one.
+    simply_ip_vault::migration::Migrator::up(&db, Some(16)).await.expect("sixteen migrations apply");
+
+    let group_a = seed_group(&db, "prod-group-a", None).await;
+    let group_b = seed_group(&db, "prod-group-b", None).await;
+
+    // A record that has existed for a while and was touched more recently — distinct, recognizable
+    // values so a wrong column (or a transposition) would be visible, not coincidentally correct.
+    let shared_created = chrono::NaiveDateTime::parse_from_str("2026-06-01 08:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+    let shared_updated = chrono::NaiveDateTime::parse_from_str("2026-08-15 12:30:00", "%Y-%m-%d %H:%M:%S").unwrap();
+    let shared_record = Uuid::new_v4();
+    simply_ip_vault::entities::ip_record::Entity::insert(simply_ip_vault::entities::ip_record::ActiveModel {
+        id: Set(shared_record),
+        target_address: Set("203.0.113.50".to_owned()),
+        cause: Set(Some("production seed".to_owned())),
+        is_locked: Set(false),
+        created_at: Set(shared_created),
+        updated_at: Set(shared_updated),
+        last_seen_at: Set(shared_updated),
+        is_deleted: Set(false),
+        deleted_at: Set(None),
+        deleted_by: Set(None),
+    })
+    .exec(&db)
+    .await
+    .expect("the record inserts under the pre-migration schema");
+
+    // A second, single-group record, so the test also covers the ordinary case alongside the
+    // multi-group one rather than only the latter.
+    let solo_created = chrono::NaiveDateTime::parse_from_str("2026-07-01 09:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+    let solo_updated = chrono::NaiveDateTime::parse_from_str("2026-08-20 16:45:00", "%Y-%m-%d %H:%M:%S").unwrap();
+    let solo_record = Uuid::new_v4();
+    simply_ip_vault::entities::ip_record::Entity::insert(simply_ip_vault::entities::ip_record::ActiveModel {
+        id: Set(solo_record),
+        target_address: Set("203.0.113.51".to_owned()),
+        cause: Set(None),
+        is_locked: Set(false),
+        created_at: Set(solo_created),
+        updated_at: Set(solo_updated),
+        last_seen_at: Set(solo_updated),
+        is_deleted: Set(false),
+        deleted_at: Set(None),
+        deleted_by: Set(None),
+    })
+    .exec(&db)
+    .await
+    .expect("the second record inserts");
+
+    // Three membership rows, under the OLD two-column shape — raw SQL because the current
+    // `ip_record_group_membership::ActiveModel` already requires `created_at`/`updated_at` and
+    // cannot express a row the pre-migration schema would accept.
+    for (record, group) in [(shared_record, group_a), (shared_record, group_b), (solo_record, group_a)] {
+        db.execute_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            format!(
+                "INSERT INTO ip_record_group_memberships (ip_record_id, group_id) VALUES (x'{}', x'{}')",
+                record.simple(),
+                group.simple()
+            ),
+        ))
+        .await
+        .expect("the old schema accepts a membership row with no timestamps");
+    }
+
+    // The upgrade.
+    simply_ip_vault::migration::Migrator::up(&db, None).await.expect("the membership-timestamp migration applies");
+
+    // Nothing lost, nothing duplicated: exactly the three memberships seeded above, still linking
+    // the same (record, group) pairs.
+    let all_memberships = simply_ip_vault::entities::ip_record_group_membership::Entity::find()
+        .all(&db)
+        .await
+        .expect("memberships are still queryable through the new entity shape");
+    assert_eq!(all_memberships.len(), 3, "no membership row was lost or duplicated by the rebuild");
+
+    let shared_memberships: Vec<_> = all_memberships.iter().filter(|m| m.ip_record_id == shared_record).collect();
+    assert_eq!(shared_memberships.len(), 2, "the multi-group record must still hold both of its memberships");
+    let shared_groups: std::collections::HashSet<Uuid> = shared_memberships.iter().map(|m| m.group_id).collect();
+    assert_eq!(shared_groups, [group_a, group_b].into(), "linked to exactly the two groups seeded, no others");
+
+    // The multi-group case this test exists for: BOTH of the shared record's memberships were
+    // backfilled from that same record, and therefore agree with each other and with the record.
+    for m in &shared_memberships {
+        assert_eq!(m.created_at, shared_created, "backfilled created_at must match the record's own, for group {}", m.group_id);
+        assert_eq!(m.updated_at, shared_updated, "backfilled updated_at must match the record's own, for group {}", m.group_id);
+    }
+
+    let solo_membership = all_memberships
+        .iter()
+        .find(|m| m.ip_record_id == solo_record)
+        .expect("the single-group record's membership survives too");
+    assert_eq!(solo_membership.group_id, group_a);
+    assert_eq!(solo_membership.created_at, solo_created);
+    assert_eq!(solo_membership.updated_at, solo_updated);
+
+    // Foreign keys still function post-rebuild: deleting the shared record must cascade and leave
+    // group_b with none of its memberships, not an orphaned row.
+    simply_ip_vault::entities::ip_record::Entity::delete_by_id(shared_record)
+        .exec(&db)
+        .await
+        .expect("the delete succeeds");
+    let remaining = simply_ip_vault::entities::ip_record_group_membership::Entity::find()
+        .filter(simply_ip_vault::entities::ip_record_group_membership::Column::IpRecordId.eq(shared_record))
+        .all(&db)
+        .await
+        .expect("query succeeds");
+    assert!(remaining.is_empty(), "ON DELETE CASCADE must still cascade after the rebuild");
+
+    // The index swap actually happened: the new composite exists, and the one built solely for the
+    // record-level sort this migration retires does not.
+    assert!(
+        simply_ip_vault::db::has_index(&db, "ip_record_group_memberships", "idx_membership_group_updated")
+            .await
+            .unwrap(),
+        "the new (group_id, updated_at) composite must exist after the upgrade"
+    );
+    assert!(
+        simply_ip_vault::db::has_index(&db, "ip_record_group_memberships", "idx_group_memberships_lookup")
+            .await
+            .unwrap(),
+        "the pre-existing group_id lookup index must survive the rebuild"
+    );
+    assert!(
+        !simply_ip_vault::db::has_index(&db, "ip_records", "idx_ip_records_deleted_updated")
+            .await
+            .unwrap(),
+        "the index built for the record-level sort this migration retires must be gone, not just unused"
     );
 }
 

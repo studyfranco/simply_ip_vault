@@ -157,6 +157,8 @@ async fn insert_ip_record(db: &DatabaseConnection, address: &str, group_id: Uuid
     simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
         ip_record_id: Set(id),
         group_id: Set(group_id),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+        updated_at: Set(chrono::Utc::now().naive_utc()),
     }
     .insert(db)
     .await

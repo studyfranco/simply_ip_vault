@@ -52,10 +52,17 @@ body {
 
 /* ─── Layout ────────────────────────────────────────────── */
 
+/* Fluid up to a generous cap rather than a fixed 1280px: on anything narrower than the cap the
+   container simply fills the viewport (minus the clamped side padding below), so a 1440px/1920px
+   display is not left with hundreds of pixels of dead margin either side. The cap itself (1800px)
+   stops content over-stretching into unreadable full-bleed rows on a truly ultra-wide (3440px+)
+   display — fluid does not mean unbounded. Converged with `simply_hook_executor`, this ecosystem's
+   gold-standard peer (`AGENT.MD`), which made this same change first. */
 .container {
-    max-width: 1280px;
+    max-width: 1800px;
+    width: 100%;
     margin: 0 auto;
-    padding: 2rem;
+    padding: 2rem clamp(1rem, 3vw, 4rem);
     transition: opacity var(--transition-slow), transform var(--transition-slow);
 }
 
@@ -502,6 +509,17 @@ body {
     border-radius: var(--radius);
     box-shadow: var(--shadow-lg);
     padding: 0.25rem;
+}
+
+/* Toggled by `SearchableSelect.positionMenu()` in app.js when opening below the input would run
+   past the bottom of the viewport and there is more room above it instead — a combobox can sit
+   anywhere on a scrollable page (e.g. "Manage Group Rights", often the last control before the
+   fold), and `top`/`bottom` are mutually exclusive here on purpose: the element only ever anchors
+   to one edge of `.combobox` at a time. `max-height` itself is set inline per-open (how much room
+   is actually available), not here. */
+.combobox-menu.combobox-menu-above {
+    top: auto;
+    bottom: calc(100% + 4px);
 }
 
 .combobox-option {

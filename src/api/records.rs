@@ -315,21 +315,32 @@ pub(crate) async fn handle_ip_upsert(
         }
     }
 
+    // Read before the write, not inferred from an affected-row count: the membership row now
+    // carries its own `created_at`/`updated_at` (`m20260926_120000`), and the upsert below always
+    // touches a row — insert *or* update — so `exec_without_returning`'s row count can no longer
+    // distinguish the two the way a `DO NOTHING` conflict used to. An explicit read is also what
+    // lets `created_at` survive a re-registration into the same group: it is set only on the insert
+    // branch and never included in the conflict's `update_column` list below.
+    let membership_is_new = ip_record_group_membership::Entity::find_by_id((record_id, target_group_id))
+        .one(&txn)
+        .await?
+        .is_none();
+
     let mem = ip_record_group_membership::ActiveModel {
         ip_record_id: Set(record_id),
         group_id: Set(target_group_id),
+        created_at: Set(now),
+        updated_at: Set(now),
     };
-    // `exec_without_returning` is required here (not `exec`): when `DO NOTHING` actually
-    // suppresses the insert because the membership already exists, there is no row to return,
-    // and SeaORM's `exec` treats that as `DbErr::RecordNotInserted` ("None of the records are
-    // inserted") instead of the no-op success it actually is. For a single-row `Insert`, it
-    // returns the affected-row count directly as a `u64`, which doubles as the add-vs-update
-    // signal below: 1 means this (address, group) pairing is genuinely new, 0 means `DO NOTHING`
-    // suppressed it because the address was already a member of this exact group.
-    let mem_result = ip_record_group_membership::Entity::insert(mem)
+    // Upsert, not `DO NOTHING`: a re-registration into a group the address already belongs to is a
+    // real touch of *that group's* membership and must advance its `updated_at` — the whole point
+    // of moving these columns onto the membership row in the first place (see the migration's
+    // module comment). `created_at` is deliberately absent from `update_column`, so a conflict
+    // leaves it exactly as first recorded.
+    ip_record_group_membership::Entity::insert(mem)
         .on_conflict(
             OnConflict::columns([ip_record_group_membership::Column::IpRecordId, ip_record_group_membership::Column::GroupId])
-                .do_nothing()
+                .update_column(ip_record_group_membership::Column::UpdatedAt)
                 .to_owned()
         )
         .exec_without_returning(&txn)
@@ -340,7 +351,7 @@ pub(crate) async fn handle_ip_upsert(
     // Group B's perspective (and Group B's webhooks) even though the `ip_record` row itself
     // already existed — only a re-registration into a group it's *already* a member of is a true
     // `IP_UPDATE`.
-    let action = if mem_result > 0 { "IP_ADD" } else { "IP_UPDATE" };
+    let action = if membership_is_new { "IP_ADD" } else { "IP_UPDATE" };
 
     create_audit_log(
         &txn,
@@ -449,11 +460,23 @@ pub struct IpRecordResponse {
     pub cause: Option<String>,
     /// Lock status
     pub is_locked: bool,
-    /// Created at
+    /// When this record was linked into **this row's group** (`ip_record_group_memberships.created_at`,
+    /// `m20260926_120000`) — not when the underlying address was first ever seen anywhere, which can
+    /// be much earlier for an address that already belonged to another group. An address in three
+    /// groups has one `ip_records` row but three distinct membership rows, and each carries its own
+    /// history; this is that group's own.
     pub created_at: chrono::NaiveDateTime,
-    /// Updated at
+    /// When this record was last re-registered **into this row's group specifically**
+    /// (`ip_record_group_memberships.updated_at`). Re-registering the same address into a
+    /// *different* group does not advance this field — that is the property it exists to provide.
+    /// Before `m20260926_120000` this field echoed the shared `ip_records.updated_at`, which made
+    /// every group an address belonged to look freshly touched whenever *any* of them was, and made
+    /// `since`-based delta sync (below) report spurious changes to groups nothing happened in.
     pub updated_at: chrono::NaiveDateTime,
-    /// Last seen at
+    /// Last seen at — the underlying address's own freshness, **not** scoped to this group. Used by
+    /// `max_age`, which is deliberately an address-wide question ("is this address still active
+    /// anywhere") rather than a per-membership one; unlike `created_at`/`updated_at` above, this
+    /// field is unaffected by which group re-registered the address.
     pub last_seen_at: chrono::NaiveDateTime,
     /// Whether the record is soft-deleted. Always `false` in a normal listing; `true` only appears
     /// under `include_deleted=true`.
@@ -680,28 +703,36 @@ pub async fn list_ips(
         condition = condition.add(ip_record::Column::LastSeenAt.gte(threshold));
     }
 
-    // The differential-sync cutoff. Two columns can put a record on the near side of it, and using
-    // only the first was a bug that made deletions unreplicable.
+    // The differential-sync cutoff. Two columns can put a record in scope, and using only one was a
+    // bug that made deletions unreplicable — see below.
     //
-    // `last_seen_at` records when the address was last *observed*; soft delete deliberately does not
-    // touch it, because a deleted record is not a re-sighting and conflating the two would corrupt
-    // the field's meaning. But that left the tombstone unreachable: an address last seen at T0 and
-    // deleted at T1 failed `last_seen_at >= since` for every cutoff after T0, so no differential
-    // consumer could ever learn the deletion had happened. Worse, the divergence was *permanent* —
-    // `last_seen_at` only moves forward on re-registration, which by definition never happens to a
-    // deleted record, so no later poll could correct it either. Exporters kept stale entries
-    // indefinitely.
+    // The primary arm reads the **membership's own** `updated_at` (`m20260926_120000`), not the
+    // shared `ip_records.updated_at` it used to: an address re-registered into Group A must not
+    // look changed to a consumer polling `since=` scoped to Group B, since nothing about Group B's
+    // membership happened. Re-registering into a group the address already belongs to advances
+    // that *same* group's membership `updated_at` (see `handle_ip_upsert`'s upsert), so a poll
+    // scoped to that group still sees the change exactly as before — only the cross-group leak is
+    // closed.
     //
-    // So a record is in scope when **either** timestamp crosses the cutoff. The deletion arm is
-    // gated on `include_deleted` rather than applied unconditionally: without the flag a tombstone
-    // must stay invisible exactly as it does in an unfiltered listing, and matching on `deleted_at`
-    // there would leak the trash into ordinary reads for anyone who passed `since`.
+    // The deletion arm is unchanged and still reads `ip_records.deleted_at`: a soft delete removes
+    // the address from *every* group's view at once (`RBAC_MODEL.md`/`AGENT.MD` §3's soft-delete
+    // lifecycle is a whole-record operation, not a per-membership one — see `delete_ip_record`), so
+    // the tombstone is correctly a record-level, not membership-level, event. Before this migration
+    // the deletion arm was also the one that made a delta-sync consumer's `last_seen_at`-based
+    // primary arm insufficient on its own: soft delete deliberately does not touch `last_seen_at`
+    // (a delete is not a re-sighting), so an address last seen at T0 and deleted at T1 would fail
+    // `last_seen_at >= since` for every cutoff after T0, and — since `last_seen_at` only moves
+    // forward on re-registration, which by definition never happens to a deleted record — no later
+    // poll could ever correct that either. So a record is in scope when **either** arm crosses the
+    // cutoff. The deletion arm stays gated on `include_deleted`, same as before: without the flag a
+    // tombstone must stay invisible exactly as it does in an unfiltered listing, and matching on
+    // `deleted_at` there would leak the trash into ordinary reads for anyone who passed `since`.
     if let Some(since) = filters.since {
         let threshold = chrono::DateTime::from_timestamp(since, 0)
             .ok_or_else(|| AppError::InvalidInput("Invalid `since` timestamp".to_owned()))?
             .naive_utc();
 
-        let mut window = Condition::any().add(ip_record::Column::LastSeenAt.gte(threshold));
+        let mut window = Condition::any().add(ip_record_group_membership::Column::UpdatedAt.gte(threshold));
         if include_deleted {
             window = window.add(
                 Condition::all()
@@ -747,11 +778,15 @@ pub async fn list_ips(
             .await?;
         let total = count.unwrap_or(0).max(0) as u64;
 
-        // Latest activity first: whichever record was most recently added or re-registered (a ban
-        // "renewed" by a fresh match) sorts to the top, matching AGENT.MD's ordering requirement.
+        // Latest activity first: whichever (record, group) pairing was most recently added or
+        // re-registered (a ban "renewed" by a fresh match into *this* group) sorts to the top,
+        // matching AGENT.MD's ordering requirement. Sorts on the membership's own `updated_at`
+        // (`m20260926_120000`), not the shared record's — see this file's `since` comment above for
+        // why a record-level column made every group an address belonged to reorder whenever any
+        // one of them changed.
         let page = query
             .filter(condition)
-            .order_by_desc(ip_record::Column::UpdatedAt)
+            .order_by_desc(ip_record_group_membership::Column::UpdatedAt)
             .limit(limit)
             .offset(offset)
             .all(&txn)
@@ -762,7 +797,7 @@ pub async fn list_ips(
     } else {
         let page = query
             .filter(condition)
-            .order_by_desc(ip_record::Column::UpdatedAt)
+            .order_by_desc(ip_record_group_membership::Column::UpdatedAt)
             .limit(limit)
             .offset(offset)
             .all(&state.db)
@@ -797,8 +832,9 @@ pub async fn list_ips(
             group_type: group.group_type,
             cause: record.cause,
             is_locked: record.is_locked,
-            created_at: record.created_at,
-            updated_at: record.updated_at,
+            // From the membership row, not the record — see `IpRecordResponse::created_at`'s doc.
+            created_at: mem.created_at,
+            updated_at: mem.updated_at,
             last_seen_at: record.last_seen_at,
             is_deleted: record.is_deleted,
             deleted_at: record.deleted_at,
@@ -1585,10 +1621,23 @@ pub async fn batch_records(
             }
         };
 
-        let linked = ip_record_group_membership::Entity::insert(
+        // Read before the write, same reasoning as `handle_ip_upsert`: the upsert below always
+        // touches a row, so the affected-row count can no longer distinguish "linked for the first
+        // time" from "already linked, touched again" the way a `DO NOTHING` conflict's count used to.
+        let membership_is_new = ip_record_group_membership::Entity::find_by_id((record_id, group.id))
+            .one(&txn)
+            .await?
+            .is_none();
+        if membership_is_new {
+            summary.linked += 1;
+        }
+
+        ip_record_group_membership::Entity::insert(
             ip_record_group_membership::ActiveModel {
                 ip_record_id: Set(record_id),
                 group_id: Set(group.id),
+                created_at: Set(input.created_at.unwrap_or(now)),
+                updated_at: Set(input.updated_at.unwrap_or(now)),
             },
         )
         .on_conflict(
@@ -1596,19 +1645,22 @@ pub async fn batch_records(
                 ip_record_group_membership::Column::IpRecordId,
                 ip_record_group_membership::Column::GroupId,
             ])
-            .do_nothing()
+            // Not `do_nothing()`: a batch re-asserting an address already linked to this group is a
+            // real touch of *that group's* membership and must advance its `updated_at` — see
+            // `m20260926_120000`'s module comment. `created_at` is absent from this list, so a
+            // conflict leaves it exactly as first recorded.
+            .update_column(ip_record_group_membership::Column::UpdatedAt)
             .to_owned(),
         )
         .exec_without_returning(&txn)
         .await?;
-        summary.linked += linked;
 
         if !skip_webhooks {
             // Same classification `handle_ip_upsert` uses: a new membership is an `IP_ADD` even when
             // the underlying `ip_record` row already existed under a different group, since that is
             // what changed from this group's own perspective; anything else touched in this pass is
             // an `IP_UPDATE`.
-            let action = if linked > 0 { "IP_ADD" } else { "IP_UPDATE" };
+            let action = if membership_is_new { "IP_ADD" } else { "IP_UPDATE" };
             webhook_events.push(WebhookEvent {
                 action: action.to_owned(),
                 address: address.clone(),

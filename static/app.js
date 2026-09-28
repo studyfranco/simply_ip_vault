@@ -220,6 +220,32 @@ class SearchableSelect {
 
     openMenu() {
         this.menu.classList.remove('hidden');
+        this.positionMenu();
+    }
+
+    // Flips the menu above the input, and caps its height to whatever room is actually there,
+    // instead of always opening downward at a fixed 220px. This control can sit anywhere on a
+    // scrollable page — "Manage Group Rights" in the API Keys tab is often the last thing before
+    // the fold — and a menu that opens off the bottom of the viewport with no repositioning
+    // leaves its lower options unreachable unless the user happens to scroll the whole page
+    // first, which nothing here prompts them to do. Must run after `classList.remove('hidden')`
+    // above: a `display: none` element reports zero size, so measuring first would always pick
+    // "opens fine" regardless of where the input actually is.
+    positionMenu() {
+        const gap = 4;
+        const inputRect = this.search.getBoundingClientRect();
+        const spaceBelow = window.innerHeight - inputRect.bottom - gap;
+        const spaceAbove = inputRect.top - gap;
+        // Below is the default — matching a native <select> — and is kept even on a tie; only
+        // flipped when there is unambiguously more room above.
+        const openAbove = spaceBelow < spaceAbove;
+        this.menu.classList.toggle('combobox-menu-above', openAbove);
+        // Never taller than the CSS default (220px), and never taller than the room actually
+        // available on whichever side was just chosen. A 120px floor keeps a handful of options
+        // visible (with their own scrollbar) even in a very short viewport, rather than shrinking
+        // toward zero.
+        const available = Math.max(120, openAbove ? spaceAbove : spaceBelow);
+        this.menu.style.maxHeight = `${Math.min(220, available)}px`;
     }
 
     closeMenu() {

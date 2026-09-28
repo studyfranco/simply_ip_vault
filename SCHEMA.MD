@@ -170,9 +170,9 @@ Stores banned or whitelisted IP addresses and CIDR subnets.
 | `cause` | `Text` | Nullable | Reason for adding the IP record |
 | `is_locked` | `Boolean` | Default: `false` | When `true`, the record cannot be modified or deleted through the API regardless of caller permissions. No endpoint currently sets this; it is a manual/administrative safeguard |
 | `created_at` | `DateTimeUtc` | Not Null | Initial insertion timestamp |
-| `updated_at` | `DateTimeUtc` | Not Null, Indexed | Timestamp of the last field update (cause change or re-registration). Indexed twice over: `idx-ip_records-updated_at` (single-column, `m20260811_000011`, for the delta-sync `since` filter, which searches this column alone) and `idx_ip_records_deleted_updated` (composite with `is_deleted`, `m20260824_150000`, below) — not a duplicate, since `GET /api/ips`'s own listing query filters `is_deleted` *and* sorts by this column together, a shape the single-column index cannot serve without a separate sort step |
-| `last_seen_at` | `DateTimeUtc` | Not Null, Indexed | Timestamp of last re-registration or recorded activity |
-| `is_deleted` | `Boolean` | Not Null, Default: `false`, Indexed | Soft-delete flag. A `true` row is hidden from every read (including the `iplist` export) and from webhook dispatch, but survives for the retention window so a master key can inspect or restore it. Also the leading column of `idx_ip_records_deleted_updated` (`(is_deleted, updated_at DESC)`, `m20260824_150000`) — `GET /api/ips`'s own query filters on this column and sorts on `updated_at` in the same request, and `EXPLAIN QUERY PLAN` confirmed this composite is what lets SQLite serve both from one index scan instead of filtering via the single-column `is_deleted` index and then falling back to `USE TEMP B-TREE FOR ORDER BY` |
+| `updated_at` | `DateTimeUtc` | Not Null, Indexed | Timestamp of the last field update (cause change or re-registration) — an **address-wide** property, shared by every group the address belongs to. Indexed single-column as `idx-ip_records-updated_at` (`m20260811_000011`). No longer paired with a composite alongside `is_deleted`: `m20260824_150000`'s `idx_ip_records_deleted_updated` served `GET /api/ips`'s old sort on *this* column, which `m20260926_120000` retired in favour of sorting on `ip_record_group_memberships.updated_at` instead (see that table's own `updated_at`, below) — the record-level column is no longer sorted or filtered on anywhere, and the composite index was dropped rather than kept unused |
+| `last_seen_at` | `DateTimeUtc` | Not Null, Indexed | Timestamp of last re-registration or recorded activity — also address-wide by design, unlike `ip_record_group_memberships.updated_at`. This is what `max_age` filters on: "is this address still active *anywhere*", deliberately a different question from "did *this* group's membership change" |
+| `is_deleted` | `Boolean` | Not Null, Default: `false`, Indexed | Soft-delete flag. A `true` row is hidden from every read (including the `iplist` export) and from webhook dispatch, but survives for the retention window so a master key can inspect or restore it |
 | `deleted_at` | `DateTimeUtc` | Nullable, Indexed | When the soft delete happened; `NULL` while live. This — not `updated_at` — is what the purge measures against, so restoring and re-deleting restarts the retention clock |
 | `deleted_by` | `Text` | Nullable | The `api_keys.id` (as text) of whoever soft-deleted the row. Deliberately **not** a foreign key: a FK would either block deleting that key or null the attribution out, and an attribution that disappears with its actor is not an attribution |
 
@@ -194,15 +194,29 @@ Associates an IP record with one or multiple IP groups.
 | :--- | :--- | :--- | :--- |
 | `ip_record_id` | `UUID` | FK -> `ip_records.id` (CASCADE) | Target IP Record ID |
 | `group_id` | `UUID` | FK -> `ip_groups.id` (CASCADE) | Associated Group ID |
+| `created_at` | `DateTimeUtc` | Not Null | When *this* (record, group) pairing was created — added by `m20260926_120000`. Distinct from `ip_records.created_at`: one address shared by three groups has one `ip_records` row but three membership rows, each with its own history |
+| `updated_at` | `DateTimeUtc` | Not Null, Indexed (composite, below) | When *this* pairing was last re-registered — advanced only by `handle_ip_upsert`/`batch_records` touching **this same group**, never by activity in a different group the same address also belongs to. This is what `GET /api/ips`'s `since` delta-sync filter and `ORDER BY` now read, replacing the pre-`m20260926_120000` behaviour of reading the shared `ip_records.updated_at` — see that migration's module comment for the bug this closes (an unrelated group's re-ban making an address look "changed" to every other group it belonged to, which spuriously re-triggered a differential-sync consumer's own downstream action for a group nothing happened in) |
 
 *Constraints & Indexes:*
 - Primary Key: Composite `(ip_record_id, group_id)` — serves a lookup keyed on `ip_record_id`
   (or on both columns together) but not one keyed on `group_id` alone, since that is the
   *trailing* column.
 - `idx_group_memberships_lookup`: Composite `(group_id, ip_record_id)`, added by `m20260824_150000`.
-  The other column order — every RBAC accessible-groups filter, and `GET /api/ips`'s own
-  `groups=`/`group_name=`/`group_id=` filters, look up memberships by `group_id` alone, which the
-  primary key above cannot serve; `EXPLAIN QUERY PLAN` showed a full table scan without this index.
+  The other column order — every RBAC accessible-groups filter, and the `full_replace` sweep, look
+  up memberships by `group_id` alone, which the primary key above cannot serve.
+- `idx_membership_group_updated`: Composite `(group_id, updated_at DESC)`, added by
+  `m20260926_120000` alongside the two new columns. `GET /api/ips`'s join now filters on `group_id`
+  and sorts on this table's own `updated_at` together; `EXPLAIN QUERY PLAN` confirmed this is what
+  lets that combination avoid `USE TEMP B-TREE FOR ORDER BY` for the common, group-scoped case
+  (any non-master call, or any `groups=`/`group_id=`/`status=`-filtered one). The one case this
+  cannot help — a master browsing every group at once, with no `group_id` predicate to drive
+  either side of the join — still needs a temp b-tree; see `m20260926_120000`'s own module comment
+  and `tests/schema_integrity_tests.rs` for why that trade-off was accepted rather than chased.
+- `idx_ip_records_deleted_updated` (`ip_records`, composite `is_deleted`+`updated_at DESC`,
+  `m20260824_150000`) was **dropped** by `m20260926_120000`: it existed solely to serve the
+  record-level sort this migration retires, and nothing else in the codebase queries
+  `ip_records.updated_at` — keeping it would cost every future `ip_records` write for no query the
+  planner would ever use it for.
 
 ---
 

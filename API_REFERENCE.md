@@ -224,8 +224,8 @@ holds `can_read` on. Master sees everything.
 | `ip` | string | no | — | Substring match on `target_address`. A fully parseable address/CIDR is canonicalized first so it still matches the stored form |
 | `cause` | string | no | — | Substring match on `cause` |
 | `status` | string | no | — | `ban`\|`banlist` or `white`\|`whitelist`. Anything else → `400` |
-| `max_age` | i64 (secs) | no | — | Only records whose `last_seen_at` is within this many seconds |
-| `since` | i64 (unix) | no | — | Delta-sync cutoff. In scope when `last_seen_at >= since`, **or** — with `include_deleted=true` — when `is_deleted` and `deleted_at >= since` |
+| `max_age` | i64 (secs) | no | — | Only records whose `last_seen_at` is within this many seconds — address-wide freshness, not scoped to any one group |
+| `since` | i64 (unix) | no | — | Delta-sync cutoff. In scope when **this row's group membership's own** `updated_at >= since`, **or** — with `include_deleted=true` — when `is_deleted` and `deleted_at >= since`. Scoped per membership since `m20260926_120000` — an address re-registered into a *different* group no longer makes it look changed here (see the response schema note below) |
 | `include_deleted` | bool | no | `false` | Include soft-deleted records. Scoped exactly as live ones; **not** master-gated |
 | `limit` | u64 | no | `50` | Page size |
 | `offset` | u64 | no | `0` | Page offset |
@@ -233,8 +233,8 @@ holds `can_read` on. Master sees everything.
 | `mode` | string | no | — | Synonym for `format` |
 | `include_total` | bool | no | `false` | Wrap the response in a `{data, total, limit, offset, total_pages}` envelope instead of the bare array. Ignored under `format=iplist`/`mode=iplist` |
 
-**Response `200`** — by default, an array of `IpRecordResponse`, ordered by `updated_at`
-descending:
+**Response `200`** — by default, an array of `IpRecordResponse`, ordered by (this row's group
+membership's own) `updated_at` descending:
 
 ```json
 [{
@@ -246,6 +246,17 @@ descending:
   "deleted_by": "uuid-string" // MASTER ONLY — omitted for every other caller
 }]
 ```
+
+> **`created_at`/`updated_at` describe this row's *(record, group)* pairing, not the address in
+> general — `last_seen_at` is the one that does.** Since `m20260926_120000`, the first two come
+> from `ip_record_group_memberships`, which carries its own history per group; an address in three
+> groups has one `ip_records` row but three distinct membership rows, and this response surfaces
+> the one for *this* row's `group_name`. Before that migration these two fields echoed the shared
+> `ip_records.created_at`/`updated_at`, so re-registering an address into Group A made its row in
+> every other group it belonged to show the same fresh `updated_at` too — the bug that also drove
+> `since` above. `last_seen_at` stays address-wide on purpose: it answers "is this address still
+> active anywhere", not "did this group's membership change", and `max_age` still filters on it
+> unchanged.
 
 With `format=iplist` or `mode=iplist`, the shape is instead `{"ip_list": ["192.0.2.10", ...]}` —
 sorted and de-duplicated, skipping the per-row group lookup.

@@ -674,9 +674,14 @@ async fn test_multi_group_and_temporal_filtering() {
     .await
     .unwrap();
 
+    // The membership must be aged the same as the record — `since` now reads the membership's own
+    // `updated_at` (`m20260926_120000`), so a membership stamped "now" would look fresh regardless
+    // of how stale the record it points at is.
     simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
         ip_record_id: Set(old_record_id),
         group_id: Set(old_group_id),
+        created_at: Set(old_time),
+        updated_at: Set(old_time),
     }
     .insert(&db)
     .await
@@ -6725,6 +6730,8 @@ async fn s6_a_complete_resolution_map_cascades_the_subtree_and_honours_each_reso
     simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
         ip_record_id: Set(record_id),
         group_id: Set(group_id),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+        updated_at: Set(chrono::Utc::now().naive_utc()),
     }
     .insert(&db)
     .await
@@ -7100,6 +7107,8 @@ async fn batch_skips_locked_records_without_modifying_them() {
     simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
         ip_record_id: Set(record_id),
         group_id: Set(group_id),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+        updated_at: Set(chrono::Utc::now().naive_utc()),
     }
     .insert(&db)
     .await
@@ -7179,6 +7188,8 @@ async fn full_replace_soft_deletes_omitted_records_and_records_who_did_it() {
             simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
                 ip_record_id: Set(id),
                 group_id: Set(group_id),
+                created_at: Set(now),
+                updated_at: Set(now),
             }
             .insert(&db)
             .await
@@ -7798,6 +7809,8 @@ async fn test_differential_sync_includes_recently_deleted_ips() {
     simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
         ip_record_id: Set(record_id),
         group_id: Set(group_id),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+        updated_at: Set(chrono::Utc::now().naive_utc()),
     }
     .insert(&db)
     .await
@@ -7887,9 +7900,14 @@ async fn test_differential_sync_includes_recently_deleted_ips() {
     .insert(&db)
     .await
     .unwrap();
+    // Aged the same as the record — `since`'s primary arm now reads the membership's own
+    // `updated_at` (`m20260926_120000`), so a membership stamped "now" would look freshly touched
+    // regardless of how quiet the record it points at actually was.
     simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
         ip_record_id: Set(quiet_id),
         group_id: Set(group_id),
+        created_at: Set(t0),
+        updated_at: Set(t0),
     }
     .insert(&db)
     .await
@@ -8060,9 +8078,14 @@ async fn test_sync_since_older_than_retention_period() {
             .insert(&db)
             .await
             .unwrap();
+            // Aged the same as `last_seen` — `since`'s primary arm now reads the membership's own
+            // `updated_at` (`m20260926_120000`), so this closure's whole "how long ago" parameter
+            // would be silently ignored by the filter under test if the membership stayed "now".
             simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
                 ip_record_id: Set(id),
                 group_id: Set(group_id),
+                created_at: Set(last_seen),
+                updated_at: Set(last_seen),
             }
             .insert(&db)
             .await

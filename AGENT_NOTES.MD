@@ -9883,3 +9883,118 @@ when `include_total` is false — a single query has nothing to be inconsistent 
 `cargo test` **354 passed**, 0 failed (4 new: two `src/error.rs` unit tests for the `503`
 distinction, two `schema_integrity_tests.rs` benchmarks/SQL-shape checks); `./scripts/test_e2e.sh`
 and `./scripts/verify_convergence.sh` re-run clean. `RBAC_MODEL.md` untouched. No new migration.
+
+### Addendum 14 — membership timestamps move to the join table, and the dashboard stops hiding behind a 1280px cap
+
+Two independent user reports this round: (1) re-registering a shared address into one group made
+its row in every *other* group the address belonged to look freshly changed, which spuriously
+retriggered a differential-sync consumer's own downstream action (a webhook, a firewall reload)
+for a group nothing happened in; (2) the dashboard used a fraction of a wide viewport, and a
+group-selection dropdown in the API Keys tab could open partially or fully below the bottom of the
+screen with no way to reach its lower options short of scrolling the whole page first.
+
+**Root cause of (1), confirmed before writing any migration.** `ip_records.created_at`/`updated_at`
+are properties of the shared address row, and one address row is referenced by every group's
+membership row (`ip_record_group_memberships`, previously just `(ip_record_id, group_id)` — no
+timestamps of its own at all). `GET /api/ips`'s `since` filter and `ORDER BY` both read that shared
+column, so `handle_ip_upsert` touching the address *for Group A* advanced a value `GET
+/api/ips?groups=B&since=T` also reads for Group B. `simply_ip_exporter`'s own `since`-based sync
+cache (`example/simply_ip_exporter/src/cache.rs`, confirmed by reading it after a fresh pull) is
+built on exactly the assumption this violated — "the max `updated_at` I've seen is safe to use as
+my next poll's cutoff" stops being true the moment the column can advance for a reason that has
+nothing to do with the group being synced.
+
+**The fix.** `m20260926_120000_add_membership_timestamps` adds `created_at`/`updated_at`
+(`NOT NULL`) to `ip_record_group_memberships` — a full SQLite table rebuild (the correct value per
+existing row is a correlated backfill from the referenced `ip_records` row, which `ADD COLUMN
+NOT NULL` can't express without a rebuild; PostgreSQL/MySQL take `ALTER COLUMN`/`MODIFY COLUMN`
+directly, same branch shape as `m20260811_000010`). `handle_ip_upsert`/`batch_records` now
+**upsert** the membership row (`ON CONFLICT (...) DO UPDATE SET updated_at`, with `created_at`
+absent from the update list so a conflict never touches it) instead of inserting under `DO
+NOTHING`, so a re-registration into the *same* group advances that group's own `updated_at` while
+a different group's membership is untouched. `list_ips`'s `ORDER BY` and `since`'s primary arm
+(not its `include_deleted` tombstone arm, which is correctly still record-level — a soft delete
+removes the address from every group at once) now read the membership's own column, and
+`IpRecordResponse.created_at`/`.updated_at` are populated from the membership row rather than the
+record — a deliberate, documented API contract change (`API_REFERENCE.md`), since each response row
+already *is* a (record, group) pairing and "when was this pairing created/touched" is the more
+useful answer than "when was the shared address first ever seen anywhere". `last_seen_at` and
+`max_age` are untouched — deliberately still address-wide, a genuinely different question.
+
+**The affected-row-count trick had to go.** `mem_result > 0` (insert vs. `DO NOTHING` no-op) was
+the existing `IP_ADD`/`IP_UPDATE` classification signal; an upsert always reports an affected row
+either way. Replaced with an explicit `find_by_id((record_id, group_id))` read immediately before
+the write, inside the same `Immediate`-mode transaction both handlers already hold — same shape the
+`ip_record` loop directly above it already uses for its own find-then-insert-or-update decision, so
+this isn't a new pattern in the file, just the membership write catching up to it.
+
+**Index consequence, found by grepping rather than assumed.** Moving `list_ips`'s sort off
+`ip_records.updated_at` left `idx_ip_records_deleted_updated` (`m20260824_150000`) with no query
+anywhere in `src/` still using its indexed column — confirmed with `grep -rn
+"ip_record::Column::UpdatedAt" src/`, zero hits outside the entity itself. Dropped in the same
+migration rather than left as unused weight on every future `ip_records` write, and replaced with
+`idx_membership_group_updated` (`group_id`, `updated_at DESC`) on the table that now needs it.
+**One query shape lost its temp-b-tree-free plan and the trade was accepted rather than chased:** a
+master browsing every group at once, with no `group_id` predicate to drive either side of the
+join, still needs a temp b-tree — no single-table index can drive from `ip_records` (where
+`is_deleted` lives) while also pre-sorting on `ip_record_group_memberships.updated_at` (the other
+table). Verified by trying anyway (a bare `(updated_at DESC)` index on the membership table changed
+nothing about that specific plan) before accepting it. Measured at ~67ms for the unfiltered case at
+50,000 seeded rows (up from ~3ms when the retired index could still serve it) — real, but three
+orders of magnitude short of the 20-42s this whole indexing effort exists to stay clear of, and
+`list_ips_query_plan_uses_indexes_not_a_temp_b_tree_or_table_scan`/
+`list_ips_query_completes_quickly_at_realistic_scale` (`tests/schema_integrity_tests.rs`) now pin
+that as an accepted, documented cost rather than silently losing coverage of it.
+
+**Verified against a populated upgrade, not just a fresh schema — the specific thing asked for.**
+Every other fixture in `schema_integrity_tests.rs` builds its database *after* all migrations run.
+`upgrading_a_populated_database_backfills_every_membership_including_multi_group_ones` does the
+opposite: migrates to immediately before `m20260926_120000`, seeds two groups and an address linked
+into **both** of them (plus a second, single-group address) under the pre-migration two-column
+schema via raw SQL (the current typed `ActiveModel` already requires the new columns and can't
+express a row the old schema would accept), then applies the migration and asserts — explicitly,
+not incidentally — that **both** of the shared address's memberships backfilled to the identical
+value from the one record they share, that nothing was lost or duplicated (exact row count), that
+`ON DELETE CASCADE` still fires post-rebuild, and that the index swap actually happened. Confirmed
+this test can fail, not just pass: swapped which correlated subquery fed which column in the
+migration's backfill and re-ran it — failed with the exact wrong values in the assertion message;
+reverted, passed again.
+
+**Root cause of (2), reproduced live before touching CSS.** Launched the real server and a headless
+Chromium (`chromium --headless=new --remote-debugging-port`, driven over raw CDP via
+`websocket-client` in a throwaway venv — no `chromium-cli`/`playwright` available in this
+container), logged in as master, opened the "Manage Group Rights" group combobox, and read its
+`getBoundingClientRect()` directly: the menu (fixed `220px`, opening downward at `top: calc(100% +
+4px)`) rendered with its bottom edge past `window.innerHeight`, exactly matching the reported
+symptom, because `SearchableSelect.openMenu()` only ever toggled the `hidden` class — no check for
+whether opening downward actually fit. Fixed in the shared class (`app.js`), not per-caller: a new
+`positionMenu()`, called from `openMenu()` after the `hidden` class is removed (measuring before
+that would always read a `display: none` element as zero-size), compares room above vs. below the
+input and toggles a `.combobox-menu-above` class (swapping `top`/`bottom`) plus an inline
+`max-height` capped to whatever room is actually available (floored at `120px` so a very short
+viewport still shows a few options rather than shrinking toward nothing). Every `SearchableSelect`
+instance — group filters, both webhook target-group pickers, "Manage Group Rights" — gets this for
+free. Re-verified live after the fix: the same combobox now opens upward and renders fully inside
+the viewport.
+
+**The width complaint, verified the same way, and converged rather than invented.** The dashboard's
+`.container` was a fixed `max-width: 1280px; padding: 2rem`, confirmed live (screenshot at a
+1600px window showed roughly 300px of dead margin on each side) before touching anything.
+`example/simply_hook_executor` — this ecosystem's gold-standard peer per `AGENT.MD` — had already
+made exactly this change (`max-width: 1800px; width: 100%; padding: 2rem clamp(1rem, 3vw, 4rem)`,
+with a comment explaining the reasoning: fluid up to a generous cap rather than fixed, so a
+1440p/1920p display isn't left with dead margin, while the cap itself stops an ultra-wide monitor
+from stretching content into unreadably wide rows). Copied verbatim rather than inventing a
+different number, matching `AGENT.MD`'s convergence directive — where the two foundational peers
+agree, that agreement is the answer. `example/simply_ip_exporter`/`simply_ip_sync` still carry the
+old `1280px` value, so this is `simply_ip_vault` catching up to a change `simply_hook_executor`
+made first, not new drift. Verified at both a 1600px desktop width (full-width, no dead margin) and
+a 390px mobile width (unchanged from before — the existing `@media (max-width: 640px)` block and
+the new fluid padding's own floor both still resolve the same way there) via the same live
+browser session.
+
+**Gates:** `cargo check --all-targets` clean; `cargo clippy --all-targets -- -D warnings` clean;
+`cargo test` **355 passed**, 0 failed (1 new: the populated-upgrade migration test above);
+`./scripts/test_e2e.sh` **780 checks passed**, 0 failed; `./scripts/verify_convergence.sh` **63
+matching, 0 documented divergences, 0 unexplained** — peer repos pulled fresh per `AGENT.MD`
+before both the convergence run and the `.container` comparison above. `RBAC_MODEL.md` untouched.
