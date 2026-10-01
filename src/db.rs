@@ -167,9 +167,10 @@ fn build_sqlite_connect_options(db_url: &str) -> Result<SqliteConnectOptions, Db
         // typed setter like the others above.
         .pragma("temp_store", "MEMORY")
         // Memory-mapped I/O (256 MB) to allow reading hot pages/indexes directly from RAM bypassing syscalls.
-        .pragma("mmap_size", "368435456")
+        .pragma("mmap_size", "388435456")
         // Page cache allocation (128 MB per connection, negative value = KiB) to keep indexes pinned in memory.
-        .pragma("cache_size", "-128000"))
+        .pragma("cache_size", "-256000")
+        .pragma("auto_vacuum", "INCREMENTAL"))
 }
 
 /// Runs every pending migration on a dedicated pool that opens with exactly one connection, applies
