@@ -4,6 +4,40 @@ This document defines the complete database schema for `simply_ip_vault`. All en
 
 ---
 
+## Current model (supersedes the per-column tables below where they differ)
+
+Introduced by `m20261006_120000_refactor_membership_state`. Where a table section below still describes
+`ip_records` with `is_locked`, `is_deleted`, `deleted_at`, `deleted_by`, `updated_at`, `last_seen_at` or
+`cause`, that description is out of date: those columns moved as follows.
+
+| Table | Columns | Purpose |
+| :--- | :--- | :--- |
+| `ip_records` | `id` (PK, BLOB16), `target_address` (UNIQUE), `created_at` | The canonical address. Shared by every group that holds it. No operational state. |
+| `ip_record_group_memberships` | `id` (PK, surrogate BLOB16), `ip_record_id` (FK CASCADE), `group_id` (FK CASCADE), `is_locked`, `created_at`, `last_seen_at`, `is_deleted`, `deleted_at`, `deleted_by` | One address's state in one group. Lock, soft delete and last observation are all per group. No `updated_at`. |
+| `ip_record_causes` | `id` (PK), `membership_id` (FK CASCADE), `cause`, `created_at` | Append-only cause history. No row is written when a request has no cause. The latest cause is the newest row. |
+
+Indexes that matter for the read path:
+
+- `idx_memberships_ip_group` UNIQUE on `(ip_record_id, group_id)`: one membership per address per group.
+- `idx_memberships_active_last_seen`: partial, `(group_id, last_seen_at DESC) WHERE is_deleted = FALSE`.
+  This serves the default listing and its count without a temp B-tree. Measured at 100k rows in
+  `tests/benchmark_tests.rs`: group-scoped page about 1.2 ms, group-scoped count about 2.3 ms.
+- `idx_group_memberships_lookup` `(group_id, ip_record_id)`: foreign-key child index for `group_id`.
+- `idx_memberships_deleted_at`: retention purge.
+- `idx_causes_membership_created` `(membership_id, created_at DESC)`: foreign-key child index and latest-cause lookup.
+- `idx-audit_logs-api_key_id`, `idx-webhook_configs-group_id`: foreign-key child indexes added by `m20261005_120000`.
+
+Pragmas, set per connection and checked at boot (`src/db.rs`): `journal_mode=WAL`, `synchronous=NORMAL`,
+`foreign_keys=ON`, `busy_timeout=10000`, `temp_store=MEMORY`, `mmap_size=256 MB`, `cache_size=-64000`,
+`auto_vacuum=INCREMENTAL`. An existing database is converted to incremental auto-vacuum once, at boot,
+with `VACUUM`. `PRAGMA optimize` runs after the pragmas are applied. The maintenance worker
+(`src/maintenance.rs`) runs `incremental_vacuum(1000)` and `wal_checkpoint(TRUNCATE)` every 12 hours.
+
+The membership migration is not reversible. Membership state cannot be split back onto a shared address row
+without choosing which group's copy wins, so `down` returns an error.
+
+---
+
 ## 📊 Entity Relationship Diagram
 
 ### Mermaid Diagram (For GitHub / Forgejo / Markdown Previewers)

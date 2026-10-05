@@ -93,6 +93,11 @@ pub enum AppError {
 /// `primary | (variant << 8)` — so masking with `& 0xFF` and checking for `5`
 /// (`SQLITE_BUSY`) or `6` (`SQLITE_LOCKED`) catches every variant without enumerating them.
 fn is_transient_lock_error(err: &sea_orm::DbErr) -> bool {
+    // Pool exhaustion surfaces as `ConnectionAcquire`, not as a runtime error, so it is matched
+    // here as well: it is the same transient condition, and a client should retry it.
+    if matches!(err, sea_orm::DbErr::ConnectionAcquire(_)) {
+        return true;
+    }
     let runtime_err = match err {
         sea_orm::DbErr::Conn(e) | sea_orm::DbErr::Exec(e) | sea_orm::DbErr::Query(e) => e,
         _ => return false,

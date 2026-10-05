@@ -16,7 +16,7 @@ use axum::{
 use sea_orm::{
     ConnectionTrait,
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, Database, DatabaseConnection, EntityTrait,
-    QueryFilter,
+    QueryFilter, QueryOrder,
 };
 use sea_orm_migration::MigratorTrait;
 use serde_json::json;
@@ -2809,17 +2809,27 @@ async fn update_webhook_rejects_api_key_only_transition_without_a_key() {
 // IP record soft delete, restore, hard delete, and 92-day purge
 // ─────────────────────────────────────────────────────────────
 
-/// Seeds an IP record in a group and returns its id.
+/// Seeds a live IP record and its membership in one group, with one seeded cause. Returns the
+/// address (`ip_records`) id.
 async fn insert_ip_record(db: &DatabaseConnection, address: &str, group_id: Uuid) -> Uuid {
     let id = Uuid::new_v4();
     let now = chrono::Utc::now().naive_utc();
     simply_ip_vault::entities::ip_record::ActiveModel {
         id: Set(id),
         target_address: Set(address.to_owned()),
-        cause: Set(Some("seeded".to_owned())),
+        created_at: Set(now),
+    }
+    .insert(db)
+    .await
+    .unwrap();
+
+    let membership_id = Uuid::new_v4();
+    simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
+        id: Set(membership_id),
+        ip_record_id: Set(id),
+        group_id: Set(group_id),
         is_locked: Set(false),
         created_at: Set(now),
-        updated_at: Set(now),
         last_seen_at: Set(now),
         is_deleted: Set(false),
         deleted_at: Set(None),
@@ -2829,11 +2839,11 @@ async fn insert_ip_record(db: &DatabaseConnection, address: &str, group_id: Uuid
     .await
     .unwrap();
 
-    simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
-        ip_record_id: Set(id),
-        group_id: Set(group_id),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+    simply_ip_vault::entities::ip_record_cause::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        membership_id: Set(membership_id),
+        cause: Set("seeded".to_owned()),
+        created_at: Set(now),
     }
     .insert(db)
     .await
@@ -2842,12 +2852,44 @@ async fn insert_ip_record(db: &DatabaseConnection, address: &str, group_id: Uuid
     id
 }
 
-/// Reads a record straight from the database, bypassing every API-level filter.
+/// Reads an address row straight from the database, bypassing every API-level filter.
 async fn raw_record(
     db: &DatabaseConnection,
     id: Uuid,
 ) -> Option<simply_ip_vault::entities::ip_record::Model> {
     simply_ip_vault::entities::prelude::IpRecord::find_by_id(id).one(db).await.unwrap()
+}
+
+/// Reads one address's membership in one group, bypassing every API-level filter. All lock and
+/// soft-delete state lives here, so this is what the state assertions read.
+async fn raw_membership(
+    db: &DatabaseConnection,
+    record_id: Uuid,
+    group_id: Uuid,
+) -> Option<simply_ip_vault::entities::ip_record_group_membership::Model> {
+    simply_ip_vault::entities::prelude::IpRecordGroupMembership::find()
+        .filter(
+            simply_ip_vault::entities::ip_record_group_membership::Column::IpRecordId.eq(record_id),
+        )
+        .filter(simply_ip_vault::entities::ip_record_group_membership::Column::GroupId.eq(group_id))
+        .one(db)
+        .await
+        .unwrap()
+}
+
+/// The membership's cause history, newest first.
+async fn raw_causes(
+    db: &DatabaseConnection,
+    membership_id: Uuid,
+) -> Vec<simply_ip_vault::entities::ip_record_cause::Model> {
+    simply_ip_vault::entities::prelude::IpRecordCause::find()
+        .filter(
+            simply_ip_vault::entities::ip_record_cause::Column::MembershipId.eq(membership_id),
+        )
+        .order_by_desc(simply_ip_vault::entities::ip_record_cause::Column::CreatedAt)
+        .all(db)
+        .await
+        .unwrap()
 }
 
 /// A non-master's delete must hide the record without destroying it.
@@ -2878,25 +2920,25 @@ async fn non_master_delete_is_soft_and_hides_the_record_without_dropping_the_row
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
     assert!(String::from_utf8(body.to_vec()).unwrap().contains("198.51.100.10"));
 
-    // Delete.
+    // Delete, by address and group.
     let req = signed(
         inject_connect_info(
             Request::builder()
                 .method("DELETE")
-                .uri(format!("/api/ips/{record_id}"))
+                .uri(format!("/api/ips?target_address=198.51.100.10&group_id={group_id}"))
                 .header("X-API-Key", &deleter),
         ),
         &secret,
         "",
     );
     let res = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
-    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(parsed["deleted"], "soft", "a non-master delete must be soft");
+    assert_eq!(res.status(), StatusCode::NO_CONTENT, "a non-master delete must succeed");
 
-    // Half one: the row is still there, flagged and attributed.
-    let row = raw_record(&db, record_id).await.expect("the row must survive a soft delete");
+    // Half one: the membership is still there, flagged and attributed, and the address row is
+    // untouched.
+    let row = raw_membership(&db, record_id, group_id)
+        .await
+        .expect("the membership must survive a soft delete");
     assert!(row.is_deleted, "is_deleted must be set");
     assert!(row.deleted_at.is_some(), "deleted_at must be stamped");
     assert_eq!(
@@ -2904,7 +2946,8 @@ async fn non_master_delete_is_soft_and_hides_the_record_without_dropping_the_row
         Some(deleter_id.to_string().as_str()),
         "deleted_by must attribute the acting key"
     );
-    assert_eq!(row.target_address, "198.51.100.10", "the record's data is untouched");
+    let address = raw_record(&db, record_id).await.expect("the address row must survive");
+    assert_eq!(address.target_address, "198.51.100.10", "the record's data is untouched");
 
     // Half two: it is gone from every *ordinary* read. Each listing gets its own timestamp — the
     // paths differ, but the loop also runs after earlier calls in this test and a repeat would
@@ -2964,7 +3007,9 @@ async fn non_master_delete_is_soft_and_hides_the_record_without_dropping_the_row
         inject_connect_info(
             Request::builder()
                 .method("DELETE")
-                .uri(format!("/api/ips/{record_id}?hard=true"))
+                .uri(format!(
+                    "/api/ips?target_address=198.51.100.10&group_id={group_id}&hard=true"
+                ))
                 .header("X-API-Key", &deleter),
         ),
         &secret,
@@ -2975,7 +3020,10 @@ async fn non_master_delete_is_soft_and_hides_the_record_without_dropping_the_row
         StatusCode::FORBIDDEN,
         "hard delete must be master-only"
     );
-    assert!(raw_record(&db, record_id).await.is_some(), "the row must still be there");
+    assert!(
+        raw_membership(&db, record_id, group_id).await.is_some(),
+        "the membership must still be there"
+    );
 }
 
 /// A key with no delete permission on any of the record's groups cannot delete it at all.
@@ -2997,7 +3045,7 @@ async fn deleting_a_record_requires_delete_permission_on_one_of_its_groups() {
         inject_connect_info(
             Request::builder()
                 .method("DELETE")
-                .uri(format!("/api/ips/{record_id}"))
+                .uri(format!("/api/ips?target_address=198.51.100.20&group_id={group_id}"))
                 .header("X-API-Key", &reader),
         ),
         &secret,
@@ -3005,8 +3053,8 @@ async fn deleting_a_record_requires_delete_permission_on_one_of_its_groups() {
     );
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
 
-    let row = raw_record(&db, record_id).await.expect("row survives");
-    assert!(!row.is_deleted, "a rejected delete must not have flagged the record");
+    let row = raw_membership(&db, record_id, group_id).await.expect("row survives");
+    assert!(!row.is_deleted, "a rejected delete must not have flagged the membership");
 }
 
 /// The master's side of the trash: see it, restore it, or destroy it for good.
@@ -3043,8 +3091,12 @@ async fn master_can_view_restore_and_hard_delete_soft_deleted_records() {
         }
     };
 
-    let (status, _) = call("DELETE", format!("/api/ips/{record_id}")).await;
-    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(
+        "DELETE",
+        format!("/api/ips?target_address=198.51.100.30&group_id={group_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
 
     // Hidden from the default listing even for a master — the trash is opt-in, so a master's
     // ordinary view is not silently different from everyone else's.
@@ -3061,11 +3113,15 @@ async fn master_can_view_restore_and_hard_delete_soft_deleted_records() {
     assert!(row["deleted_at"].is_string(), "and when it happened");
 
     // Restore.
-    let (status, body) = call("POST", format!("/api/ips/{record_id}/restore")).await;
+    let (status, body) = call(
+        "POST",
+        format!("/api/ips/restore?target_address=198.51.100.30&group_id={group_id}"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "master restore must succeed");
     assert!(body.contains("\"restored\":true"));
 
-    let row = raw_record(&db, record_id).await.expect("row exists");
+    let row = raw_membership(&db, record_id, group_id).await.expect("membership exists");
     assert!(!row.is_deleted, "restore clears the flag");
     assert!(row.deleted_at.is_none(), "restore clears deleted_at");
     assert!(row.deleted_by.is_none(), "restore clears deleted_by");
@@ -3074,15 +3130,19 @@ async fn master_can_view_restore_and_hard_delete_soft_deleted_records() {
     let (_, body) = call("GET", "/api/ips".to_owned()).await;
     assert!(body.contains("198.51.100.30"), "a restored record is visible again");
 
-    // Restoring a live record is a no-op error, not a silent success.
-    let (status, _) = call("POST", format!("/api/ips/{record_id}/restore")).await;
+    // Restoring a live membership is a no-op error, not a silent success.
+    let (status, _) = call("POST", format!("/api/ips/restore?target_address=198.51.100.30&group_id={group_id}")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "nothing to restore");
 
-    // Hard delete really removes the row.
-    let (status, body) = call("DELETE", format!("/api/ips/{record_id}?hard=true")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("permanent"));
-    assert!(raw_record(&db, record_id).await.is_none(), "hard delete drops the row");
+    // Hard delete really removes the membership, and the address row once no group holds it.
+    let (status, _) = call(
+        "DELETE",
+        format!("/api/ips?target_address=198.51.100.30&group_id={group_id}&hard=true"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(raw_membership(&db, record_id, group_id).await.is_none(), "hard delete drops the membership");
+    assert!(raw_record(&db, record_id).await.is_none(), "an address held by no group is removed too");
 }
 
 /// Restore is master-only: recovering from a careless or compromised key must not depend on that
@@ -3098,7 +3158,7 @@ async fn restore_and_purge_are_master_only() {
     let secret = test_signing_secret(&delegated);
     let group_id = insert_group(&db, "perm-group").await;
     grant(&db, id, group_id, true, true, true).await;
-    let record_id = insert_ip_record(&db, "198.51.100.40", group_id).await;
+    insert_ip_record(&db, "198.51.100.40", group_id).await;
 
     let post = |path: String| {
         let (app, delegated, secret) = (app.clone(), delegated.clone(), secret.clone());
@@ -3118,7 +3178,10 @@ async fn restore_and_purge_are_master_only() {
         }
     };
 
-    assert_eq!(post(format!("/api/ips/{record_id}/restore")).await, StatusCode::FORBIDDEN);
+    assert_eq!(
+        post(format!("/api/ips/restore?target_address=198.51.100.40&group_id={group_id}")).await,
+        StatusCode::FORBIDDEN
+    );
     assert_eq!(post("/api/system/purge-ips".to_owned()).await, StatusCode::FORBIDDEN);
 }
 
@@ -3142,10 +3205,11 @@ async fn purge_removes_only_records_past_the_92_day_retention_window() {
     let age = |days: i64| (chrono::Utc::now() - chrono::Duration::days(days)).naive_utc();
 
     let mark_deleted = |id: Uuid, at: chrono::NaiveDateTime, deleted: bool| {
-        let db = db.clone();
+        let (db, group) = (db.clone(), group_id);
         async move {
-            let record = raw_record(&db, id).await.unwrap();
-            let mut active: simply_ip_vault::entities::ip_record::ActiveModel = record.into();
+            let membership = raw_membership(&db, id, group).await.unwrap();
+            let mut active: simply_ip_vault::entities::ip_record_group_membership::ActiveModel =
+                membership.into();
             active.is_deleted = Set(deleted);
             active.deleted_at = Set(Some(at));
             active.update(&db).await.unwrap();
@@ -3160,27 +3224,33 @@ async fn purge_removes_only_records_past_the_92_day_retention_window() {
     let purged = purge_expired_ip_records(&db, DEFAULT_RETENTION_DAYS).await.unwrap();
     assert_eq!(purged, 1, "exactly the one aged-out record is purged");
 
-    assert!(raw_record(&db, expired).await.is_none(), "the aged-out record is gone");
-    assert!(raw_record(&db, recent).await.is_some(), "a record inside the window is kept");
+    assert!(raw_membership(&db, expired, group_id).await.is_none(), "the aged-out membership is gone");
+    assert!(raw_record(&db, expired).await.is_none(), "an address held by no group is removed too");
     assert!(
-        raw_record(&db, live).await.is_some(),
-        "a restored record must survive regardless of its stale deleted_at"
+        raw_membership(&db, recent, group_id).await.is_some(),
+        "a membership inside the window is kept"
+    );
+    assert!(
+        raw_membership(&db, live, group_id).await.is_some(),
+        "a restored membership must survive regardless of its stale deleted_at"
     );
 
-    // Cascade: the purged record's group membership went with it, leaving no orphan junction row.
-    let orphans = simply_ip_vault::entities::prelude::IpRecordGroupMembership::find()
-        .filter(
-            simply_ip_vault::entities::ip_record_group_membership::Column::IpRecordId.eq(expired),
-        )
+    // Nothing is left orphaned: every remaining membership points at a live address row.
+    let memberships = simply_ip_vault::entities::prelude::IpRecordGroupMembership::find()
         .all(&db)
         .await
         .unwrap();
-    assert!(orphans.is_empty(), "cascade removed the membership rows");
+    for m in &memberships {
+        assert!(raw_record(&db, m.ip_record_id).await.is_some(), "no orphaned membership rows");
+    }
 
     // A retention window of 0 disables purging entirely rather than meaning "purge everything".
     assert_eq!(purge_expired_ip_records(&db, 0).await.unwrap(), 0);
     assert_eq!(purge_expired_ip_records(&db, -1).await.unwrap(), 0);
-    assert!(raw_record(&db, recent).await.is_some(), "nothing was destroyed by the disabled sweep");
+    assert!(
+        raw_membership(&db, recent, group_id).await.is_some(),
+        "nothing was destroyed by the disabled sweep"
+    );
 }
 
 /// **Successful and failed `webhook_executions` rows are purged on independent windows** — 24h for
@@ -3303,8 +3373,9 @@ async fn purge_endpoint_reports_the_number_of_records_removed() {
     let group_id = insert_group(&db, "endpoint-purge-group").await;
     let old = insert_ip_record(&db, "203.0.113.50", group_id).await;
 
-    let record = raw_record(&db, old).await.unwrap();
-    let mut active: simply_ip_vault::entities::ip_record::ActiveModel = record.into();
+    let membership = raw_membership(&db, old, group_id).await.unwrap();
+    let mut active: simply_ip_vault::entities::ip_record_group_membership::ActiveModel =
+        membership.into();
     active.is_deleted = Set(true);
     active.deleted_at = Set(Some((chrono::Utc::now() - chrono::Duration::days(200)).naive_utc()));
     active.update(&db).await.unwrap();
@@ -3341,7 +3412,10 @@ async fn purge_endpoint_reports_the_number_of_records_removed() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, _) = purge(r#"{"older_than_days":-5}"#).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(raw_record(&db, old).await.is_some(), "the rejected purges destroyed nothing");
+    assert!(
+        raw_membership(&db, old, group_id).await.is_some(),
+        "the rejected purges destroyed nothing"
+    );
 
     // An empty body uses the configured 92-day default.
     let (status, body) = purge("").await;
@@ -3349,7 +3423,7 @@ async fn purge_endpoint_reports_the_number_of_records_removed() {
     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(parsed["purged"], 1);
     assert_eq!(parsed["retention_days"], 92, "the default window is 92 days");
-    assert!(raw_record(&db, old).await.is_none());
+    assert!(raw_membership(&db, old, group_id).await.is_none());
 
     // A second sweep finds nothing left.
     let (_, body) = purge("").await;
@@ -3375,14 +3449,14 @@ async fn re_registering_a_soft_deleted_address_restores_it() {
         inject_connect_info(
             Request::builder()
                 .method("DELETE")
-                .uri(format!("/api/ips/{record_id}"))
+                .uri(format!("/api/ips?target_address=203.0.113.77&group_id={group_id}"))
                 .header("X-API-Key", &master),
         ),
         &secret,
         "",
     );
-    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
-    assert!(raw_record(&db, record_id).await.unwrap().is_deleted);
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert!(raw_membership(&db, record_id, group_id).await.unwrap().is_deleted);
 
     // Ban the same address again.
     let req = signed(
@@ -3407,11 +3481,17 @@ async fn re_registering_a_soft_deleted_address_restores_it() {
         "re-banning a soft-deleted address must succeed, not collide with the unique index"
     );
 
-    let row = raw_record(&db, record_id).await.expect("the same row is reused");
+    assert!(raw_record(&db, record_id).await.is_some(), "the same address row is reused");
+    let row = raw_membership(&db, record_id, group_id).await.expect("the same membership is reused");
     assert!(!row.is_deleted, "re-registration clears the deleted flag");
     assert!(row.deleted_at.is_none(), "...and the retention clock");
     assert!(row.deleted_by.is_none(), "...and the attribution");
-    assert_eq!(row.cause.as_deref(), Some("seen again"), "the new cause was applied");
+    let causes = raw_causes(&db, row.id).await;
+    assert_eq!(
+        causes.first().map(|c| c.cause.as_str()),
+        Some("seen again"),
+        "the new cause was appended to this membership's history"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -3611,10 +3691,11 @@ async fn tampering_with_the_query_string_invalidates_the_signature() {
     let timestamp = chrono::Utc::now().timestamp();
 
     // Signed for the plain path...
+    let plain_path = format!("/api/ips?target_address=198.51.100.77&group_id={group_id}");
     let honest = crypto::compute_signature(
         &secret,
         "DELETE",
-        &format!("/api/ips/{record_id}"),
+        &plain_path,
         &timestamp.to_string(),
         b"",
     )
@@ -3624,7 +3705,7 @@ async fn tampering_with_the_query_string_invalidates_the_signature() {
     let tampered = inject_connect_info(
         Request::builder()
             .method("DELETE")
-            .uri(format!("/api/ips/{record_id}?hard=true"))
+            .uri(format!("{plain_path}&hard=true"))
             .header("X-API-Key", &master)
             .header("X-Timestamp", timestamp.to_string())
             .header("X-Signature-256", &honest),
@@ -3638,8 +3719,8 @@ async fn tampering_with_the_query_string_invalidates_the_signature() {
         "a query string appended after signing must break the signature"
     );
     assert!(
-        raw_record(&db, record_id).await.is_some(),
-        "the record must survive the rejected escalation"
+        raw_membership(&db, record_id, group_id).await.is_some_and(|m| !m.is_deleted),
+        "the membership must survive the rejected escalation, untouched"
     );
 
     // The honest request still works, so the rejection above is about the tampering and not about
@@ -3647,14 +3728,14 @@ async fn tampering_with_the_query_string_invalidates_the_signature() {
     let honest_req = inject_connect_info(
         Request::builder()
             .method("DELETE")
-            .uri(format!("/api/ips/{record_id}"))
+            .uri(&plain_path)
             .header("X-API-Key", &master)
             .header("X-Timestamp", timestamp.to_string())
             .header("X-Signature-256", &honest),
     )
     .body(Body::empty())
     .expect("request builds");
-    assert_eq!(app.clone().oneshot(honest_req).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(app.clone().oneshot(honest_req).await.unwrap().status(), StatusCode::NO_CONTENT);
 
     // Symmetrically: a signature computed *with* the query is not valid without it, so an attacker
     // cannot strip a parameter either.
@@ -4555,8 +4636,8 @@ async fn include_deleted_is_scoped_to_readable_groups_for_a_non_master() {
 
     let mine = insert_group(&db, "mine").await;
     let theirs = insert_group(&db, "theirs").await;
-    let my_record = insert_ip_record(&db, "198.51.100.61", mine).await;
-    let their_record = insert_ip_record(&db, "198.51.100.62", theirs).await;
+    insert_ip_record(&db, "198.51.100.61", mine).await;
+    insert_ip_record(&db, "198.51.100.62", theirs).await;
 
     // Read *and* delete on my group; nothing at all on the other one.
     grant(&db, reader_id, mine, true, false, true).await;
@@ -4582,11 +4663,21 @@ async fn include_deleted_is_scoped_to_readable_groups_for_a_non_master() {
     };
 
     // The master soft-deletes the record in the other group, so there is something to leak.
-    let (status, _) = call(master.clone(), "DELETE", format!("/api/ips/{their_record}")).await;
-    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(
+        master.clone(),
+        "DELETE",
+        format!("/api/ips?target_address=198.51.100.62&group_id={theirs}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
     // The reader soft-deletes its own.
-    let (status, _) = call(reader.clone(), "DELETE", format!("/api/ips/{my_record}")).await;
-    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(
+        reader.clone(),
+        "DELETE",
+        format!("/api/ips?target_address=198.51.100.61&group_id={mine}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
 
     let (status, body) = call(reader.clone(), "GET", "/api/ips?include_deleted=true".to_owned()).await;
     assert_eq!(status, StatusCode::OK, "a can_read key may ask for the trash");
@@ -4620,7 +4711,7 @@ async fn deleted_by_is_visible_to_master_and_withheld_from_everyone_else() {
     let master = insert_master_key(&db, "Master").await;
     let (reader_id, reader) = insert_key(&db, "Reader", false, false, false, false, None).await;
     let group = insert_group(&db, "shared").await;
-    let record = insert_ip_record(&db, "198.51.100.63", group).await;
+    insert_ip_record(&db, "198.51.100.63", group).await;
     grant(&db, reader_id, group, true, false, true).await;
 
     let tick = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
@@ -4643,8 +4734,13 @@ async fn deleted_by_is_visible_to_master_and_withheld_from_everyone_else() {
         }
     };
 
-    let (status, _) = call(reader.clone(), "DELETE", format!("/api/ips/{record}")).await;
-    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(
+        reader.clone(),
+        "DELETE",
+        format!("/api/ips?target_address=198.51.100.63&group_id={group}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
 
     let (_, seen_by_reader) = call(reader, "GET", "/api/ips?include_deleted=true".to_owned()).await;
     assert!(seen_by_reader.contains("198.51.100.63"), "the record is in scope: {seen_by_reader}");
@@ -4955,8 +5051,18 @@ async fn test_concurrent_batch_writes_under_wal() {
         stored.len()
     );
     assert!(
-        stored.iter().all(|r| !r.is_deleted && !r.target_address.is_empty()),
-        "every row is intact — no partially written or corrupted record"
+        stored.iter().all(|r| !r.target_address.is_empty()),
+        "every address row is intact — no partially written or corrupted record"
+    );
+    // Every membership row is one live membership in the single group the batches wrote to.
+    let memberships = simply_ip_vault::entities::prelude::IpRecordGroupMembership::find()
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(memberships.len(), expected, "one live membership per address");
+    assert!(
+        memberships.iter().all(|m| !m.is_deleted),
+        "no membership was left soft-deleted by the concurrent writes"
     );
 
     // The service is still healthy afterwards, so nothing was left holding the pool.

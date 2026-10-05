@@ -1939,13 +1939,10 @@ check "200" "ban an address to soft-delete"
 
 api_call GET "/api/ips?groups=softdelete-group" "$MASTER_KEY"
 check "200" "list the group before deletion"
-SOFTDEL_RECORD_ID=$(echo "$RESP_BODY" | jq -r '.[] | select(.target_address == "198.51.100.201") | .id')
-log "Soft-delete target record id: $SOFTDEL_RECORD_ID"
 
 # A non-master delete must be soft: hidden from reads, row retained.
-api_call DELETE "/api/ips/$SOFTDEL_RECORD_ID" "$SOFTDEL_KEY"
-check "200" "a non-master DELETE /api/ips/{id} succeeds"
-check_true '.deleted == "soft"' "a non-master delete is soft, not permanent"
+api_call DELETE "/api/ips" "$SOFTDEL_KEY" '{"target_address":"198.51.100.201","group_name":"softdelete-group"}'
+check "204" "a non-master DELETE /api/ips (by address and group) succeeds"
 
 api_call GET "/api/ips?groups=softdelete-group" "$SOFTDEL_KEY"
 check "200" "the deleter lists the group after deleting"
@@ -1958,7 +1955,7 @@ check_true '[.ip_list[] | select(. == "198.51.100.201")] | length == 0' \
     "the soft-deleted record is excluded from the iplist export too"
 
 # A non-master cannot escalate to a permanent delete.
-api_call DELETE "/api/ips/$SOFTDEL_RECORD_ID?hard=true" "$SOFTDEL_KEY"
+api_call DELETE "/api/ips?hard=true" "$SOFTDEL_KEY" '{"target_address":"198.51.100.201","group_name":"softdelete-group"}'
 check "403" "a non-master cannot hard-delete a record"
 
 # The master trash view sees it, with its attribution.
@@ -1976,10 +1973,10 @@ check_true '[.[] | select(.target_address == "198.51.100.201")] | length == 0' \
     "the trash stays hidden unless include_deleted is explicitly requested"
 
 # Restore.
-api_call POST "/api/ips/$SOFTDEL_RECORD_ID/restore" "$SOFTDEL_KEY"
+api_call POST "/api/ips/restore" "$SOFTDEL_KEY" '{"target_address":"198.51.100.201","group_name":"softdelete-group"}'
 check "403" "a non-master cannot restore a deleted record"
 
-api_call POST "/api/ips/$SOFTDEL_RECORD_ID/restore" "$MASTER_KEY"
+api_call POST "/api/ips/restore" "$MASTER_KEY" '{"target_address":"198.51.100.201","group_name":"softdelete-group"}'
 check "200" "master restores the soft-deleted record"
 check_true '.restored == true' "the restore is reported"
 
@@ -1988,12 +1985,12 @@ check "200" "list the group after restoration"
 check_true '[.[] | select(.target_address == "198.51.100.201")] | length == 1' \
     "the restored record is visible again"
 
-api_call POST "/api/ips/$SOFTDEL_RECORD_ID/restore" "$MASTER_KEY"
+api_call POST "/api/ips/restore" "$MASTER_KEY" '{"target_address":"198.51.100.201","group_name":"softdelete-group"}'
 check "400" "restoring an already-live record is rejected"
 
 # Re-banning a soft-deleted address must resurrect it rather than collide with the unique index.
-api_call DELETE "/api/ips/$SOFTDEL_RECORD_ID" "$SOFTDEL_KEY"
-check "200" "soft-delete the record again"
+api_call DELETE "/api/ips" "$SOFTDEL_KEY" '{"target_address":"198.51.100.201","group_name":"softdelete-group"}'
+check "204" "soft-delete the record again"
 api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"198.51.100.201","group_name":"softdelete-group","cause":"seen again"}'
 check "200" "re-banning a soft-deleted address succeeds instead of colliding"
 api_call GET "/api/ips?groups=softdelete-group" "$MASTER_KEY"
@@ -2020,9 +2017,8 @@ check_true '[.[] | select(.target_address == "198.51.100.201")] | length == 1' \
     "the live record survived the purge"
 
 # Master hard delete really drops the row.
-api_call DELETE "/api/ips/$SOFTDEL_RECORD_ID?hard=true" "$MASTER_KEY"
-check "200" "master hard-deletes the record"
-check_true '.deleted == "permanent"' "the hard delete is reported as permanent"
+api_call DELETE "/api/ips?hard=true" "$MASTER_KEY" '{"target_address":"198.51.100.201","group_name":"softdelete-group"}'
+check "204" "master hard-deletes the record"
 
 api_call GET "/api/ips?include_deleted=true&groups=softdelete-group" "$MASTER_KEY"
 check_true '[.[] | select(.target_address == "198.51.100.201")] | length == 0' \
@@ -2060,9 +2056,8 @@ check_jq ".[0].cause" "updated-cause" "the cause was updated by the re-registrat
 check_jq ".[0].id" "$SOFTDEL_WHITE_RECORD_ID" "same row, same id — a genuine update, not a delete+recreate"
 
 # Soft delete + trash visibility.
-api_call DELETE "/api/ips/$SOFTDEL_WHITE_RECORD_ID" "$MASTER_KEY"
-check "200" "soft-delete the whitelisted record"
-check_true '.deleted == "soft"' "the delete is soft"
+api_call DELETE "/api/ips" "$MASTER_KEY" '{"target_address":"203.0.113.201","group_name":"softdelete-whitelist-group"}'
+check "204" "soft-delete the whitelisted record"
 
 api_call GET "/api/ips?groups=softdelete-whitelist-group" "$MASTER_KEY"
 check_true '[.[] | select(.target_address == "203.0.113.201")] | length == 0' \
@@ -2073,7 +2068,7 @@ check_true '[.[] | select(.target_address == "203.0.113.201" and .is_deleted == 
     "the trash view exposes the soft-deleted whitelist record, same as a banlist one"
 
 # Restore.
-api_call POST "/api/ips/$SOFTDEL_WHITE_RECORD_ID/restore" "$MASTER_KEY"
+api_call POST "/api/ips/restore" "$MASTER_KEY" '{"target_address":"203.0.113.201","group_name":"softdelete-whitelist-group"}'
 check "200" "restore the soft-deleted whitelist record"
 check_true '.restored == true' "the restore is reported"
 api_call GET "/api/ips?groups=softdelete-whitelist-group" "$MASTER_KEY"
@@ -2081,9 +2076,8 @@ check_true '[.[] | select(.target_address == "203.0.113.201")] | length == 1' \
     "the restored whitelist record is visible again"
 
 # Hard delete really drops the row.
-api_call DELETE "/api/ips/$SOFTDEL_WHITE_RECORD_ID?hard=true" "$MASTER_KEY"
-check "200" "hard-delete the whitelist record"
-check_true '.deleted == "permanent"' "the hard delete is reported as permanent"
+api_call DELETE "/api/ips?hard=true" "$MASTER_KEY" '{"target_address":"203.0.113.201","group_name":"softdelete-whitelist-group"}'
+check "204" "hard-delete the whitelist record"
 api_call GET "/api/ips?include_deleted=true&groups=softdelete-whitelist-group" "$MASTER_KEY"
 check_true '[.[] | select(.target_address == "203.0.113.201")] | length == 0' \
     "a hard-deleted whitelist record is gone even from the trash view"
@@ -2645,7 +2639,7 @@ log_section "26. Convergence — Full-URI Signing, Anti-Replay & Fail-Closed Cry
 # --- Full-URI signature coverage -------------------------------------------------------------
 #
 # The query string is part of the signed target. Before it was, an on-path attacker who could not
-# forge a signature could still append `?hard=true` to a captured `DELETE /api/ips/{id}` and turn a
+# forge a signature could still append `?hard=true` to a captured `DELETE /api/ips` and turn a
 # reversible soft delete into an irreversible purge — no secret required.
 
 api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"198.51.100.240","group_name":"convergence-group","cause":"full-uri signing"}'
@@ -2653,15 +2647,16 @@ check "200" "#26 seed a record for the query-tampering checks"
 
 api_call GET "/api/ips?groups=convergence-group" "$MASTER_KEY"
 check "200" "#26 read the seeded record back"
-TAMPER_RECORD_ID=$(echo "$RESP_BODY" | jq -r '[.[] | select(.target_address == "198.51.100.240")][0].id')
 
 # Sign the bare path, send it with `?hard=true` bolted on — exactly the rewrite a proxy-level
 # attacker performs.
-next_timestamp "TAMPER|$TAMPER_RECORD_ID"
+next_timestamp "TAMPER|convergence"
 TAMPER_TS="$SIGNED_TS"
-TAMPER_SIG=$(hmac_sign "$MASTER_SIGNING_SECRET" "DELETE" "/api/ips/$TAMPER_RECORD_ID" "$TAMPER_TS" "")
-raw_call DELETE "/api/ips/$TAMPER_RECORD_ID?hard=true" \
-    -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $TAMPER_TS" -H "X-Signature-256: $TAMPER_SIG"
+TAMPER_BODY='{"target_address":"198.51.100.240","group_name":"convergence-group"}'
+TAMPER_SIG=$(hmac_sign "$MASTER_SIGNING_SECRET" "DELETE" "/api/ips" "$TAMPER_TS" "$TAMPER_BODY")
+raw_call DELETE "/api/ips?hard=true" \
+    -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $TAMPER_TS" -H "X-Signature-256: $TAMPER_SIG" \
+    -H "Content-Type: application/json" -d "$TAMPER_BODY"
 check "401" "#26 a query string appended after signing breaks the signature"
 
 api_call GET "/api/ips?groups=convergence-group" "$MASTER_KEY"

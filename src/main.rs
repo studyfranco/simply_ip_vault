@@ -1,3 +1,7 @@
+#[cfg(all(target_os = "linux", not(target_env = "msvc")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::net::SocketAddr;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use tokio::net::TcpListener;
@@ -328,6 +332,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         simply_ip_vault::retention::run_retention_worker(retention_db, retention_rx).await;
     });
 
+    // Incremental vacuum and WAL truncation every 12 hours. Same shutdown pattern as retention.
+    let (maint_tx, maint_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let maint_db = db.clone();
+    let maint_handle = tokio::spawn(async move {
+        simply_ip_vault::maintenance::run_maintenance_worker(maint_db, maint_rx).await;
+    });
+
     // Separate retention sweep for webhook delivery history — its own table, its own schedule, its
     // own shutdown channel, for the reasons `retention::run_webhook_execution_retention_worker`'s
     // doc comment gives.
@@ -384,9 +395,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(tx);
     drop(retention_tx);
     drop(exec_retention_tx);
+    drop(maint_tx);
     let _ = worker_handle.await;
     let _ = retention_handle.await;
     let _ = exec_retention_handle.await;
+    let _ = maint_handle.await;
 
     tracing::info!("Graceful shutdown complete.");
     Ok(())

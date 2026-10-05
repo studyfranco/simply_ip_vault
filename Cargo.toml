@@ -31,6 +31,12 @@ log = "0.4"
 # nonces collision-safe without any counter state to persist — see `src/crypto.rs`.
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "getrandom"] }
 
+# glibc malloc serializes allocations behind a process-wide lock; under a multi-threaded Tokio
+# runtime that lock is the contention point. jemalloc uses per-thread arenas instead. Linux only:
+# the allocator is selected in `main.rs` with the same cfg, so other targets keep the system one.
+[target.'cfg(all(target_os = "linux", not(target_env = "msvc")))'.dependencies]
+tikv-jemallocator = "0.7"
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 # `test-util` unlocks the pausable clock (`tokio::time::pause`/`advance`). `src/replay.rs` expires

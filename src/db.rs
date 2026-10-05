@@ -165,7 +165,15 @@ fn build_sqlite_connect_options(db_url: &str) -> Result<SqliteConnectOptions, Db
         // place a slow disk can show up as request latency. No portable `SqliteConnectOptions`
         // method exists for this pragma, hence the generic `.pragma()` escape hatch rather than a
         // typed setter like the others above.
-        .pragma("temp_store", "MEMORY"))
+        .pragma("temp_store", "MEMORY")
+        // Persistent in the file header, so only a database created under this setting (or one that
+        // has been VACUUMed under it — see `ensure_incremental_auto_vacuum`) is actually incremental.
+        // On an existing NONE database this per-connection value is inert until that conversion runs.
+        .pragma("auto_vacuum", "INCREMENTAL")
+        // 256 MiB of memory-mapped reads: hot pages are served without a `read(2)` copy per page.
+        .pragma("mmap_size", "268435456")
+        // 64 MiB page cache per connection (negative = KiB, so this is 64000 KiB).
+        .pragma("cache_size", "-64000"))
 }
 
 /// Runs every pending migration on a dedicated pool that opens with exactly one connection, applies
@@ -199,6 +207,7 @@ pub async fn run_migrations_isolated(db_url: &str) -> Result<(), DbErr> {
     };
 
     crate::migration::Migrator::up(&db, None).await?;
+    ensure_incremental_auto_vacuum(&db).await?;
 
     // Explicit rather than left to `drop`: a dropped `DatabaseConnection` closes its pool in the
     // background, with no guarantee it has finished by the time this function returns. The whole
@@ -450,11 +459,95 @@ pub async fn apply_sqlite_pragmas(db: &DatabaseConnection) -> Result<(), DbErr> 
             tracing::warn!("Could not set the SQLite {label}: {e}. Continuing with the default.");
         }
     }
+    for (label, statement) in [
+        ("auto vacuum", "PRAGMA auto_vacuum=INCREMENTAL;".to_owned()),
+        ("mmap size", "PRAGMA mmap_size=268435456;".to_owned()),
+        ("page cache size", "PRAGMA cache_size=-64000;".to_owned()),
+    ] {
+        if let Err(e) =
+            db.execute_raw(Statement::from_string(DatabaseBackend::Sqlite, statement)).await
+        {
+            tracing::warn!("Could not set the SQLite {label}: {e}. Continuing with the default.");
+        }
+    }
     tracing::info!(
         "SQLite session pragmas applied: foreign_keys=ON, synchronous=NORMAL, \
-         busy_timeout={SQLITE_BUSY_TIMEOUT_MS}ms, temp_store=MEMORY."
+         busy_timeout={SQLITE_BUSY_TIMEOUT_MS}ms, temp_store=MEMORY, auto_vacuum=INCREMENTAL, \
+         mmap_size=256MiB, cache_size=64MiB."
     );
 
+    // `PRAGMA optimize` refreshes the planner's statistics for tables whose data has changed enough
+    // to matter. Cheap when there is nothing to do, and it is what keeps the partial-index plans in
+    // `schema_integrity_tests.rs` honest as the data grows.
+    if let Err(e) = db.execute_raw(Statement::from_string(DatabaseBackend::Sqlite, "PRAGMA optimize;".to_owned())).await {
+        tracing::warn!("Could not run PRAGMA optimize: {e}.");
+    } else {
+        tracing::info!("SQLite planner statistics refreshed (PRAGMA optimize).");
+    }
+
+    Ok(())
+}
+
+/// Reads the database's `auto_vacuum` mode as SQLite reports it: `0` NONE, `1` FULL, `2` INCREMENTAL.
+async fn auto_vacuum_mode(db: &DatabaseConnection) -> Result<i64, DbErr> {
+    let row = db
+        .query_one_raw(Statement::from_string(DatabaseBackend::Sqlite, "PRAGMA auto_vacuum;".to_owned()))
+        .await?
+        .ok_or_else(|| DbErr::Custom("PRAGMA auto_vacuum returned no row".to_owned()))?;
+    row.try_get::<i64>("", "auto_vacuum").map_err(|e| DbErr::Custom(e.to_string()))
+}
+
+/// Converts a SQLite database still in `auto_vacuum = NONE` to `INCREMENTAL`, once, at startup.
+///
+/// SQLite only honours an `auto_vacuum` change for a database that is rewritten afterward, so the
+/// switch is followed by `VACUUM`. That rewrite is proportional to database size and holds the
+/// database for its duration — which is why this runs inside [`run_migrations_isolated`], on the
+/// single-connection pool, before the HTTP listener binds, rather than as a background task. A
+/// database already in any other mode is left alone.
+async fn ensure_incremental_auto_vacuum(db: &DatabaseConnection) -> Result<(), DbErr> {
+    if db.get_database_backend() != DatabaseBackend::Sqlite {
+        return Ok(());
+    }
+    match auto_vacuum_mode(db).await? {
+        0 => {
+            tracing::warn!(
+                "SQLite auto_vacuum is NONE; converting to INCREMENTAL and running VACUUM. This \
+                 rewrites the whole database and can take a while on a large one."
+            );
+            db.execute_unprepared("PRAGMA auto_vacuum = INCREMENTAL;").await?;
+            db.execute_unprepared("VACUUM;").await?;
+            tracing::info!("SQLite auto_vacuum converted to INCREMENTAL.");
+            Ok(())
+        }
+        mode => {
+            tracing::info!("SQLite auto_vacuum mode is {mode}; no conversion needed.");
+            Ok(())
+        }
+    }
+}
+
+/// Returns up to `pages` free pages to the operating system (`PRAGMA incremental_vacuum`).
+///
+/// Only meaningful on a database in `INCREMENTAL` mode (see [`ensure_incremental_auto_vacuum`]).
+/// Deletes leave free pages behind rather than shrinking the file; this is what gives them back,
+/// in bounded slices so no single call holds the write lock for long.
+pub async fn run_incremental_vacuum(db: &DatabaseConnection, pages: u32) -> Result<(), DbErr> {
+    if db.get_database_backend() != DatabaseBackend::Sqlite {
+        return Ok(());
+    }
+    db.execute_unprepared(&format!("PRAGMA incremental_vacuum({pages});")).await?;
+    Ok(())
+}
+
+/// Folds the write-ahead log back into the main database file and truncates it to zero bytes.
+///
+/// Without this the WAL grows with sustained writes until SQLite's automatic checkpoint (which
+/// does not truncate) lets it be reused, so an idle service can keep a large WAL file on disk.
+pub async fn wal_checkpoint_truncate(db: &DatabaseConnection) -> Result<(), DbErr> {
+    if db.get_database_backend() != DatabaseBackend::Sqlite {
+        return Ok(());
+    }
+    db.execute_unprepared("PRAGMA wal_checkpoint(TRUNCATE);").await?;
     Ok(())
 }
 

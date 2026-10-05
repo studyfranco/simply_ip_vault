@@ -13,6 +13,8 @@ pub mod ip_group;
 pub mod ip_record;
 /// The `ip_record_group_memberships` M:N junction table between IP records and groups.
 pub mod ip_record_group_membership;
+/// The `ip_record_causes` table: append-only cause history per membership.
+pub mod ip_record_cause;
 /// The `webhook_configs` table: outbound webhook endpoints scoped to an IP group.
 pub mod webhook_config;
 /// The `webhook_executions` table: one row per outbound HTTP attempt a webhook dispatch makes.

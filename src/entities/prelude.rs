@@ -16,3 +16,6 @@ pub use super::webhook_config::Entity as WebhookConfig;
 pub use super::webhook_execution::Entity as WebhookExecution;
 /// The `audit_logs` entity.
 pub use super::audit_log::Entity as AuditLog;
+
+/// The `ip_record_causes` entity.
+pub use super::ip_record_cause::Entity as IpRecordCause;

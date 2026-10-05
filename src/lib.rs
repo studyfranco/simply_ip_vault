@@ -48,6 +48,7 @@ pub mod dispatch;
 pub mod entities;
 pub mod error;
 pub mod extract;
+pub mod maintenance;
 pub mod master;
 pub mod middleware;
 pub mod migration;
@@ -64,10 +65,8 @@ pub fn create_app(state: AppState) -> Router {
         .route("/auth/me", get(api::get_me))
         .route("/ips", get(api::list_ips))
         .route("/ips", delete(api::delete_ip))
-        // Record-level lifecycle, distinct from the group-scoped `DELETE /ips` above: this acts on
-        // the record as a whole and soft-deletes by default.
-        .route("/ips/{id}", delete(api::delete_ip_record))
-        .route("/ips/{id}/restore", post(api::restore_ip_record))
+        // Restore a soft-deleted membership. Identified by address and group, like DELETE /ips.
+        .route("/ips/restore", post(api::restore_ip_record))
         .route("/system/purge-ips", post(api::purge_ip_records))
         // Bulk synchronisation for the companion exporter/sync worker. Distinct from the singular
         // `/ips` routes above: it is transactional, and its `full_replace` mode expresses "and

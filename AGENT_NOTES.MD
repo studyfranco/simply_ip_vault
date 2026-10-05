@@ -10045,3 +10045,21 @@ verify_convergence.sh` **63 matching, 0 documented divergences, 0 unexplained** 
 re-pulled first, all already up to date). `RBAC_MODEL.md` untouched. `Cargo.lock` itself is not part
 of this or any commit, by the repository's own existing convention — only `Cargo.toml`'s three-line
 pin fix is.
+
+## Addendum: membership state refactor (refactor(schema))
+
+- Per-group state moved off `ip_records` onto `ip_record_group_memberships`, which gained a surrogate `id`.
+  `ip_records` is now only `(id, target_address, created_at)`. `updated_at` is removed everywhere, and
+  `last_seen_at` is the one observation timestamp.
+- `ip_record_causes` is an append-only history. A request without a cause writes no row.
+- Membership operations address a membership by `(target_address, group)`. `DELETE /api/ips/{id}` and
+  `POST /api/ips/{id}/restore` are removed. Use `DELETE /api/ips` and `POST /api/ips/restore`, with the
+  address and group in the query or a JSON body.
+- A webhook event carries the group of the membership that changed. An add into group B must never
+  select group A's webhooks. `tests/webhook_integration_tests.rs` pins this.
+- Read-path budget: the group-scoped list and count stay under 10 ms at 100k rows. The count omits the
+  `ip_records` join unless an address filter needs it. The list plan must not contain a temp B-tree.
+  `tests/benchmark_tests.rs` checks both.
+- Retention purges memberships first, then address rows that no group holds.
+- Pragmas and maintenance are described in `SCHEMA.MD` ("Current model").
+

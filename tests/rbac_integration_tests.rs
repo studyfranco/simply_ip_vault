@@ -2,7 +2,7 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, Database, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, Database, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder};
 use sea_orm_migration::MigratorTrait;
 use serde_json::json;
 use tower::ServiceExt;
@@ -14,6 +14,94 @@ async fn setup_test_db() -> DatabaseConnection {
     let db = Database::connect("sqlite::memory:").await.unwrap();
     migration::Migrator::up(&db, None).await.unwrap();
     db
+}
+
+/// Inserts an address row. It carries only the address and when it was first recorded; the lock,
+/// observation time, soft delete and cause all belong to a membership (see [`seed_membership`]).
+async fn seed_ip_record(db: &DatabaseConnection, address: &str, created_at: chrono::NaiveDateTime) -> Uuid {
+    let id = Uuid::new_v4();
+    simply_ip_vault::entities::ip_record::ActiveModel {
+        id: Set(id),
+        target_address: Set(address.to_owned()),
+        created_at: Set(created_at),
+    }
+    .insert(db)
+    .await
+    .unwrap();
+    id
+}
+
+/// One address's state within one group, as `ip_record_group_memberships` stores it.
+#[derive(Clone, Debug)]
+struct SeededMembership {
+    is_locked: bool,
+    created_at: chrono::NaiveDateTime,
+    last_seen_at: chrono::NaiveDateTime,
+    is_deleted: bool,
+    deleted_at: Option<chrono::NaiveDateTime>,
+    deleted_by: Option<String>,
+}
+
+impl SeededMembership {
+    /// A live, unlocked membership created and last observed at `at`.
+    fn live_at(at: chrono::NaiveDateTime) -> Self {
+        Self { is_locked: false, created_at: at, last_seen_at: at, is_deleted: false, deleted_at: None, deleted_by: None }
+    }
+}
+
+/// Inserts the membership of `record_id` in `group_id` with a fresh surrogate id, and returns that id.
+async fn seed_membership(db: &DatabaseConnection, record_id: Uuid, group_id: Uuid, seed: SeededMembership) -> Uuid {
+    let id = Uuid::new_v4();
+    simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
+        id: Set(id),
+        ip_record_id: Set(record_id),
+        group_id: Set(group_id),
+        is_locked: Set(seed.is_locked),
+        created_at: Set(seed.created_at),
+        last_seen_at: Set(seed.last_seen_at),
+        is_deleted: Set(seed.is_deleted),
+        deleted_at: Set(seed.deleted_at),
+        deleted_by: Set(seed.deleted_by),
+    }
+    .insert(db)
+    .await
+    .unwrap();
+    id
+}
+
+/// Appends one cause to a membership's history, as the schema records causes (`ip_record_causes`).
+async fn seed_cause(db: &DatabaseConnection, membership_id: Uuid, cause: &str, created_at: chrono::NaiveDateTime) {
+    simply_ip_vault::entities::ip_record_cause::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        membership_id: Set(membership_id),
+        cause: Set(cause.to_owned()),
+        created_at: Set(created_at),
+    }
+    .insert(db)
+    .await
+    .unwrap();
+}
+
+/// The membership of `address` in `group_id`. Every lock and soft-delete assertion reads this, not
+/// the address row, because that state is per group.
+async fn membership_of(
+    db: &DatabaseConnection,
+    address: &str,
+    group_id: Uuid,
+) -> simply_ip_vault::entities::ip_record_group_membership::Model {
+    let record = simply_ip_vault::entities::ip_record::Entity::find()
+        .filter(simply_ip_vault::entities::ip_record::Column::TargetAddress.eq(address))
+        .one(db)
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("no ip_record for {address}"));
+    simply_ip_vault::entities::ip_record_group_membership::Entity::find()
+        .filter(simply_ip_vault::entities::ip_record_group_membership::Column::IpRecordId.eq(record.id))
+        .filter(simply_ip_vault::entities::ip_record_group_membership::Column::GroupId.eq(group_id))
+        .one(db)
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("no membership of {address} in group {group_id}"))
 }
 
 fn inject_connect_info(req: axum::http::request::Builder) -> axum::http::request::Builder {
@@ -656,36 +744,12 @@ async fn test_multi_group_and_temporal_filtering() {
     .await
     .unwrap();
 
-    let old_record_id = Uuid::new_v4();
     let old_time = chrono::Utc::now().naive_utc() - chrono::Duration::hours(2);
-    simply_ip_vault::entities::ip_record::ActiveModel {
-        id: Set(old_record_id),
-        target_address: Set("8.8.4.4".to_owned()),
-        cause: Set(None),
-        is_locked: Set(false),
-        created_at: Set(old_time),
-        updated_at: Set(old_time),
-        last_seen_at: Set(old_time),
-        is_deleted: Set(false),
-        deleted_at: Set(None),
-        deleted_by: Set(None),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
+    let old_record_id = seed_ip_record(&db, "8.8.4.4", old_time).await;
 
-    // The membership must be aged the same as the record — `since` now reads the membership's own
-    // `updated_at` (`m20260926_120000`), so a membership stamped "now" would look fresh regardless
-    // of how stale the record it points at is.
-    simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
-        ip_record_id: Set(old_record_id),
-        group_id: Set(old_group_id),
-        created_at: Set(old_time),
-        updated_at: Set(old_time),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
+    // `since` and `max_age` read the membership's own `last_seen_at`, so the membership must be aged
+    // too: a membership stamped "now" would look fresh regardless of how stale its address is.
+    seed_membership(&db, old_record_id, old_group_id, SeededMembership::live_at(old_time)).await;
 
     // `groups` filter: only the fresh record's group should be returned.
     let req = signed(inject_connect_info(Request::builder()
@@ -3559,8 +3623,8 @@ async fn test_list_ips_include_total_respects_rbac_group_scoping() {
     assert_eq!(parsed["data"].as_array().unwrap().len(), 0);
 }
 
-/// `GET /api/ips` must order results by `updated_at DESC` — the most recently added or
-/// re-registered record always sorts first, regardless of insertion order.
+/// `GET /api/ips` must order results by the membership's `last_seen_at DESC` — the most recently
+/// added or re-registered address always sorts first, regardless of insertion order.
 #[tokio::test]
 async fn test_list_ips_orders_by_updated_at_descending() {
     let db = setup_test_db().await;
@@ -3605,7 +3669,7 @@ async fn test_list_ips_orders_by_updated_at_descending() {
     let addresses = list(&app, &master_key, 0).await;
     assert_eq!(addresses, vec!["203.0.113.103", "203.0.113.102", "203.0.113.101"], "most recently created sorts first");
 
-    // Re-register the OLDEST one (.101) — it must now jump to the front, since its updated_at is
+    // Re-register the OLDEST one (.101) — it must now jump to the front, since its last_seen_at is
     // now the most recent of the three.
     assert_eq!(app.clone().oneshot(ban("203.0.113.101", 1)).await.unwrap().status(), StatusCode::OK);
 
@@ -4368,7 +4432,23 @@ async fn test_auth_mode_preconditions_are_enforced_at_creation() {
 async fn test_auth_mode_migration_preserves_existing_rows_and_reverses_cleanly() {
     use sea_orm::{ConnectionTrait, Statement};
 
-    let db = setup_test_db().await;
+    // Migrate only up to the membership refactor, not the whole registry. That refactor is
+    // irreversible by design: membership state cannot be split back onto a shared address row
+    // without choosing which group's copy wins. Unwinding through it would therefore prove nothing
+    // about the auth-mode migration. Stopping just before it lets this test cover the auth-mode
+    // reversal exactly as it was, against the schema it actually ran on.
+    let all = migration::Migrator::migrations();
+    let auth_mode_index = all
+        .iter()
+        .position(|m| m.name().contains("add_webhook_auth_modes"))
+        .expect("the auth-mode migration must be registered");
+    let refactor_index = all
+        .iter()
+        .position(|m| m.name().contains("refactor_membership_state"))
+        .expect("the membership refactor must be registered");
+
+    let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+    migration::Migrator::up(&db, Some(refactor_index as u32)).await.unwrap();
     let backend = db.get_database_backend();
     let exec = |sql: &str| db.execute_raw(Statement::from_string(backend, sql.to_owned()));
 
@@ -4379,16 +4459,10 @@ async fn test_auth_mode_migration_preserves_existing_rows_and_reverses_cleanly()
           VALUES ('w', 'legacy', 'https://example.com/hook', 's', 'BODY_ONLY', '{}', 'g', 1, '2026-01-01 00:00:00')")
         .await.unwrap();
 
-    // Reverse *back through* the auth-mode migration. The step count is derived from the registry
-    // rather than hardcoded: `down` always unwinds from the newest migration, so every migration
-    // added after this one shifts how far back the auth-mode change sits. Computing it here means
-    // adding a migration cannot silently turn this into a test of something else.
-    let all = migration::Migrator::migrations();
-    let auth_mode_index = all
-        .iter()
-        .position(|m| m.name().contains("add_webhook_auth_modes"))
-        .expect("the auth-mode migration must be registered");
-    let steps = (all.len() - auth_mode_index) as u32;
+    // Reverse back through the auth-mode migration. The step count is derived from the registry, so
+    // adding a migration cannot silently shift what this test covers. The newest migration applied
+    // here is the one just before the refactor.
+    let steps = (refactor_index - auth_mode_index) as u32;
 
     migration::Migrator::down(&db, Some(steps)).await.unwrap();
     let row = db.query_one_raw(Statement::from_string(backend,
@@ -6711,31 +6785,10 @@ async fn s6_a_complete_resolution_map_cascades_the_subtree_and_honours_each_reso
     let (survivor_id, _survivor_key) = insert_key(&db, "Survivor", false, false, false, false).await;
 
     // Some IP data in the group, to prove reassignment moves the container without touching contents.
-    let record_id = Uuid::new_v4();
-    simply_ip_vault::entities::ip_record::ActiveModel {
-        id: Set(record_id),
-        target_address: Set("203.0.113.5".to_owned()),
-        cause: Set(Some("pre-cascade".to_owned())),
-        is_locked: Set(false),
-        is_deleted: Set(false),
-        deleted_at: Set(None),
-        deleted_by: Set(None),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
-        last_seen_at: Set(chrono::Utc::now().naive_utc()),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
-    simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
-        ip_record_id: Set(record_id),
-        group_id: Set(group_id),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
+    let now = chrono::Utc::now().naive_utc();
+    let record_id = seed_ip_record(&db, "203.0.113.5", now).await;
+    let membership_id = seed_membership(&db, record_id, group_id, SeededMembership::live_at(now)).await;
+    seed_cause(&db, membership_id, "pre-cascade", now).await;
 
     let complete = json!({
         "resolutions": [
@@ -6784,10 +6837,10 @@ async fn s6_a_complete_resolution_map_cascades_the_subtree_and_honours_each_reso
 
     // §6: "Data is never destroyed implicitly." The IP record inside the reassigned group is
     // untouched, and so is its membership.
-    let record = simply_ip_vault::entities::prelude::IpRecord::find_by_id(record_id)
+    let membership = simply_ip_vault::entities::prelude::IpRecordGroupMembership::find_by_id(membership_id)
         .one(&db).await.unwrap()
         .expect("resource data must survive a key cascade");
-    assert!(!record.is_deleted, "and it was not soft-deleted either");
+    assert!(!membership.is_deleted, "and it was not soft-deleted either");
     assert_eq!(
         simply_ip_vault::entities::ip_record_group_membership::Entity::find()
             .filter(simply_ip_vault::entities::ip_record_group_membership::Column::GroupId.eq(group_id))
@@ -6976,7 +7029,7 @@ async fn batch_fixture() -> (axum::Router, DatabaseConnection, String) {
     (app, db, plaintext)
 }
 
-/// Reads one record straight from the database, bypassing every read endpoint.
+/// Reads one address row straight from the database, bypassing every read endpoint.
 ///
 /// The assertions below are about columns — `created_at` preserved, `deleted_by` populated — and a
 /// listing endpoint applies its own projection and scoping. Going to the row is the only way to see
@@ -6992,7 +7045,42 @@ async fn raw_record_by_address(
         .unwrap()
 }
 
-/// Re-registering an address advances `last_seen_at` and `updated_at` but never `created_at`.
+/// Reads one membership straight from the database, resolving the group by name. `None` when the
+/// address is not in that group (or does not exist).
+async fn raw_membership(
+    db: &DatabaseConnection,
+    address: &str,
+    group_name: &str,
+) -> Option<simply_ip_vault::entities::ip_record_group_membership::Model> {
+    let group = simply_ip_vault::entities::ip_group::Entity::find()
+        .filter(simply_ip_vault::entities::ip_group::Column::Name.eq(group_name.to_owned()))
+        .one(db)
+        .await
+        .unwrap()?;
+    let record = raw_record_by_address(db, address).await?;
+    simply_ip_vault::entities::ip_record_group_membership::Entity::find()
+        .filter(simply_ip_vault::entities::ip_record_group_membership::Column::IpRecordId.eq(record.id))
+        .filter(simply_ip_vault::entities::ip_record_group_membership::Column::GroupId.eq(group.id))
+        .one(db)
+        .await
+        .unwrap()
+}
+
+/// Every cause in a membership's history, oldest first. An absent cause writes no row, so an empty
+/// vector is the only way to say "no cause was ever reported".
+async fn causes_of(db: &DatabaseConnection, membership_id: Uuid) -> Vec<String> {
+    simply_ip_vault::entities::ip_record_cause::Entity::find()
+        .filter(simply_ip_vault::entities::ip_record_cause::Column::MembershipId.eq(membership_id))
+        .order_by_asc(simply_ip_vault::entities::ip_record_cause::Column::CreatedAt)
+        .all(db)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|c| c.cause)
+        .collect()
+}
+
+/// Re-registering an address advances the membership's `last_seen_at` but never `created_at`.
 ///
 /// `created_at` records when this service first saw the address. A sync that reports it again is not
 /// a creation, and letting a client overwrite that field would make the column mean "when the
@@ -7044,6 +7132,7 @@ async fn batch_preserves_created_at_while_advancing_last_seen_at() {
 
     let first = raw_record_by_address(&db, "203.0.113.10").await.expect("record exists");
     assert_eq!(first.created_at.to_string(), "2020-01-01 00:00:00");
+    let first_membership = raw_membership(&db, "203.0.113.10", "batch-group").await.expect("membership exists");
 
     // Second sync: same address, newer activity.
     let res = post(
@@ -7071,9 +7160,14 @@ async fn batch_preserves_created_at_while_advancing_last_seen_at() {
         second.created_at, first.created_at,
         "created_at must survive a re-sync — even one that supplies an earlier value"
     );
-    assert_eq!(second.last_seen_at.to_string(), "2026-06-01 12:00:00");
-    assert!(second.updated_at > first.updated_at, "updated_at advances");
-    assert_eq!(second.cause.as_deref(), Some("initial"), "an omitted cause does not clear it");
+    let second_membership = raw_membership(&db, "203.0.113.10", "batch-group").await.expect("membership still exists");
+    assert_eq!(second_membership.last_seen_at.to_string(), "2026-06-01 12:00:00");
+    assert!(second_membership.last_seen_at > first_membership.last_seen_at, "last_seen_at advances");
+    assert_eq!(
+        causes_of(&db, second_membership.id).await,
+        vec!["initial".to_owned()],
+        "an omitted cause writes no history row and does not clear the existing one"
+    );
 }
 
 /// A locked record is skipped, counted, and left byte-for-byte as it was.
@@ -7086,33 +7180,17 @@ async fn batch_skips_locked_records_without_modifying_them() {
     let (app, db, key) = batch_fixture().await;
     let group_id = insert_group_row(&db, "locked-group").await;
 
-    // A locked record, placed in the group directly.
-    let record_id = Uuid::new_v4();
+    // A locked membership, placed in the group directly.
     let original = chrono::NaiveDateTime::parse_from_str("2021-03-04 05:06:07", "%Y-%m-%d %H:%M:%S").unwrap();
-    simply_ip_vault::entities::ip_record::ActiveModel {
-        id: Set(record_id),
-        target_address: Set("203.0.113.20".to_owned()),
-        cause: Set(Some("hands off".to_owned())),
-        is_locked: Set(true),
-        created_at: Set(original),
-        updated_at: Set(original),
-        last_seen_at: Set(original),
-        is_deleted: Set(false),
-        deleted_at: Set(None),
-        deleted_by: Set(None),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
-    simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
-        ip_record_id: Set(record_id),
-        group_id: Set(group_id),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
+    let record_id = seed_ip_record(&db, "203.0.113.20", original).await;
+    let membership_id = seed_membership(
+        &db,
+        record_id,
+        group_id,
+        SeededMembership { is_locked: true, ..SeededMembership::live_at(original) },
+    )
+    .await;
+    seed_cause(&db, membership_id, "hands off", original).await;
 
     let body = json!({
         "group_name": "locked-group",
@@ -7142,11 +7220,11 @@ async fn batch_skips_locked_records_without_modifying_them() {
     assert_eq!(summary["updated"], 0);
     assert_eq!(summary["created"], 0);
 
-    let row = raw_record_by_address(&db, "203.0.113.20").await.expect("still there");
+    let row = raw_membership(&db, "203.0.113.20", "locked-group").await.expect("still there");
     assert!(row.is_locked, "the lock survives");
     assert!(!row.is_deleted, "a locked record is not soft-deleted by a batch that asks for it");
-    assert_eq!(row.cause.as_deref(), Some("hands off"), "its cause is untouched");
-    assert_eq!(row.updated_at, original, "not even updated_at moves");
+    assert_eq!(causes_of(&db, row.id).await, vec!["hands off".to_owned()], "its cause history is untouched");
+    assert_eq!(row.last_seen_at, original, "not even last_seen_at moves");
 }
 
 /// `full_replace` soft-deletes the active records the batch omits, attributing each to the caller.
@@ -7168,32 +7246,10 @@ async fn full_replace_soft_deletes_omitted_records_and_records_who_did_it() {
     let seed = |address: &'static str, locked: bool| {
         let db = db.clone();
         async move {
-            let id = Uuid::new_v4();
             let now = chrono::Utc::now().naive_utc();
-            simply_ip_vault::entities::ip_record::ActiveModel {
-                id: Set(id),
-                target_address: Set(address.to_owned()),
-                cause: Set(None),
-                is_locked: Set(locked),
-                created_at: Set(now),
-                updated_at: Set(now),
-                last_seen_at: Set(now),
-                is_deleted: Set(false),
-                deleted_at: Set(None),
-                deleted_by: Set(None),
-            }
-            .insert(&db)
-            .await
-            .unwrap();
-            simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
-                ip_record_id: Set(id),
-                group_id: Set(group_id),
-                created_at: Set(now),
-                updated_at: Set(now),
-            }
-            .insert(&db)
-            .await
-            .unwrap();
+            let id = seed_ip_record(&db, address, now).await;
+            seed_membership(&db, id, group_id, SeededMembership { is_locked: locked, ..SeededMembership::live_at(now) })
+                .await;
         }
     };
     seed("203.0.113.31", false).await; // kept — the batch lists it
@@ -7223,10 +7279,10 @@ async fn full_replace_soft_deletes_omitted_records_and_records_who_did_it() {
             .unwrap();
     assert_eq!(summary["soft_deleted"], 1, "exactly the omitted unlocked record");
 
-    let kept = raw_record_by_address(&db, "203.0.113.31").await.unwrap();
+    let kept = membership_of(&db, "203.0.113.31", group_id).await;
     assert!(!kept.is_deleted, "a listed record stays live");
 
-    let swept = raw_record_by_address(&db, "203.0.113.32").await.unwrap();
+    let swept = membership_of(&db, "203.0.113.32", group_id).await;
     assert!(swept.is_deleted, "an omitted record is soft-deleted");
     assert!(swept.deleted_at.is_some(), "and stamped");
     assert_eq!(
@@ -7236,7 +7292,7 @@ async fn full_replace_soft_deletes_omitted_records_and_records_who_did_it() {
          key being deleted later"
     );
 
-    let locked = raw_record_by_address(&db, "203.0.113.33").await.unwrap();
+    let locked = membership_of(&db, "203.0.113.33", group_id).await;
     assert!(
         !locked.is_deleted,
         "a locked record is exempt from the sweep — an administrative hold a remote sync could \
@@ -7277,14 +7333,14 @@ async fn deleted_by_survives_the_deletion_of_the_key_it_names() {
     );
     assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
 
-    let row = raw_record_by_address(&db, "203.0.113.40").await.unwrap();
+    let row = raw_membership(&db, "203.0.113.40", "attrib-group").await.unwrap();
     assert!(row.is_deleted);
     assert_eq!(row.deleted_by.as_deref(), Some(key_id.to_string().as_str()));
 
     // Remove the key directly — the API refuses to delete a master, and this is about the column.
     simply_ip_vault::entities::api_key::Entity::delete_by_id(key_id).exec(&db).await.unwrap();
 
-    let after = raw_record_by_address(&db, "203.0.113.40").await.unwrap();
+    let after = raw_membership(&db, "203.0.113.40", "attrib-group").await.unwrap();
     assert_eq!(
         after.deleted_by.as_deref(),
         Some(key_id.to_string().as_str()),
@@ -7739,8 +7795,8 @@ async fn a_large_batch_completes_promptly_and_leaves_the_service_responsive() {
     );
 
     // Every row is accounted for: nothing was lost, and the sweep was scoped.
-    let live = simply_ip_vault::entities::ip_record::Entity::find()
-        .filter(simply_ip_vault::entities::ip_record::Column::IsDeleted.eq(false))
+    let live = simply_ip_vault::entities::ip_record_group_membership::Entity::find()
+        .filter(simply_ip_vault::entities::ip_record_group_membership::Column::IsDeleted.eq(false))
         .all(&db)
         .await
         .unwrap()
@@ -7764,9 +7820,9 @@ async fn a_large_batch_completes_promptly_and_leaves_the_service_responsive() {
 ///
 /// # The bug this pins
 ///
-/// Soft delete writes `is_deleted`, `deleted_at`, `deleted_by` and `updated_at` — but deliberately
-/// **not** `last_seen_at`, which records when the address was last *observed*, not when the row was
-/// last touched. Conflating the two would corrupt the field's meaning.
+/// Soft delete writes `is_deleted`, `deleted_at` and `deleted_by` on the membership — but deliberately
+/// **not** `last_seen_at`, which records when the address was last *observed* in that group, not when
+/// the membership was last touched. Conflating the two would corrupt the field's meaning.
 ///
 /// The `since` filter, however, tested `last_seen_at` alone. So an address last seen at T0 and
 /// deleted at T1 was invisible to every `?since=` query with a cutoff after T0: the deletion had
@@ -7790,31 +7846,9 @@ async fn test_differential_sync_includes_recently_deleted_ips() {
     // T0 — an hour ago. Seeded directly so the timestamp is exact; the deletion below still goes
     // through the real endpoint, so the code path that writes the tombstone is the deployed one.
     let t0 = chrono::Utc::now().naive_utc() - chrono::Duration::hours(1);
-    let record_id = Uuid::new_v4();
-    simply_ip_vault::entities::ip_record::ActiveModel {
-        id: Set(record_id),
-        target_address: Set("198.51.100.77".to_owned()),
-        cause: Set(Some("seeded at T0".to_owned())),
-        is_locked: Set(false),
-        created_at: Set(t0),
-        updated_at: Set(t0),
-        last_seen_at: Set(t0),
-        is_deleted: Set(false),
-        deleted_at: Set(None),
-        deleted_by: Set(None),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
-    simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
-        ip_record_id: Set(record_id),
-        group_id: Set(group_id),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
+    let record_id = seed_ip_record(&db, "198.51.100.77", t0).await;
+    let membership_id = seed_membership(&db, record_id, group_id, SeededMembership::live_at(t0)).await;
+    seed_cause(&db, membership_id, "seeded at T0", t0).await;
 
     let get = |path: String, tick: i64| {
         let (app, key) = (app.clone(), key.clone());
@@ -7831,21 +7865,22 @@ async fn test_differential_sync_includes_recently_deleted_ips() {
         }
     };
 
-    // T1 — delete through the API, so `deleted_at` is written by production code.
+    // T1 — delete through the API, so `deleted_at` is written by production code. The membership is
+    // named by address and group in the body; the address row itself is never touched.
     let req = signed_later(
         inject_connect_info(
-            Request::builder().method("DELETE").uri(format!("/api/ips/{record_id}")).header("X-API-Key", &key),
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/ips")
+                .header("X-API-Key", &key)
+                .header("Content-Type", "application/json"),
         ),
         1,
-        "",
+        json!({ "target_address": "198.51.100.77", "group_name": "sync-group" }).to_string(),
     );
-    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
 
-    let row = simply_ip_vault::entities::ip_record::Entity::find_by_id(record_id)
-        .one(&db)
-        .await
-        .unwrap()
-        .expect("the row survives a soft delete");
+    let row = membership_of(&db, "198.51.100.77", group_id).await;
     assert!(row.is_deleted, "the delete was soft");
     let t1 = row.deleted_at.expect("deleted_at is stamped");
     assert_eq!(row.last_seen_at, t0, "last_seen_at must NOT move on delete — that is the premise");
@@ -7884,34 +7919,10 @@ async fn test_differential_sync_includes_recently_deleted_ips() {
 
     // 4. A live record whose last_seen_at predates the cutoff stays excluded, so the new clause
     //    widened the filter for tombstones only and not for everything.
-    let quiet_id = Uuid::new_v4();
-    simply_ip_vault::entities::ip_record::ActiveModel {
-        id: Set(quiet_id),
-        target_address: Set("198.51.100.88".to_owned()),
-        cause: Set(None),
-        is_locked: Set(false),
-        created_at: Set(t0),
-        updated_at: Set(t0),
-        last_seen_at: Set(t0),
-        is_deleted: Set(false),
-        deleted_at: Set(None),
-        deleted_by: Set(None),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
-    // Aged the same as the record — `since`'s primary arm now reads the membership's own
-    // `updated_at` (`m20260926_120000`), so a membership stamped "now" would look freshly touched
-    // regardless of how quiet the record it points at actually was.
-    simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
-        ip_record_id: Set(quiet_id),
-        group_id: Set(group_id),
-        created_at: Set(t0),
-        updated_at: Set(t0),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
+    let quiet_id = seed_ip_record(&db, "198.51.100.88", t0).await;
+    // Aged the same as the address: `since` reads the membership's own `last_seen_at`, so a membership
+    // stamped "now" would look freshly observed regardless of how quiet it actually was.
+    seed_membership(&db, quiet_id, group_id, SeededMembership::live_at(t0)).await;
 
     let (_, body) = get(format!("/api/ips?since={t1_epoch}&include_deleted=true"), 5).await;
     assert!(
@@ -8062,34 +8073,21 @@ async fn test_sync_since_older_than_retention_period() {
     let seed = |address: &'static str, last_seen: chrono::NaiveDateTime, deleted: Option<chrono::NaiveDateTime>| {
         let db = db.clone();
         async move {
-            let id = Uuid::new_v4();
-            simply_ip_vault::entities::ip_record::ActiveModel {
-                id: Set(id),
-                target_address: Set(address.to_owned()),
-                cause: Set(None),
-                is_locked: Set(false),
-                created_at: Set(last_seen),
-                updated_at: Set(last_seen),
-                last_seen_at: Set(last_seen),
-                is_deleted: Set(deleted.is_some()),
-                deleted_at: Set(deleted),
-                deleted_by: Set(None),
-            }
-            .insert(&db)
-            .await
-            .unwrap();
-            // Aged the same as `last_seen` — `since`'s primary arm now reads the membership's own
-            // `updated_at` (`m20260926_120000`), so this closure's whole "how long ago" parameter
-            // would be silently ignored by the filter under test if the membership stayed "now".
-            simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
-                ip_record_id: Set(id),
-                group_id: Set(group_id),
-                created_at: Set(last_seen),
-                updated_at: Set(last_seen),
-            }
-            .insert(&db)
-            .await
-            .unwrap();
+            let id = seed_ip_record(&db, address, last_seen).await;
+            // Aged the same as `last_seen`: `since` reads the membership's own `last_seen_at`, so this
+            // closure's "how long ago" parameter would be silently ignored by the filter under test if
+            // the membership were stamped "now".
+            seed_membership(
+                &db,
+                id,
+                group_id,
+                SeededMembership {
+                    is_deleted: deleted.is_some(),
+                    deleted_at: deleted,
+                    ..SeededMembership::live_at(last_seen)
+                },
+            )
+            .await;
         }
     };
 
@@ -8143,8 +8141,8 @@ async fn test_sync_since_older_than_retention_period() {
     // The boundary is a property of the data, not of the query: a tombstone purged by retention is
     // simply absent, and no `since` value can recover it. Asserted by deleting the row the way the
     // retention worker would and re-running the identical request.
-    simply_ip_vault::entities::ip_record::Entity::delete_many()
-        .filter(simply_ip_vault::entities::ip_record::Column::TargetAddress.eq("198.51.100.202"))
+    let purged = membership_of(&db, "198.51.100.202", group_id).await;
+    simply_ip_vault::entities::ip_record_group_membership::Entity::delete_by_id(purged.id)
         .exec(&db)
         .await
         .unwrap();

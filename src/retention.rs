@@ -1,4 +1,4 @@
-//! Background retention worker: permanently drops soft-deleted IP records once they age out.
+//! Background retention worker: permanently drops soft-deleted IP memberships once they age out.
 //!
 //! A soft delete (`ip_records.is_deleted`) is reversible by design — it exists so a mistyped
 //! `DELETE`, or one issued by a compromised delegated key, is recoverable. That safety net is only
@@ -12,10 +12,13 @@
 use std::time::Duration;
 
 use chrono::Utc;
-use sea_orm::{ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter};
+use sea_orm::{
+    ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, TransactionTrait,
+    sea_query::{Expr, ExprTrait, Query},
+};
 use tokio::sync::mpsc;
 
-use crate::entities::{ip_record, webhook_execution};
+use crate::entities::{ip_record, ip_record_group_membership, webhook_execution};
 
 /// Days a soft-deleted record is kept before the purge removes it for good.
 pub const DEFAULT_RETENTION_DAYS: i64 = 92;
@@ -53,22 +56,23 @@ pub fn retention_days_from_env() -> i64 {
 /// Reads the configured sweep interval, clamped to at least one second.
 fn sweep_seconds_from_env() -> u64 {
     match std::env::var(RETENTION_SWEEP_ENV) {
-        Ok(raw) => raw.trim().parse::<u64>().unwrap_or(DEFAULT_SWEEP_SECONDS).max(1),
+        Ok(raw) => std::cmp::max(raw.trim().parse::<u64>().unwrap_or(DEFAULT_SWEEP_SECONDS), 1),
         Err(_) => DEFAULT_SWEEP_SECONDS,
     }
 }
 
-/// Permanently deletes soft-deleted IP records whose `deleted_at` is older than `retention_days`.
+/// Permanently deletes soft-deleted memberships whose `deleted_at` is older than `retention_days`,
+/// then removes any canonical address row that no group still references.
 ///
-/// Returns the number of rows removed. A non-positive `retention_days` disables purging and is a
-/// no-op, so an operator can retain the trash indefinitely without also disabling the worker.
+/// Returns the number of memberships removed. A non-positive `retention_days` disables purging and
+/// is a no-op, so an operator can retain the trash indefinitely without also disabling the worker.
 ///
-/// Both conditions are required, not just the timestamp: a row with `deleted_at` set but
-/// `is_deleted = false` is a *restored* record that kept its old timestamp, and purging it would
-/// silently destroy live data. Matching on the flag as well makes that impossible by construction.
+/// Both conditions are required on a membership: a row with `deleted_at` set but `is_deleted =
+/// false` is a *restored* membership that kept its old timestamp, and purging it would silently
+/// destroy live data.
 ///
-/// The `ip_record_group_memberships` rows go with it via the schema's `ON DELETE CASCADE`, so no
-/// orphan junction rows survive the purge.
+/// Order matters: memberships first, then orphaned addresses. The cause history goes with its
+/// membership via `ON DELETE CASCADE`. An address still held by another group keeps its row.
 pub async fn purge_expired_ip_records(
     db: &DatabaseConnection,
     retention_days: i64,
@@ -79,13 +83,27 @@ pub async fn purge_expired_ip_records(
 
     let threshold = (Utc::now() - chrono::Duration::days(retention_days)).naive_utc();
 
-    let result = ip_record::Entity::delete_many()
-        .filter(ip_record::Column::IsDeleted.eq(true))
-        .filter(ip_record::Column::DeletedAt.is_not_null())
-        .filter(ip_record::Column::DeletedAt.lt(threshold))
-        .exec(db)
+    let txn = db.begin().await?;
+    let result = ip_record_group_membership::Entity::delete_many()
+        .filter(ip_record_group_membership::Column::IsDeleted.eq(true))
+        .filter(ip_record_group_membership::Column::DeletedAt.is_not_null())
+        .filter(ip_record_group_membership::Column::DeletedAt.lt(threshold))
+        .exec(&txn)
         .await?;
 
+    ip_record::Entity::delete_many()
+        .filter(
+            Expr::col((ip_record::Entity, ip_record::Column::Id)).not_in_subquery(
+                Query::select()
+                    .column((ip_record_group_membership::Entity, ip_record_group_membership::Column::IpRecordId))
+                    .from(ip_record_group_membership::Entity)
+                    .to_owned(),
+            ),
+        )
+        .exec(&txn)
+        .await?;
+
+    txn.commit().await?;
     Ok(result.rows_affected)
 }
 

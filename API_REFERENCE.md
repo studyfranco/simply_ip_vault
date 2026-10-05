@@ -224,8 +224,8 @@ holds `can_read` on. Master sees everything.
 | `ip` | string | no | — | Substring match on `target_address`. A fully parseable address/CIDR is canonicalized first so it still matches the stored form |
 | `cause` | string | no | — | Substring match on `cause` |
 | `status` | string | no | — | `ban`\|`banlist` or `white`\|`whitelist`. Anything else → `400` |
-| `max_age` | i64 (secs) | no | — | Only records whose `last_seen_at` is within this many seconds — address-wide freshness, not scoped to any one group |
-| `since` | i64 (unix) | no | — | Delta-sync cutoff. In scope when **this row's group membership's own** `updated_at >= since`, **or** — with `include_deleted=true` — when `is_deleted` and `deleted_at >= since`. Scoped per membership since `m20260926_120000` — an address re-registered into a *different* group no longer makes it look changed here (see the response schema note below) |
+| `max_age` | i64 (secs) | no | — | Only memberships whose `last_seen_at` is within this many seconds. Per membership, so it reads the observation in the group being listed |
+| `since` | i64 (unix) | no | — | Delta-sync cutoff. In scope when this membership's `last_seen_at >= since`, **or** — with `include_deleted=true` — when `is_deleted` and `deleted_at >= since`. Scoped per membership: a change in one group never makes the same address look changed in another |
 | `include_deleted` | bool | no | `false` | Include soft-deleted records. Scoped exactly as live ones; **not** master-gated |
 | `limit` | u64 | no | `50` | Page size |
 | `offset` | u64 | no | `0` | Page offset |
@@ -233,30 +233,25 @@ holds `can_read` on. Master sees everything.
 | `mode` | string | no | — | Synonym for `format` |
 | `include_total` | bool | no | `false` | Wrap the response in a `{data, total, limit, offset, total_pages}` envelope instead of the bare array. Ignored under `format=iplist`/`mode=iplist` |
 
-**Response `200`** — by default, an array of `IpRecordResponse`, ordered by (this row's group
-membership's own) `updated_at` descending:
+**Response `200`** — by default, an array of `IpRecordResponse`, ordered by `last_seen_at`
+descending. Each item is one **membership**: an address's state within one group.
 
 ```json
 [{
-  "id": "uuid", "target_address": "192.0.2.10", "group_name": "fail2ban",
+  "id": "uuid",            // the membership id
+  "ip_record_id": "uuid",  // the canonical address row
+  "target_address": "192.0.2.10", "group_name": "fail2ban",
   "group_type": "banlist", "cause": "SSH brute force" | null, "is_locked": false,
-  "created_at": "...", "updated_at": "...", "last_seen_at": "...",
+  "created_at": "...", "last_seen_at": "...",
   "is_deleted": false,
   "deleted_at": "...",        // omitted when null
   "deleted_by": "uuid-string" // MASTER ONLY — omitted for every other caller
 }]
 ```
 
-> **`created_at`/`updated_at` describe this row's *(record, group)* pairing, not the address in
-> general — `last_seen_at` is the one that does.** Since `m20260926_120000`, the first two come
-> from `ip_record_group_memberships`, which carries its own history per group; an address in three
-> groups has one `ip_records` row but three distinct membership rows, and this response surfaces
-> the one for *this* row's `group_name`. Before that migration these two fields echoed the shared
-> `ip_records.created_at`/`updated_at`, so re-registering an address into Group A made its row in
-> every other group it belonged to show the same fresh `updated_at` too — the bug that also drove
-> `since` above. `last_seen_at` stays address-wide on purpose: it answers "is this address still
-> active anywhere", not "did this group's membership change", and `max_age` still filters on it
-> unchanged.
+> There is no `updated_at`. `created_at` is when the address was first linked into this group, and
+> `last_seen_at` is the latest observation in this group. `cause` is the most recent entry in the
+> membership's append-only cause history, and is `null` when no cause was ever reported.
 
 With `format=iplist` or `mode=iplist`, the shape is instead `{"ip_list": ["192.0.2.10", ...]}` —
 sorted and de-duplicated, skipping the per-row group lookup.
@@ -301,80 +296,66 @@ in `tests/schema_integrity_tests.rs` for measured figures.
 > `deleted_by` is withheld from non-masters even under `include_deleted`: §4 limits what one key may
 > learn about another to id, name, and rights on a *shared* resource.
 
-### `DELETE /api/ips`
+### `DELETE /api/ips` (soft or hard)
 
-**Handler:** `api::delete_ip` · **Auth:** `can_delete` on the named group (Master bypasses)
+Soft-deletes one address's membership in one group. The hard form (`hard=true`) removes the row.
+Both are identified by address and group, so the request never needs a database id.
 
-Removes a record's membership in **one group**, leaving the record itself intact. Distinct from
-`DELETE /api/ips/{id}`, which acts on the record as a whole.
+**Auth:** `can_delete` on the named group. `hard=true` is **Master only**.
 
-Parameters may arrive via **query string, JSON body, or a mix of both** — some HTTP clients refuse to
-attach a body to `DELETE`, others prefer one. Query values win on overlap.
+Parameters may arrive via **query string, JSON body, or both**. Query values win on overlap.
+
+```http
+DELETE /api/ips
+Content-Type: application/json
+
+{"target_address": "192.0.2.10", "group_name": "fail2ban"}
+```
 
 | Name | Type | Req. | Description |
 | :--- | :--- | :--- | :--- |
-| `target_address` | string | **yes** | Address or CIDR. Canonicalized before lookup, so `X/32` and `X` both match |
+| `target_address` | string | **yes** | Address or CIDR. Canonicalized before lookup |
 | `group_id` | UUID | one of | Target group by id |
 | `group_name` | string | one of | Target group by name |
+| `hard` | bool | no | `false`. **Master only.** Removes the membership row; the address row too if no group still holds it |
 
-Exactly one of `group_id` / `group_name` is required.
-
-| Status | Meaning |
-| :--- | :--- |
-| `204` | Membership removed |
-| `400` | `target_address` missing, or both group identifiers supplied |
-| `403` | No `can_delete` on the group; or the record is `is_locked` |
-| `404` | Group, record, or membership not found |
-
-Enqueues an `IP_DELETE` webhook event after the transaction commits.
-
-### `DELETE /api/ips/{id}`
-
-**Handler:** `api::delete_ip_record` · **Auth:** `can_delete` on **at least one** group holding the
-record. `?hard=true` is **Master only**.
-
-Soft-deletes by default: the row stays, marked `is_deleted` with `deleted_at`/`deleted_by` set, and
-disappears from every read until a master restores it or retention purges it after 92 days.
-
-| Path param | Type | Description |
-| :--- | :--- | :--- |
-| `id` | UUID | Record id |
-
-| Query param | Type | Req. | Default | Description |
-| :--- | :--- | :--- | :--- | :--- |
-| `hard` | bool | no | `false` | **Master only.** Drop the row outright, cascading to memberships |
-
-**Response `200`:**
-
-```json
-{ "id": "uuid", "target_address": "192.0.2.10", "deleted": "soft", "already_deleted": false }
-// hard delete: { "id": "...", "target_address": "...", "deleted": "permanent" }
-```
-
-`already_deleted: true` is returned without moving `deleted_at`, so a repeated call cannot silently
+Soft delete is the default: the membership is marked `is_deleted` with `deleted_at`/`deleted_by`
+set, hidden from every read until a master restores it or retention purges it after 92 days.
+Deleting an already-deleted membership returns `204` without moving `deleted_at`, so a repeat cannot
 extend the retention window.
 
 | Status | Meaning |
 | :--- | :--- |
-| `403` | No delete access to any group holding the record; record is `is_locked`; or `hard=true` from a non-master |
-| `404` | No such record |
+| `204` | Membership deleted (soft or hard) |
+| `400` | `target_address` missing, or invalid JSON |
+| `403` | No `can_delete` on the group; the membership is `is_locked`; or `hard=true` from a non-master |
+| `404` | No such group, address, or membership in that group |
+
+Enqueues an `IP_DELETE` webhook event after the transaction commits, for this group only.
 
 > A delegated key never gets a hard delete: `can_delete` is a routine, widely-handed-out scope, and
 > its blast radius should be a recoverable mistake rather than permanent data loss.
 
-### `POST /api/ips/{id}/restore`
+### `POST /api/ips/restore`
 
-**Handler:** `api::restore_ip_record` · **Auth:** **Master only**
+**Auth:** **Master only**. Identified by address and group, like `DELETE /api/ips`, as query, body, or both.
 
-Clears `is_deleted`, `deleted_at` and `deleted_by`, so a restored row is indistinguishable from one
-never deleted.
+```http
+POST /api/ips/restore
+Content-Type: application/json
+
+{"target_address": "192.0.2.10", "group_name": "fail2ban"}
+```
+
+Clears `is_deleted`, `deleted_at` and `deleted_by` on that membership, so it is indistinguishable
+from one never deleted.
 
 | Status | Body / meaning |
 | :--- | :--- |
-| `200` | `{"id":"uuid","target_address":"...","is_deleted":false,"restored":true}` |
-| `400` | The record is not deleted; nothing to restore |
+| `200` | `{"target_address":"...","group_name":"...","is_deleted":false,"restored":true}` |
+| `400` | The membership is not deleted; nothing to restore |
 | `403` | Caller is not master |
-| `404` | No such record |
+| `404` | No such group, address, or membership in that group |
 
 > Master-only even though a delegated key may have caused the deletion: the point of the trash is
 > that recovering from a compromised key does not depend on that same key's authority.
@@ -457,8 +438,8 @@ Each `records[]` entry (`BatchRecordInput`):
 | `cause` | string | no | Omitted leaves an existing value untouched; it does not clear it |
 | `is_deleted` | bool | no | `false` on an existing deleted record restores it |
 | `created_at` | datetime | no | Used **only** when the record is new; never overwrites an existing value |
-| `updated_at` | datetime | no | Defaults to now |
-| `last_seen_at` | datetime | no | Defaults to now |
+| `last_seen_at` | datetime | no | Defaults to now. The observation time for this membership |
+| `updated_at` | datetime | no | **Deprecated** alias for `last_seen_at`, kept for existing sync clients. Ignored when `last_seen_at` is present |
 | `deleted_at` | datetime | no | Only meaningful alongside `is_deleted: true` |
 
 **Response `200`** — `BatchRecordsResponse`:
@@ -1153,13 +1134,12 @@ fallback, specifically so a file dropped into `static/` could never shadow a pro
 | 2 | GET | `/ready` | `/readyz` | none |
 | 3 | GET | `/api/auth/me` | — | any key |
 | 4 | GET | `/api/ips` | — | any key, read-scoped |
-| 5 | DELETE | `/api/ips` | — | `can_delete` on group |
-| 6 | DELETE | `/api/ips/{id}` | — | `can_delete` on any holding group; `?hard=true` Master |
-| 7 | POST | `/api/ips/{id}/restore` | — | Master |
-| 8 | POST | `/api/system/purge-ips` | — | Master |
-| 9 | POST | `/api/records/batch` | — | `can_write`; `full_replace` also `can_delete` |
-| 10 | POST | `/api/ban` | — | `can_write` on group |
-| 11 | POST | `/api/white` | — | `can_write` on group |
+| 5 | DELETE | `/api/ips` | — | `can_delete` on group; `hard=true` Master (address and group in query or JSON body) |
+| 6 | POST | `/api/ips/restore` | — | Master (address and group in query or JSON body) |
+| 7 | POST | `/api/system/purge-ips` | — | Master |
+| 8 | POST | `/api/records/batch` | — | `can_write`; `full_replace` also `can_delete` |
+| 9 | POST | `/api/ban` | — | `can_write` on group |
+| 10 | POST | `/api/white` | — | `can_write` on group |
 | 12 | POST | `/api/keys` | — | Master or `can_manage_keys` |
 | 13 | GET | `/api/keys` | — | Master or `can_manage_keys` |
 | 14 | PUT | `/api/keys/{id}` | — | ↑ + own subtree |

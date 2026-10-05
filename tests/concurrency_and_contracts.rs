@@ -136,29 +136,28 @@ async fn insert_group(db: &DatabaseConnection, name: &str) -> Uuid {
     id
 }
 
+/// Inserts an address and a live, unlocked membership of it in `group_id`. Returns the address id.
 async fn insert_ip_record(db: &DatabaseConnection, address: &str, group_id: Uuid) -> Uuid {
     let id = Uuid::new_v4();
     let now = chrono::Utc::now().naive_utc();
     simply_ip_vault::entities::ip_record::ActiveModel {
         id: Set(id),
         target_address: Set(address.to_owned()),
-        cause: Set(None),
-        is_locked: Set(false),
         created_at: Set(now),
-        updated_at: Set(now),
-        last_seen_at: Set(now),
-        is_deleted: Set(false),
-        deleted_at: Set(None),
-        deleted_by: Set(None),
     }
     .insert(db)
     .await
     .unwrap();
     simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
+        id: Set(Uuid::new_v4()),
         ip_record_id: Set(id),
         group_id: Set(group_id),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        is_locked: Set(false),
+        created_at: Set(now),
+        last_seen_at: Set(now),
+        is_deleted: Set(false),
+        deleted_at: Set(None),
+        deleted_by: Set(None),
     }
     .insert(db)
     .await
@@ -271,6 +270,8 @@ async fn two_concurrent_deletes_of_the_same_record_are_idempotent() {
 
     let group = insert_group(&db, "race-group").await;
     let record = insert_ip_record(&db, "198.51.100.150", group).await;
+    // The delete addresses the membership by (address, group), per `DELETE /api/ips`.
+    let body = format!(r#"{{"target_address":"198.51.100.150","group_id":"{group}"}}"#);
 
     let mut tasks = tokio::task::JoinSet::new();
     for offset in 0..2 {
@@ -281,12 +282,13 @@ async fn two_concurrent_deletes_of_the_same_record_are_idempotent() {
             inject_connect_info(
                 Request::builder()
                     .method("DELETE")
-                    .uri(format!("/api/ips/{record}"))
-                    .header("X-API-Key", &master),
+                    .uri("/api/ips")
+                    .header("X-API-Key", &master)
+                    .header("Content-Type", "application/json"),
             ),
             &secret,
             chrono::Utc::now().timestamp() + offset,
-            "",
+            &body,
         );
         tasks.spawn(async move { send(&app, request).await });
     }
@@ -305,13 +307,14 @@ async fn two_concurrent_deletes_of_the_same_record_are_idempotent() {
         "both deletes report success, because the endpoint is idempotent by contract: {statuses:?}"
     );
 
-    // The row is intact and deleted exactly once.
-    let rows = simply_ip_vault::entities::ip_record::Entity::find()
-        .filter(simply_ip_vault::entities::ip_record::Column::TargetAddress.eq("198.51.100.150"))
+    // The membership is intact and deleted exactly once.
+    let rows = simply_ip_vault::entities::ip_record_group_membership::Entity::find()
+        .filter(simply_ip_vault::entities::ip_record_group_membership::Column::IpRecordId.eq(record))
+        .filter(simply_ip_vault::entities::ip_record_group_membership::Column::GroupId.eq(group))
         .all(&db)
         .await
         .unwrap();
-    assert_eq!(rows.len(), 1, "no duplicate row was produced by the race");
+    assert_eq!(rows.len(), 1, "no duplicate membership was produced by the race");
     assert!(rows[0].is_deleted, "the record is soft-deleted");
     assert!(
         rows[0].deleted_at.is_some(),
@@ -394,8 +397,9 @@ async fn malformed_input_is_refused_on_every_extractor() {
     assert!(body.contains("nope"), "and names the offending field: {body}");
 
     // 3. An unparseable UUID path parameter — routed through `StrictPath`, so it keeps the JSON
-    //    shape even though axum itself rejects it before any handler runs.
-    let (status, body) = call("DELETE", "/api/ips/not-a-uuid".to_owned(), "").await;
+    //    shape even though axum itself rejects it before any handler runs. `DELETE /api/ips/{id}` no
+    //    longer exists, so the path-parameter case is exercised on a route that still takes one.
+    let (status, body) = call("DELETE", "/api/groups/not-a-uuid".to_owned(), "").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "an unparseable path id is a 400: {body}");
     assert!(
         body.contains("\"error\""),
