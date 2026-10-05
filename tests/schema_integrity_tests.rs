@@ -1978,8 +1978,8 @@ async fn every_foreign_key_child_column_is_indexed() {
 
     for (table, index) in [
         ("audit_logs", "idx-audit_logs-api_key_id"),
-        ("webhook_configs", "idx-webhook_configs-group_id"),
-        ("webhook_executions", "idx-webhook_executions-webhook_id"),
+        ("webhook_configs", "idx_webhooks_group_active"),
+        ("webhook_executions", "idx_webhook_exec_lookup"),
         ("api_key_group_permissions", "idx-akgp-group_id"),
         ("api_key_group_permissions", "idx-akgp-api_key_id-group_id"),
         ("ip_record_group_memberships", "idx_group_memberships_lookup"),

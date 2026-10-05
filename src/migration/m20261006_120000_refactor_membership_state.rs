@@ -21,12 +21,18 @@
 //! becomes one `ip_record_causes` row, dated to the membership's creation. Nothing is dropped: the
 //! row counts before and after are the memberships' and the records' own.
 //!
-//! # Ordering
+//! # Ordering and cost
 //!
 //! Foreign keys are enforced, so dropping a parent that still has children cascades. The rebuild
 //! therefore creates the new tables under temporary names, copies into them, drops the old
 //! children and then the old parent, and only then renames. No step drops a table that a live
 //! foreign key still references.
+//!
+//! Every copy is one set-based `INSERT ... SELECT` run by SQLite itself. Nothing is read into
+//! Rust, so memory use does not grow with the table size and the work is one pass per table. The
+//! indexes are built after the copies, so SQLite fills each B-tree in a single sorted pass rather
+//! than maintaining it row by row. Row counts are checked against the source before the old tables
+//! are dropped; a mismatch aborts the migration and the transaction rolls back.
 //!
 //! # Reversal
 //!
@@ -34,13 +40,13 @@
 //! membership's state cannot be split back onto a shared row without choosing which group's copy
 //! wins. `down` refuses rather than guessing.
 
-use sea_orm::{ConnectionTrait, sea_query::{self, Index as SqIndex, Query}};
+use sea_orm::sea_query::{Alias, Asterisk, Expr, ExprTrait, Func, Index as SqIndex, IndexOrder, Query};
 use sea_orm_migration::prelude::*;
-use uuid::Uuid;
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
+/// The pre-refactor `ip_records`, read by the copies below.
 #[derive(DeriveIden)]
 enum IpRecords {
     Table,
@@ -49,7 +55,6 @@ enum IpRecords {
     Cause,
     IsLocked,
     CreatedAt,
-    LastSeenAt,
     IsDeleted,
     DeletedAt,
     DeletedBy,
@@ -61,6 +66,7 @@ enum IpRecordsNew {
     Table,
 }
 
+/// Both the pre-refactor membership table and, under its final name, the post-refactor one.
 #[derive(DeriveIden)]
 enum Memberships {
     #[sea_orm(iden = "ip_record_group_memberships")]
@@ -84,6 +90,12 @@ enum MembershipsNew {
 }
 
 #[derive(DeriveIden)]
+enum CausesNew {
+    #[sea_orm(iden = "ip_record_causes_new")]
+    Table,
+}
+
+#[derive(DeriveIden)]
 enum Causes {
     #[sea_orm(iden = "ip_record_causes")]
     Table,
@@ -99,93 +111,30 @@ enum IpGroups {
     Id,
 }
 
-/// One address row read from the old schema.
-struct OldRecord {
-    id: Uuid,
-    target_address: String,
-    cause: Option<String>,
-    is_locked: bool,
-    created_at: chrono::NaiveDateTime,
-    is_deleted: bool,
-    deleted_at: Option<chrono::NaiveDateTime>,
-    deleted_by: Option<String>,
+/// Surrogate id: 16 random bytes, stored in the same BLOB form as every other UUID column.
+fn random_id() -> Expr {
+    Func::cust(Alias::new("randomblob")).arg(Expr::val(16)).into()
 }
 
-/// One old membership, with the per-group `updated_at` the old schema recorded for it.
-struct OldMembership {
-    ip_record_id: Uuid,
-    group_id: Uuid,
-    created_at: chrono::NaiveDateTime,
-    updated_at: chrono::NaiveDateTime,
-}
-
-async fn read_records(db: &SchemaManagerConnection<'_>) -> Result<Vec<OldRecord>, DbErr> {
+/// Row count of `table`, computed by the engine. Used to prove a copy kept every row.
+async fn count(manager: &SchemaManager<'_>, table: impl IntoIden) -> Result<i64, DbErr> {
     let stmt = Query::select()
-        .columns([
-            IpRecords::Id,
-            IpRecords::TargetAddress,
-            IpRecords::Cause,
-            IpRecords::IsLocked,
-            IpRecords::CreatedAt,
-            IpRecords::LastSeenAt,
-            IpRecords::IsDeleted,
-            IpRecords::DeletedAt,
-            IpRecords::DeletedBy,
-        ])
-        .from(IpRecords::Table)
+        .expr_as(Func::count(Expr::col(Asterisk)), Alias::new("n"))
+        .from(table)
         .to_owned();
-    db.query_all(&stmt)
+    let row = manager
+        .get_connection()
+        .query_one(&stmt)
         .await?
-        .into_iter()
-        .map(|row| {
-            Ok(OldRecord {
-                id: row.try_get("", "id")?,
-                target_address: row.try_get("", "target_address")?,
-                cause: row.try_get("", "cause")?,
-                is_locked: row.try_get("", "is_locked")?,
-                created_at: row.try_get("", "created_at")?,
-                is_deleted: row.try_get("", "is_deleted")?,
-                deleted_at: row.try_get("", "deleted_at")?,
-                deleted_by: row.try_get("", "deleted_by")?,
-            })
-        })
-        .collect()
-}
-
-async fn read_memberships(db: &SchemaManagerConnection<'_>) -> Result<Vec<OldMembership>, DbErr> {
-    let stmt = Query::select()
-        .columns([
-            Memberships::IpRecordId,
-            Memberships::GroupId,
-            Memberships::CreatedAt,
-            Memberships::UpdatedAt,
-        ])
-        .from(Memberships::Table)
-        .to_owned();
-    db.query_all(&stmt)
-        .await?
-        .into_iter()
-        .map(|row| {
-            Ok(OldMembership {
-                ip_record_id: row.try_get("", "ip_record_id")?,
-                group_id: row.try_get("", "group_id")?,
-                created_at: row.try_get("", "created_at")?,
-                updated_at: row.try_get("", "updated_at")?,
-            })
-        })
-        .collect()
+        .ok_or_else(|| DbErr::Migration("COUNT(*) returned no row".to_owned()))?;
+    row.try_get("", "n")
 }
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let conn = manager.get_connection();
-        let records = read_records(conn).await?;
-        let memberships = read_memberships(conn).await?;
-        let by_id: std::collections::HashMap<Uuid, &OldRecord> =
-            records.iter().map(|r| (r.id, r)).collect();
-
-        // 1. The canonical address table, under a temporary name.
+        // 1. The canonical address table, under a temporary name, filled by one engine-side copy.
         manager
             .create_table(
                 Table::create()
@@ -196,16 +145,22 @@ impl MigrationTrait for Migration {
                     .to_owned(),
             )
             .await?;
-        for r in &records {
-            let stmt = Query::insert()
-                .into_table(IpRecordsNew::Table)
-                .columns([IpRecords::Id, IpRecords::TargetAddress, IpRecords::CreatedAt])
-                .values_panic([r.id.into(), r.target_address.clone().into(), r.created_at.into()])
-                .to_owned();
-            conn.execute(&stmt).await?;
-        }
+        let copy_records = Query::insert()
+            .into_table(IpRecordsNew::Table)
+            .columns([IpRecords::Id, IpRecords::TargetAddress, IpRecords::CreatedAt])
+            .select_from(
+                Query::select()
+                    .columns([IpRecords::Id, IpRecords::TargetAddress, IpRecords::CreatedAt])
+                    .from(IpRecords::Table)
+                    .to_owned(),
+            )
+            .map_err(|e| DbErr::Migration(e.to_string()))?
+            .to_owned();
+        conn.execute(&copy_records).await?;
 
-        // 2. The stateful memberships, under a temporary name, referencing the new address table.
+        // 2. The stateful memberships, under a temporary name. Each old membership joins the record
+        // it points at, which supplies the state (`is_locked`, soft delete) that moves onto the
+        // membership. `last_seen_at` is the old per-group `updated_at`.
         manager
             .create_table(
                 Table::create()
@@ -238,49 +193,42 @@ impl MigrationTrait for Migration {
                     .to_owned(),
             )
             .await?;
+        let copy_memberships = Query::insert()
+            .into_table(MembershipsNew::Table)
+            .columns([
+                Memberships::Id,
+                Memberships::IpRecordId,
+                Memberships::GroupId,
+                Memberships::IsLocked,
+                Memberships::CreatedAt,
+                Memberships::LastSeenAt,
+                Memberships::IsDeleted,
+                Memberships::DeletedAt,
+                Memberships::DeletedBy,
+            ])
+            .select_from(
+                Query::select()
+                    .expr(random_id())
+                    .column((Memberships::Table, Memberships::IpRecordId))
+                    .column((Memberships::Table, Memberships::GroupId))
+                    .column((IpRecords::Table, IpRecords::IsLocked))
+                    .column((Memberships::Table, Memberships::CreatedAt))
+                    .column((Memberships::Table, Memberships::UpdatedAt))
+                    .column((IpRecords::Table, IpRecords::IsDeleted))
+                    .column((IpRecords::Table, IpRecords::DeletedAt))
+                    .column((IpRecords::Table, IpRecords::DeletedBy))
+                    .from(Memberships::Table)
+                    .inner_join(
+                        IpRecords::Table,
+                        Expr::col((IpRecords::Table, IpRecords::Id))
+                            .equals((Memberships::Table, Memberships::IpRecordId)),
+                    )
+                    .to_owned(),
+            )
+            .map_err(|e| DbErr::Migration(e.to_string()))?
+            .to_owned();
+        conn.execute(&copy_memberships).await?;
 
-        // The old `(ip_record_id, group_id)` primary key becomes a unique index under its brief
-        // name. A membership is still one per (address, group); the index is that constraint and
-        // the upsert target, so a second identical index is not created alongside it.
-        let mut cause_rows: Vec<(Uuid, String, chrono::NaiveDateTime)> = Vec::new();
-        for m in &memberships {
-            let record = by_id.get(&m.ip_record_id).ok_or_else(|| {
-                DbErr::Migration(format!(
-                    "membership references missing ip_record {} — refusing to migrate a dangling row",
-                    m.ip_record_id
-                ))
-            })?;
-            let membership_id = Uuid::new_v4();
-            let stmt = Query::insert()
-                .into_table(MembershipsNew::Table)
-                .columns([
-                    Memberships::Id,
-                    Memberships::IpRecordId,
-                    Memberships::GroupId,
-                    Memberships::IsLocked,
-                    Memberships::CreatedAt,
-                    Memberships::LastSeenAt,
-                    Memberships::IsDeleted,
-                    Memberships::DeletedAt,
-                    Memberships::DeletedBy,
-                ])
-                .values_panic([
-                    membership_id.into(),
-                    m.ip_record_id.into(),
-                    m.group_id.into(),
-                    record.is_locked.into(),
-                    m.created_at.into(),
-                    m.updated_at.into(),
-                    record.is_deleted.into(),
-                    record.deleted_at.into(),
-                    record.deleted_by.clone().into(),
-                ])
-                .to_owned();
-            conn.execute(&stmt).await?;
-            if let Some(cause) = record.cause.as_ref().filter(|c| !c.is_empty()) {
-                cause_rows.push((membership_id, cause.clone(), m.created_at));
-            }
-        }
         manager
             .create_index(
                 SqIndex::create()
@@ -293,26 +241,31 @@ impl MigrationTrait for Migration {
                     .to_owned(),
             )
             .await?;
+        // Every old membership must have become exactly one new membership, and every record one
+        // canonical address. The inner join drops a membership whose record is missing, so the
+        // counts are the check that nothing was lost before the sources are dropped.
+        let old_memberships = count(manager, Memberships::Table).await?;
+        let new_memberships = count(manager, MembershipsNew::Table).await?;
+        if old_memberships != new_memberships {
+            return Err(DbErr::Migration(format!(
+                "membership copy kept {new_memberships} of {old_memberships} rows — refusing to drop \
+                 the source; check for memberships whose ip_record is missing"
+            )));
+        }
+        let old_records = count(manager, IpRecords::Table).await?;
+        let new_records = count(manager, IpRecordsNew::Table).await?;
+        if old_records != new_records {
+            return Err(DbErr::Migration(format!(
+                "address copy kept {new_records} of {old_records} rows — refusing to drop the source"
+            )));
+        }
 
-        // 3. Drop the old children, then the old parent. Nothing references the old parent any
-        // more, so no cascade can reach a row that is being kept.
-        manager.drop_table(Table::drop().table(Memberships::Table).to_owned()).await?;
-        manager.drop_table(Table::drop().table(IpRecords::Table).to_owned()).await?;
-
-        // 4. Rename the new tables into place. SQLite rewrites the foreign keys that point at the
-        // temporary name, so they end up referencing the real names.
-        manager
-            .rename_table(Table::rename().table(IpRecordsNew::Table, IpRecords::Table).to_owned())
-            .await?;
-        manager
-            .rename_table(Table::rename().table(MembershipsNew::Table, Memberships::Table).to_owned())
-            .await?;
-
-        // 5. Causes: append-only, one row per reported cause, referencing the final membership table.
+        // 3. Causes: append-only, one row per membership whose record carried a non-empty cause,
+        // dated to the membership's creation.
         manager
             .create_table(
                 Table::create()
-                    .table(Causes::Table)
+                    .table(CausesNew::Table)
                     .col(ColumnDef::new(Causes::Id).uuid().not_null().primary_key())
                     .col(ColumnDef::new(Causes::MembershipId).uuid().not_null())
                     .col(ColumnDef::new(Causes::Cause).text().not_null())
@@ -320,26 +273,80 @@ impl MigrationTrait for Migration {
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk-irc-membership_id")
-                            .from(Causes::Table, Causes::MembershipId)
-                            .to(Memberships::Table, Memberships::Id)
+                            .from(CausesNew::Table, Causes::MembershipId)
+                            .to(MembershipsNew::Table, Memberships::Id)
                             .on_delete(ForeignKeyAction::Cascade)
                             .on_update(ForeignKeyAction::Cascade),
                     )
                     .to_owned(),
             )
             .await?;
-        for (membership_id, cause, created_at) in cause_rows {
-            let stmt = Query::insert()
-                .into_table(Causes::Table)
-                .columns([Causes::Id, Causes::MembershipId, Causes::Cause, Causes::CreatedAt])
-                .values_panic([Uuid::new_v4().into(), membership_id.into(), cause.into(), created_at.into()])
-                .to_owned();
-            conn.execute(&stmt).await?;
-        }
+        let copy_causes = Query::insert()
+            .into_table(CausesNew::Table)
+            .columns([Causes::Id, Causes::MembershipId, Causes::Cause, Causes::CreatedAt])
+            .select_from(
+                Query::select()
+                    .expr(random_id())
+                    .column((MembershipsNew::Table, Memberships::Id))
+                    .column((IpRecords::Table, IpRecords::Cause))
+                    .column((Memberships::Table, Memberships::CreatedAt))
+                    .from(Memberships::Table)
+                    .inner_join(
+                        IpRecords::Table,
+                        Expr::col((IpRecords::Table, IpRecords::Id))
+                            .equals((Memberships::Table, Memberships::IpRecordId)),
+                    )
+                    .inner_join(
+                        MembershipsNew::Table,
+                        Expr::col((MembershipsNew::Table, Memberships::IpRecordId))
+                            .equals((Memberships::Table, Memberships::IpRecordId))
+                            .and(
+                                Expr::col((MembershipsNew::Table, Memberships::GroupId))
+                                    .equals((Memberships::Table, Memberships::GroupId)),
+                            ),
+                    )
+                    .and_where(Expr::col((IpRecords::Table, IpRecords::Cause)).is_not_null())
+                    .and_where(Expr::col((IpRecords::Table, IpRecords::Cause)).ne(""))
+                    .to_owned(),
+            )
+            .map_err(|e| DbErr::Migration(e.to_string()))?
+            .to_owned();
+        conn.execute(&copy_causes).await?;
 
-        // 6. Indexes. Every foreign-key child column leads one: the membership's `ip_record_id` is
-        // covered by the unique index above, its `group_id` by the lookup below, and a cause's
-        // `membership_id` by the composite that also serves "latest cause for this membership".
+        // 4. Drop the old children, then the old parent. Nothing references the old parent any
+        // more, so no cascade can reach a row that is being kept.
+        manager.drop_table(Table::drop().table(Memberships::Table).to_owned()).await?;
+        manager.drop_table(Table::drop().table(IpRecords::Table).to_owned()).await?;
+        // 5. Rename into place. SQLite rewrites the foreign keys that name a temporary table, so
+        // the causes table ends up referencing the real membership table.
+        manager
+            .rename_table(Table::rename().table(IpRecordsNew::Table, IpRecords::Table).to_owned())
+            .await?;
+        manager
+            .rename_table(Table::rename().table(MembershipsNew::Table, Memberships::Table).to_owned())
+            .await?;
+        manager
+            .rename_table(Table::rename().table(CausesNew::Table, Causes::Table).to_owned())
+            .await?;
+        // 6. Indexes, built after every copy. Each partial predicate is written with the literal
+        // SeaORM emits (`FALSE` / `TRUE`): SQLite uses a partial index only when the query's
+        // literal matches the index's, so `= 0` would be skipped by every query the app issues.
+        //
+        // The unique `(ip_record_id, group_id)` index is the one-membership-per-address constraint
+        // and the upsert target, so no second non-unique index is created alongside it.
+        manager
+            .create_index(
+                SqIndex::create()
+                    .if_not_exists()
+                    .unique()
+                    .name("idx_memberships_ip_group")
+                    .table(Memberships::Table)
+                    .col(Memberships::IpRecordId)
+                    .col(Memberships::GroupId)
+                    .to_owned(),
+            )
+            .await?;
+        // Foreign-key child for `group_id`, and the membership lookup by group.
         manager
             .create_index(
                 SqIndex::create()
@@ -351,7 +358,62 @@ impl MigrationTrait for Migration {
                     .to_owned(),
             )
             .await?;
-        manager.create_index(partial_active_index_on_real_table()).await?;
+        // Active listing per group, newest observation first. Serves the default page and count.
+        manager
+            .create_index(
+                SqIndex::create()
+                    .if_not_exists()
+                    .name("idx_memberships_active_last_seen")
+                    .table(Memberships::Table)
+                    .col(Memberships::GroupId)
+                    .col((Memberships::LastSeenAt, IndexOrder::Desc))
+                    .and_where(Expr::col(Memberships::IsDeleted).eq(false))
+                    .to_owned(),
+            )
+            .await?;
+        // Active listing across all groups, newest first.
+        manager
+            .create_index(
+                SqIndex::create()
+                    .if_not_exists()
+                    .name("idx_memberships_global_active_last_seen")
+                    .table(Memberships::Table)
+                    .col((Memberships::LastSeenAt, IndexOrder::Desc))
+                    .and_where(Expr::col(Memberships::IsDeleted).eq(false))
+                    .to_owned(),
+            )
+            .await?;
+        // Active lock filter per group.
+        manager
+            .create_index(
+                SqIndex::create()
+                    .if_not_exists()
+                    .name("idx_memberships_active_locked")
+                    .table(Memberships::Table)
+                    .col(Memberships::GroupId)
+                    .col(Memberships::IsLocked)
+                    .and_where(Expr::col(Memberships::IsDeleted).eq(false))
+                    .to_owned(),
+            )
+            .await?;
+        // Retention sweep: soft-deleted memberships only, by deletion time. The non-partial index
+        // this name used to refer to is replaced, so live rows do not pay for it.
+        manager
+            .drop_index(SqIndex::drop().if_exists().name("idx_memberships_deleted_at").table(Memberships::Table).to_owned())
+            .await?;
+        manager
+            .create_index(
+                SqIndex::create()
+                    .if_not_exists()
+                    .name("idx_memberships_deleted_at")
+                    .table(Memberships::Table)
+                    .col(Memberships::DeletedAt)
+                    .and_where(Expr::col(Memberships::IsDeleted).eq(true))
+                    .to_owned(),
+            )
+            .await?;
+        // Cause history: a membership's causes, newest first. Also the FK child index for
+        // `membership_id`.
         manager
             .create_index(
                 SqIndex::create()
@@ -360,18 +422,6 @@ impl MigrationTrait for Migration {
                     .table(Causes::Table)
                     .col(Causes::MembershipId)
                     .col((Causes::CreatedAt, IndexOrder::Desc))
-                    .to_owned(),
-            )
-            .await?;
-        // The `is_deleted` / `deleted_at` purge sweep and the retention tombstone arm both read
-        // these on the membership now.
-        manager
-            .create_index(
-                SqIndex::create()
-                    .if_not_exists()
-                    .name("idx_memberships_deleted_at")
-                    .table(Memberships::Table)
-                    .col(Memberships::DeletedAt)
                     .to_owned(),
             )
             .await?;
@@ -385,16 +435,4 @@ impl MigrationTrait for Migration {
                 .to_owned(),
         ))
     }
-}
-
-/// The partial index, built against the table's final name once the rename has happened.
-fn partial_active_index_on_real_table() -> IndexCreateStatement {
-    SqIndex::create()
-        .if_not_exists()
-        .name("idx_memberships_active_last_seen")
-        .table(Memberships::Table)
-        .col(Memberships::GroupId)
-        .col((Memberships::LastSeenAt, IndexOrder::Desc))
-        .and_where(sea_query::Expr::col(Memberships::IsDeleted).eq(false))
-        .to_owned()
 }
