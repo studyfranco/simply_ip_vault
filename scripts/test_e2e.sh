@@ -4579,6 +4579,86 @@ else
     echo -e "$(ts)   ${RED}✗ FAIL${RESET} #34d /api/ip_groups returned different names: canonical=$CANONICAL_NAMES alias=$ALIAS_NAMES" >&2
 fi
 
+# ── 35. Stateful memberships: per-group state, cause history, restore, totals ─────────────────
+#
+# The address row is canonical; lock, soft delete and last observation belong to the membership in one
+# group. These checks exercise that split through the wire, against the refactored schema.
+
+ADDR_M="198.51.100.231"
+GROUP_MA="membership-a"
+GROUP_MB="membership-b"
+DEL_A="{\"target_address\":\"$ADDR_M\",\"group_name\":\"$GROUP_MA\"}"
+
+api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"$ADDR_M\",\"group_name\":\"$GROUP_MA\",\"cause\":\"first cause\"}"
+check "200" "#35 ban the address into membership-a with a cause"
+api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"$ADDR_M\",\"group_name\":\"$GROUP_MB\",\"cause\":\"b cause\"}"
+check "200" "#35 the same address into membership-b (a second membership, same canonical row)"
+
+api_call GET "/api/ips?groups=$GROUP_MA" "$MASTER_KEY"
+check "200" "#35 list membership-a"
+check_true "[.[] | select(.target_address == \"$ADDR_M\")] | length == 1" \
+    "#35 the address appears once in membership-a"
+check_true "[.[] | select(.target_address == \"$ADDR_M\") | has(\"updated_at\") | not] | all" \
+    "#35 the response carries no updated_at (last_seen_at is the single timestamp)"
+check_true "[.[] | select(.target_address == \"$ADDR_M\") | has(\"ip_record_id\") and has(\"id\")] | all" \
+    "#35 each item exposes the membership id and the canonical ip_record_id"
+
+# Cause history: the latest cause wins; a re-report without a cause writes no row and keeps it.
+api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"$ADDR_M\",\"group_name\":\"$GROUP_MA\",\"cause\":\"second cause\"}"
+check "200" "#35 re-report into membership-a with a new cause"
+api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"$ADDR_M\",\"group_name\":\"$GROUP_MA\"}"
+check "200" "#35 re-report into membership-a with no cause"
+api_call GET "/api/ips?groups=$GROUP_MA" "$MASTER_KEY"
+check_true "[.[] | select(.target_address == \"$ADDR_M\") | .cause] == [\"second cause\"]" \
+    "#35 the reported cause is the latest one, and a cause-less re-report does not clear it"
+
+api_call GET "/api/ips?groups=$GROUP_MA&cause=first" "$MASTER_KEY"
+check_true "[.[] | select(.target_address == \"$ADDR_M\")] | length == 1" \
+    "#35 cause filter matches an older cause in the membership history"
+
+# Per-group state: soft-deleting membership-a must not touch membership-b.
+api_call DELETE "/api/ips" "$MASTER_KEY" "$DEL_A"
+check "204" "#35 soft-delete the address from membership-a by address and group"
+api_call GET "/api/ips?groups=$GROUP_MA" "$MASTER_KEY"
+check_true "[.[] | select(.target_address == \"$ADDR_M\")] | length == 0" \
+    "#35 the soft-deleted membership is hidden from membership-a"
+api_call GET "/api/ips?groups=$GROUP_MB" "$MASTER_KEY"
+check_true "[.[] | select(.target_address == \"$ADDR_M\")] | length == 1" \
+    "#35 the same address in membership-b is unaffected by the membership-a delete"
+
+api_call GET "/api/ips?include_deleted=true&groups=$GROUP_MA" "$MASTER_KEY"
+check_true "[.[] | select(.target_address == \"$ADDR_M\" and .is_deleted == true)] | length == 1" \
+    "#35 include_deleted exposes the soft-deleted membership with its deleted state"
+
+# The route that addressed a record by id is gone: restore and delete must go by address and group.
+api_call DELETE "/api/ips/00000000-0000-0000-0000-000000000000" "$MASTER_KEY"
+check "405" "#35 DELETE /api/ips/{id} is no longer served (405: the path exists for other methods only)"
+
+# Restore by address and group.
+api_call POST "/api/ips/restore" "$MASTER_KEY" "$DEL_A"
+check "200" "#35 master restores the membership by address and group"
+api_call GET "/api/ips?groups=$GROUP_MA" "$MASTER_KEY"
+check_true "[.[] | select(.target_address == \"$ADDR_M\")] | length == 1" \
+    "#35 the restored membership is visible in membership-a again"
+api_call POST "/api/ips/restore" "$MASTER_KEY" "$DEL_A"
+check "400" "#35 restoring a live membership is rejected"
+
+# Totals and freshness, scoped per membership.
+api_call GET "/api/ips?groups=$GROUP_MB&include_total=true&limit=1" "$MASTER_KEY"
+check "200" "#35 include_total envelope for membership-b"
+check_true '(.total >= 1) and (.data | length == 1) and (.total_pages >= 1)' \
+    "#35 include_total reports a total across pages, not just the page size"
+api_call GET "/api/ips?groups=$GROUP_MB&max_age=3600" "$MASTER_KEY"
+check_true "[.[] | select(.target_address == \"$ADDR_M\")] | length == 1" \
+    "#35 max_age keeps a membership observed within the window"
+
+# Hard delete removes only this membership; the address stays because membership-b still holds it.
+api_call DELETE "/api/ips?hard=true" "$MASTER_KEY" "$DEL_A"
+check "204" "#35 master hard-deletes the membership in membership-a"
+api_call GET "/api/ips?groups=$GROUP_MB" "$MASTER_KEY"
+check_true "[.[] | select(.target_address == \"$ADDR_M\")] | length == 1" \
+    "#35 the address survives a hard delete while another group still holds it"
+
 log_section "Summary"
 echo -e "$(ts) ${GREEN}Passed: $PASS_COUNT${RESET}   ${RED}Failed: $FAIL_COUNT${RESET}" >&2
 
