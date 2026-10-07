@@ -40,7 +40,10 @@
 //! membership's state cannot be split back onto a shared row without choosing which group's copy
 //! wins. `down` refuses rather than guessing.
 
-use sea_orm::sea_query::{Alias, Asterisk, Expr, ExprTrait, Func, Index as SqIndex, IndexOrder, Query};
+use sea_orm::{
+    DatabaseBackend,
+    sea_query::{self, Alias, Asterisk, Expr, ExprTrait, Func, Index as SqIndex, IndexOrder, Query},
+};
 use sea_orm_migration::prelude::*;
 
 #[derive(DeriveMigrationName)]
@@ -111,9 +114,12 @@ enum IpGroups {
     Id,
 }
 
-/// Surrogate id: 16 random bytes, stored in the same BLOB form as every other UUID column.
-fn random_id() -> Expr {
-    Func::cust(Alias::new("randomblob")).arg(Expr::val(16)).into()
+/// Surrogate id: UUID generated according to the database backend dialect.
+fn random_id(backend: DatabaseBackend) -> Expr {
+    match backend {
+        DatabaseBackend::Postgres => Func::cust(Alias::new("gen_random_uuid")).into(),
+        _ => Func::cust(Alias::new("randomblob")).arg(Expr::val(16)).into(),
+    }
 }
 
 /// Row count of `table`, computed by the engine. Used to prove a copy kept every row.
@@ -134,6 +140,7 @@ async fn count(manager: &SchemaManager<'_>, table: impl IntoIden) -> Result<i64,
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let conn = manager.get_connection();
+        let backend = manager.get_database_backend();
         // 1. The canonical address table, under a temporary name, filled by one engine-side copy.
         manager
             .create_table(
@@ -208,7 +215,7 @@ impl MigrationTrait for Migration {
             ])
             .select_from(
                 Query::select()
-                    .expr(random_id())
+                    .expr(random_id(backend))
                     .column((Memberships::Table, Memberships::IpRecordId))
                     .column((Memberships::Table, Memberships::GroupId))
                     .column((IpRecords::Table, IpRecords::IsLocked))
@@ -241,6 +248,7 @@ impl MigrationTrait for Migration {
                     .to_owned(),
             )
             .await?;
+
         // Every old membership must have become exactly one new membership, and every record one
         // canonical address. The inner join drops a membership whose record is missing, so the
         // counts are the check that nothing was lost before the sources are dropped.
@@ -286,7 +294,7 @@ impl MigrationTrait for Migration {
             .columns([Causes::Id, Causes::MembershipId, Causes::Cause, Causes::CreatedAt])
             .select_from(
                 Query::select()
-                    .expr(random_id())
+                    .expr(random_id(backend))
                     .column((MembershipsNew::Table, Memberships::Id))
                     .column((IpRecords::Table, IpRecords::Cause))
                     .column((Memberships::Table, Memberships::CreatedAt))
@@ -328,12 +336,8 @@ impl MigrationTrait for Migration {
         manager
             .rename_table(Table::rename().table(CausesNew::Table, Causes::Table).to_owned())
             .await?;
-        // 6. Indexes, built after every copy. Each partial predicate is written with the literal
-        // SeaORM emits (`FALSE` / `TRUE`): SQLite uses a partial index only when the query's
-        // literal matches the index's, so `= 0` would be skipped by every query the app issues.
-        //
-        // The unique `(ip_record_id, group_id)` index is the one-membership-per-address constraint
-        // and the upsert target, so no second non-unique index is created alongside it.
+
+        // 6. Performance indexes built after data population.
         manager
             .create_index(
                 SqIndex::create()
@@ -346,7 +350,7 @@ impl MigrationTrait for Migration {
                     .to_owned(),
             )
             .await?;
-        // Foreign-key child for `group_id`, and the membership lookup by group.
+
         manager
             .create_index(
                 SqIndex::create()
@@ -358,7 +362,8 @@ impl MigrationTrait for Migration {
                     .to_owned(),
             )
             .await?;
-        // Active listing per group, newest observation first. Serves the default page and count.
+
+        // Active listing per group, newest observation first.
         manager
             .create_index(
                 SqIndex::create()
@@ -371,6 +376,7 @@ impl MigrationTrait for Migration {
                     .to_owned(),
             )
             .await?;
+
         // Active listing across all groups, newest first.
         manager
             .create_index(
@@ -383,6 +389,7 @@ impl MigrationTrait for Migration {
                     .to_owned(),
             )
             .await?;
+
         // Active lock filter per group.
         manager
             .create_index(
@@ -396,8 +403,8 @@ impl MigrationTrait for Migration {
                     .to_owned(),
             )
             .await?;
-        // Retention sweep: soft-deleted memberships only, by deletion time. The non-partial index
-        // this name used to refer to is replaced, so live rows do not pay for it.
+
+        // Soft-delete retention cleanup index.
         manager
             .drop_index(SqIndex::drop().if_exists().name("idx_memberships_deleted_at").table(Memberships::Table).to_owned())
             .await?;
@@ -412,8 +419,8 @@ impl MigrationTrait for Migration {
                     .to_owned(),
             )
             .await?;
-        // Cause history: a membership's causes, newest first. Also the FK child index for
-        // `membership_id`.
+
+        // Cause history lookup index.
         manager
             .create_index(
                 SqIndex::create()
@@ -425,6 +432,7 @@ impl MigrationTrait for Migration {
                     .to_owned(),
             )
             .await?;
+
         Ok(())
     }
 
