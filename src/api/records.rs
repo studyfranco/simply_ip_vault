@@ -12,7 +12,8 @@ use ipnetwork::IpNetwork;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, ConnectionTrait,
     DatabaseTransaction, EntityTrait, JoinType, PaginatorTrait, QueryFilter, QueryOrder,
-    QuerySelect, RelationTrait, SqlErr, SqliteTransactionMode, TransactionOptions, TransactionTrait,
+    QuerySelect, RelationTrait, SqlErr, SqliteTransactionMode, TransactionOptions,
+    TransactionTrait,
     sea_query::{Expr, ExprTrait, Func, Query},
 };
 use serde::{Deserialize, Serialize};
@@ -432,6 +433,94 @@ fn empty_ips_response(format_iplist: bool, include_total: bool, limit: u64, offs
     Json(Vec::<IpRecordResponse>::new()).into_response()
 }
 
+/// Above this many groups, [`fetch_merged_page`]'s one-query-per-group approach costs more than a
+/// single `GroupId IN (...)` query with a sort. The production complaint this exists for ("group_id
+/// IN (?, ?, ?, ?)") is a handful of groups; past this bound, a broad RBAC grant or a long `groups=`
+/// list falls back to the plain `IN (...)` query instead.
+const MERGE_MAX_GROUPS: usize = 16;
+/// Above this `offset + limit`, each per-group query in [`fetch_merged_page`] would itself need to
+/// fetch too many rows to stay cheap (every one of them fetches `offset + limit`, since the globally
+/// correct page can draw unevenly from any group). Deep pagination across several groups falls back
+/// to the single `IN (...)` query instead — slower, but correct, and a rare access pattern next to
+/// the first few pages a dashboard actually loads.
+const MERGE_MAX_FETCH: u64 = 2000;
+
+/// Counts memberships matching `condition`, scoped to `groups` when given.
+///
+/// With `groups`, this sums one indexed per-group count instead of running a single `GroupId IN
+/// (...)` count — kept symmetric with [`fetch_merged_page`] so the two agree on what the group
+/// filter means, even though a count has no `ORDER BY` to break and `IN (...)` alone would already
+/// be index-covered.
+async fn count_matching(
+    db: &sea_orm::DatabaseConnection,
+    condition: &Condition,
+    address_filter_present: bool,
+    groups: Option<&[Uuid]>,
+) -> Result<u64, AppError> {
+    // One query, never split per group. `fetch_merged_page` splits because an `ORDER BY` across a
+    // `GroupId IN (...)` cannot be served from the per-group partial index without a sort. A count
+    // has no order to satisfy, so that reason never applied to it: `GroupId IN (...)` stays a
+    // covering-index scan (confirmed with `EXPLAIN QUERY PLAN` against this schema). Splitting it
+    // would only add round trips for no benefit.
+    let mut scoped = condition.clone();
+    if let Some(ids) = groups {
+        scoped = scoped.add(ip_record_group_membership::Column::GroupId.is_in(ids.iter().copied()));
+    }
+    let mut query = ip_record_group_membership::Entity::find();
+    if address_filter_present {
+        query = query.join(JoinType::InnerJoin, ip_record_group_membership::Relation::IpRecord.def());
+    }
+    // `COUNT(*)`, not `COUNT(id)`: the partial index on `(group_id, last_seen_at)` does not carry
+    // `id`, so counting that column forces a table lookup per matching row and loses "COVERING
+    // INDEX" — about 10x slower on this schema (measured: COUNT(id) 1.4ms vs COUNT(*) 0.14ms per
+    // group at 100k rows; this is also what made the production `COUNT(... IN (?,?,?,?))` query
+    // take 5.8s). `COUNT(*)` needs no column value, so SQLite answers it from the index alone.
+    let count: Option<i64> = query
+        .filter(scoped)
+        .select_only()
+        .expr_as(Func::count(Expr::col(sea_orm::sea_query::Asterisk)), "row_count")
+        .into_tuple::<i64>()
+        .one(db)
+        .await?;
+    Ok(std::cmp::max(count.unwrap_or(0), 0) as u64)
+}
+
+/// Fetches one page across a small, explicit set of groups without an SQL `ORDER BY` that spans
+/// them.
+///
+/// The partial index `idx_memberships_active_last_seen` is `(group_id, last_seen_at DESC) WHERE
+/// is_deleted = FALSE` — it sorts *within* one `group_id`, not across several. A `GroupId IN
+/// (...)` with `ORDER BY last_seen_at` therefore cannot be served from it directly; SQLite scans
+/// the matching rows and sorts them in a temp b-tree instead, which is what turns a page read into
+/// a full scan as a group grows. Querying each group individually keeps every query on the
+/// indexed, pre-sorted path: no sort, and no more than `offset + limit` rows read per group. The
+/// (small, bounded) merge happens in Rust instead, which is cheap exactly because each input is
+/// already sorted and the inputs are few.
+async fn fetch_merged_page(
+    db: &sea_orm::DatabaseConnection,
+    condition: &Condition,
+    group_ids: &[Uuid],
+    offset: u64,
+    limit: u64,
+) -> Result<Vec<(ip_record_group_membership::Model, Option<ip_record::Model>)>, AppError> {
+    let take = offset.saturating_add(limit);
+    let mut merged = Vec::with_capacity(group_ids.len() * take as usize);
+    for &group_id in group_ids {
+        let scoped = condition.clone().add(ip_record_group_membership::Column::GroupId.eq(group_id));
+        let rows = ip_record_group_membership::Entity::find()
+            .join(JoinType::InnerJoin, ip_record_group_membership::Relation::IpRecord.def())
+            .select_also(ip_record::Entity)
+            .filter(scoped)
+            .order_by_desc(ip_record_group_membership::Column::LastSeenAt)
+            .limit(take)
+            .all(db)
+            .await?;
+        merged.extend(rows);
+    }
+    merged.sort_by_key(|(m, _)| std::cmp::Reverse(m.last_seen_at));
+    Ok(merged.into_iter().skip(offset as usize).take(limit as usize).collect())
+}
+
 /// Handles `GET /api/ips`: lists memberships, scoped to groups the caller may read.
 pub async fn list_ips(
     State(state): State<AppState>,
@@ -523,6 +612,12 @@ pub async fn list_ips(
         group_constraints.push(typed);
     }
 
+    // A small, explicit group set (RBAC scope intersected with `groups`/`group_id`/`status`) is
+    // served as one indexed query per group instead of a single `GroupId IN (...)`. See
+    // `fetch_merged_page`'s doc comment for why: SQLite's partial index sorts within one group_id,
+    // not across several, so `IN (...)` with `ORDER BY last_seen_at` falls back to a full sort —
+    // confirmed against this schema as the cause of the reported 56–91s multi-group query.
+    let mut merge_group_ids: Option<Vec<Uuid>> = None;
     if !group_constraints.is_empty() {
         let mut intersected = group_constraints.pop().expect("just checked non-empty");
         for set in &group_constraints {
@@ -531,7 +626,14 @@ pub async fn list_ips(
         if intersected.is_empty() {
             return Ok(empty_ips_response(format_iplist, include_total, limit, offset));
         }
-        condition = condition.add(ip_record_group_membership::Column::GroupId.is_in(intersected));
+        if intersected.len() > 1
+            && intersected.len() <= MERGE_MAX_GROUPS
+            && offset.saturating_add(limit) <= MERGE_MAX_FETCH
+        {
+            merge_group_ids = Some(intersected.into_iter().collect());
+        } else {
+            condition = condition.add(ip_record_group_membership::Column::GroupId.is_in(intersected));
+        }
     }
 
     let address_filter_present = matches!(&filters.ip, Some(ip) if !ip.is_empty());
@@ -579,41 +681,25 @@ pub async fn list_ips(
     }
 
     let total = if include_total {
-        // The address join is only needed when an address filter is present. Without it the count
-        // is answered from the membership index alone, which is what keeps it under budget on a
-        // large group: a join per counted row would dominate the cost.
-        let mut count_query = ip_record_group_membership::Entity::find();
-        if address_filter_present {
-            count_query = count_query
-                .join(JoinType::InnerJoin, ip_record_group_membership::Relation::IpRecord.def());
-        }
-        let count: Option<i64> = count_query
-            .filter(condition.clone())
-            .select_only()
-            .expr_as(
-                Func::count(Expr::col((
-                    ip_record_group_membership::Entity,
-                    ip_record_group_membership::Column::Id,
-                ))),
-                "row_count",
-            )
-            .into_tuple::<i64>()
-            .one(&state.db)
-            .await?;
-        Some(std::cmp::max(count.unwrap_or(0), 0) as u64)
+        Some(count_matching(&state.db, &condition, address_filter_present, merge_group_ids.as_deref()).await?)
     } else {
         None
     };
 
-    let page = ip_record_group_membership::Entity::find()
-        .join(JoinType::InnerJoin, ip_record_group_membership::Relation::IpRecord.def())
-        .select_also(ip_record::Entity)
-        .filter(condition)
-        .order_by_desc(ip_record_group_membership::Column::LastSeenAt)
-        .limit(limit)
-        .offset(offset)
-        .all(&state.db)
-        .await?;
+    let page = match &merge_group_ids {
+        Some(ids) => fetch_merged_page(&state.db, &condition, ids, offset, limit).await?,
+        None => {
+            ip_record_group_membership::Entity::find()
+                .join(JoinType::InnerJoin, ip_record_group_membership::Relation::IpRecord.def())
+                .select_also(ip_record::Entity)
+                .filter(condition)
+                .order_by_desc(ip_record_group_membership::Column::LastSeenAt)
+                .limit(limit)
+                .offset(offset)
+                .all(&state.db)
+                .await?
+        }
+    };
 
     if format_iplist {
         let mut ip_list: Vec<String> = page

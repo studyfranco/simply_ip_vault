@@ -1104,8 +1104,12 @@ async fn the_audit_rebuild_preserved_both_indexes() {
 /// Updated by `m20260926_120000`: `list_ips` now sorts on `ip_record_group_memberships.updated_at`,
 /// not `ip_records.updated_at` (see that migration's module comment for why), so the query shapes
 /// pinned here changed to match. Three shapes, not two — the group-scoped shape *replaces* the old
-/// two-shape coverage; the unfiltered shape is new and pins a real, accepted trade-off rather than
-/// silently losing coverage of it.
+/// two-shape coverage; the unfiltered shape is new.
+///
+/// Updated again by `m20261008_120000_add_simple_foreign_key_indexes`: that migration's plain
+/// `idx-irgm-last_seen_at` index turned the unfiltered shape from a genuine, documented trade-off
+/// (full scan, temp b-tree sort) into an ordered index walk with no sort step — exactly the
+/// simplification this test's own comment asked for once that happened.
 #[tokio::test]
 async fn list_ips_query_plan_uses_indexes_not_a_temp_b_tree_or_table_scan() {
     let tmp = TempDb::new();
@@ -1153,15 +1157,15 @@ async fn list_ips_query_plan_uses_indexes_not_a_temp_b_tree_or_table_scan() {
     );
 
     // The unfiltered shape: a master browsing every group at once, with no `group_id` predicate to
-    // drive either side of the join. **Documented trade-off, not a regression to chase down.** No
-    // index on `ip_record_group_memberships` can drive this query from the `ip_records` side (where
-    // `is_deleted` lives) while also supplying pre-sorted order on `updated_at` (which lives on
-    // the *other* table) — a single-table index cannot span both. Verified by trying anyway: adding
-    // a bare `(updated_at DESC)` index changed nothing about this specific plan. The old
-    // `ip_records`-driven, record-level sort avoided this by living entirely on one table, at the
-    // cost of the correctness bug `m20260926_120000` exists to fix; this is the accepted trade for
-    // that fix. Bounded in practice by `LIMIT 50` and by this being the *unfiltered* master view
-    // specifically, not the common path.
+    // drive either side of the join. This used to need a full scan plus a temp b-tree sort — no
+    // index could drive it from `is_deleted` while also pre-sorting `last_seen_at`, since the two
+    // lived on different tables before `m20260926_120000` and no single-table index spanned both
+    // even after. `m20261008_120000_add_simple_foreign_key_indexes`'s plain `idx-irgm-last_seen_at`
+    // fixes this directly: SQLite can walk that index in `last_seen_at` order and check
+    // `is_deleted` per row as it goes, so the separate sort step is gone. It is still a scan of
+    // every row touched in `last_seen_at` order (unlike the group-scoped shape above, which seeks
+    // straight to one group's range), which is why this stays a distinct, separately-pinned shape
+    // rather than folded into the group-scoped assertions.
     let unfiltered_plan = plan_lines(
         &db,
         "EXPLAIN QUERY PLAN \
@@ -1172,24 +1176,32 @@ async fn list_ips_query_plan_uses_indexes_not_a_temp_b_tree_or_table_scan() {
     )
     .await;
     assert!(
-        unfiltered_plan.iter().any(|l| l.contains("TEMP B-TREE")),
-        "if this ever stops needing a temp b-tree, the trade-off above no longer holds and this \
-         test (and its doc comment) should be simplified rather than left describing a cost that \
-         went away: {unfiltered_plan:?}"
+        !unfiltered_plan.iter().any(|l| l.contains("TEMP B-TREE")),
+        "the unfiltered master listing must not need a separate sort step once \
+         idx-irgm-last_seen_at exists: {unfiltered_plan:?}"
+    );
+    assert!(
+        unfiltered_plan.iter().any(|l| l.contains("idx-irgm-last_seen_at")),
+        "the unfiltered master listing must be ordered by idx-irgm-last_seen_at: {unfiltered_plan:?}"
     );
 
     // The bare group-scoped lookup every RBAC accessible-groups filter (and the `full_replace`
     // sweep) performs — `WHERE group_id = ?` alone, the shape the membership table's primary key
-    // (`ip_record_id, group_id` — the *other* column order) cannot serve. Two indexes now lead
-    // with `group_id` (the pre-existing `idx_group_memberships_lookup` and the new
-    // `idx_membership_group_updated`), and on an empty, unanalyzed test database the planner's
-    // choice between two otherwise-equivalent options isn't a property worth pinning by name —
-    // only "no full scan" is.
+    // (`ip_record_id, group_id` — the *other* column order) cannot serve. Several indexes now lead
+    // with `group_id` (`idx_group_memberships_lookup`, `idx_memberships_active_last_seen`,
+    // `idx_memberships_active_locked`, and the plain `idx-irgm-group_id`), and on an empty,
+    // unanalyzed test database the planner's choice among otherwise-equivalent options isn't a
+    // property worth pinning by name — only "no full scan" is.
     let group_lookup_plan =
         plan_lines(&db, "EXPLAIN QUERY PLAN SELECT * FROM ip_record_group_memberships WHERE group_id = '00000000-0000-0000-0000-000000000000'")
             .await;
     assert!(
-        group_lookup_plan.iter().any(|l| l.contains("idx_group_memberships_lookup") || l.contains("idx_memberships_active_last_seen")),
+        group_lookup_plan.iter().any(|l| {
+            l.contains("idx_group_memberships_lookup")
+                || l.contains("idx_memberships_active_last_seen")
+                || l.contains("idx_memberships_active_locked")
+                || l.contains("idx-irgm-group_id")
+        }),
         "the group_id lookup must use one of the group_id-leading indexes: {group_lookup_plan:?}"
     );
     assert!(
@@ -1989,6 +2001,32 @@ async fn every_foreign_key_child_column_is_indexed() {
         assert!(
             simply_ip_vault::db::has_index(&db, table, index).await.unwrap(),
             "foreign-key child {table} must be indexed by {index}"
+        );
+    }
+}
+
+/// `m20261008_120000_add_simple_foreign_key_indexes`: every foreign-key child column, and every
+/// `ORDER BY` column not already plainly indexed, has a single-column index of its own, in addition
+/// to whatever composite or partial index already leads with or covers it.
+#[tokio::test]
+async fn every_foreign_key_child_column_also_has_a_plain_single_column_index() {
+    let tmp = TempDb::new();
+    let db = fresh_db(&tmp).await;
+
+    for (table, index) in [
+        ("ip_record_group_memberships", "idx-irgm-ip_record_id"),
+        ("ip_record_group_memberships", "idx-irgm-group_id"),
+        ("ip_record_group_memberships", "idx-irgm-last_seen_at"),
+        ("api_key_group_permissions", "idx-akgp-api_key_id"),
+        ("webhook_configs", "idx-webhook_configs-group_id"),
+        ("webhook_executions", "idx-webhook_executions-webhook_id"),
+        ("ip_record_causes", "idx-irc-membership_id"),
+        ("ip_record_causes", "idx-irc-created_at"),
+    ] {
+        assert!(
+            simply_ip_vault::db::has_index(&db, table, index).await.unwrap(),
+            "foreign-key child {table} must have its own plain index {index}, not only a composite \
+             that happens to lead with it"
         );
     }
 }

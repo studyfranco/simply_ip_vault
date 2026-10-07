@@ -108,6 +108,57 @@ use sea_orm_migration::MigratorTrait;
 /// place, which addresses the contention itself rather than just how long a caller tolerates it.
 pub const SQLITE_BUSY_TIMEOUT_MS: u32 = 10_000;
 
+/// Overrides the memory-mapped I/O window, in bytes. Env `SQLITE_MMAP_SIZE_BYTES`.
+pub const SQLITE_MMAP_SIZE_BYTES_ENV: &str = "SQLITE_MMAP_SIZE_BYTES";
+/// Default memory-mapped I/O window: 512 MiB. Hot pages are served without a `read(2)` copy per
+/// page. Doubled from the original 256 MiB after production telemetry showed multi-group listings
+/// paying real I/O cost at that size; still a window, not a load of the whole file, so a database
+/// much larger than this stays correct and just serves its colder pages the ordinary way.
+const DEFAULT_SQLITE_MMAP_SIZE_BYTES: i64 = 512 * 1024 * 1024;
+
+/// Overrides the page cache budget, in KiB. Env `SQLITE_CACHE_SIZE_KIB`.
+///
+/// This is the *magnitude*: SQLite's own `cache_size` pragma takes a negative number to mean "KiB
+/// of pages" (positive means "number of pages", which is the confusing historical default), and
+/// this env var is that negative number's absolute value, negated when the pragma is issued — so
+/// setting it never requires remembering which sign means what.
+pub const SQLITE_CACHE_SIZE_KIB_ENV: &str = "SQLITE_CACHE_SIZE_KIB";
+/// Default page cache: 128 MiB (131072 KiB) **per connection**. Doubled from the original 64 MiB.
+/// Multiplies by the pool size for total resident memory — see [`SQLITE_MEMORY_MAX_CONNECTIONS`]
+/// and the file-backed pool's own connection cap for what that multiplies against.
+const DEFAULT_SQLITE_CACHE_SIZE_KIB: i64 = 128 * 1024;
+
+/// Reads [`SQLITE_MMAP_SIZE_BYTES_ENV`], falling back to the default with a warning on a bad or
+/// negative value. Read once per connection open, same as every other pragma here — not cached
+/// globally, so tests that set the env var per-case are not fighting a stale value.
+fn sqlite_mmap_size_bytes() -> i64 {
+    let value = crate::config::numeric_env(SQLITE_MMAP_SIZE_BYTES_ENV, DEFAULT_SQLITE_MMAP_SIZE_BYTES);
+    if value < 0 {
+        tracing::warn!(
+            "{SQLITE_MMAP_SIZE_BYTES_ENV}={value} must not be negative; using the default of \
+             {DEFAULT_SQLITE_MMAP_SIZE_BYTES} bytes."
+        );
+        DEFAULT_SQLITE_MMAP_SIZE_BYTES
+    } else {
+        value
+    }
+}
+
+/// Reads [`SQLITE_CACHE_SIZE_KIB_ENV`], falling back to the default with a warning on a bad or
+/// non-positive value.
+fn sqlite_cache_size_kib() -> i64 {
+    let value = crate::config::numeric_env(SQLITE_CACHE_SIZE_KIB_ENV, DEFAULT_SQLITE_CACHE_SIZE_KIB);
+    if value <= 0 {
+        tracing::warn!(
+            "{SQLITE_CACHE_SIZE_KIB_ENV}={value} must be positive; using the default of \
+             {DEFAULT_SQLITE_CACHE_SIZE_KIB} KiB."
+        );
+        DEFAULT_SQLITE_CACHE_SIZE_KIB
+    } else {
+        value
+    }
+}
+
 /// Connections in the in-memory SQLite tier's pool. **One**, unconditionally, and not a tuning
 /// knob — see the module header for why this is a data-integrity constraint rather than the
 /// DDL-race concern the rest of this module is about.
@@ -170,10 +221,11 @@ fn build_sqlite_connect_options(db_url: &str) -> Result<SqliteConnectOptions, Db
         // has been VACUUMed under it — see `ensure_incremental_auto_vacuum`) is actually incremental.
         // On an existing NONE database this per-connection value is inert until that conversion runs.
         .pragma("auto_vacuum", "INCREMENTAL")
-        // 256 MiB of memory-mapped reads: hot pages are served without a `read(2)` copy per page.
-        .pragma("mmap_size", "268435456")
-        // 64 MiB page cache per connection (negative = KiB, so this is 64000 KiB).
-        .pragma("cache_size", "-64000"))
+        // Memory-mapped reads: hot pages are served without a `read(2)` copy per page. See
+        // `SQLITE_MMAP_SIZE_BYTES_ENV`'s doc comment for the default and how to override it.
+        .pragma("mmap_size", sqlite_mmap_size_bytes().to_string())
+        // Page cache per connection (negative = KiB). See `SQLITE_CACHE_SIZE_KIB_ENV`.
+        .pragma("cache_size", format!("-{}", sqlite_cache_size_kib())))
 }
 
 /// Runs every pending migration on a dedicated pool that opens with exactly one connection, applies
@@ -459,10 +511,12 @@ pub async fn apply_sqlite_pragmas(db: &DatabaseConnection) -> Result<(), DbErr> 
             tracing::warn!("Could not set the SQLite {label}: {e}. Continuing with the default.");
         }
     }
+    let mmap_bytes = sqlite_mmap_size_bytes();
+    let cache_kib = sqlite_cache_size_kib();
     for (label, statement) in [
         ("auto vacuum", "PRAGMA auto_vacuum=INCREMENTAL;".to_owned()),
-        ("mmap size", "PRAGMA mmap_size=268435456;".to_owned()),
-        ("page cache size", "PRAGMA cache_size=-64000;".to_owned()),
+        ("mmap size", format!("PRAGMA mmap_size={mmap_bytes};")),
+        ("page cache size", format!("PRAGMA cache_size=-{cache_kib};")),
     ] {
         if let Err(e) =
             db.execute_raw(Statement::from_string(DatabaseBackend::Sqlite, statement)).await
@@ -473,7 +527,9 @@ pub async fn apply_sqlite_pragmas(db: &DatabaseConnection) -> Result<(), DbErr> 
     tracing::info!(
         "SQLite session pragmas applied: foreign_keys=ON, synchronous=NORMAL, \
          busy_timeout={SQLITE_BUSY_TIMEOUT_MS}ms, temp_store=MEMORY, auto_vacuum=INCREMENTAL, \
-         mmap_size=256MiB, cache_size=64MiB."
+         mmap_size={}MiB, cache_size={}MiB.",
+        mmap_bytes / (1024 * 1024),
+        cache_kib / 1024,
     );
 
     // `PRAGMA optimize` refreshes the planner's statistics for tables whose data has changed enough

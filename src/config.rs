@@ -103,7 +103,7 @@ pub const TRUSTED_PROXIES_ENV: &str = "TRUSTED_PROXIES";
 // `TRUSTED_PROXIES` and `VAULT_ENCRYPTION_KEY`, which abort startup — those *are* boundaries.
 
 /// Reads a numeric environment variable, falling back to `default` with a warning if unusable.
-fn numeric_env<T>(name: &str, default: T) -> T
+pub(crate) fn numeric_env<T>(name: &str, default: T) -> T
 where
     T: std::str::FromStr + std::fmt::Display + Copy,
 {
