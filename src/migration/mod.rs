@@ -22,6 +22,7 @@ mod m20261005_120000_add_foreign_key_indexes;
 mod m20261006_120000_refactor_membership_state;
 mod m20261007_120000_add_webhook_query_indexes;
 mod m20261008_120000_add_simple_foreign_key_indexes;
+mod m20261009_120000_make_listing_indexes_covering;
 
 /// The ordered set of all schema migrations for `simply_ip_vault`.
 pub struct Migrator;
@@ -51,6 +52,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261006_120000_refactor_membership_state::Migration),
             Box::new(m20261007_120000_add_webhook_query_indexes::Migration),
             Box::new(m20261008_120000_add_simple_foreign_key_indexes::Migration),
+            Box::new(m20261009_120000_make_listing_indexes_covering::Migration),
         ]
     }
 }

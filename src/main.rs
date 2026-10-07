@@ -315,6 +315,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // not be applied is a performance regression; refusing to boot over it would be an outage.
     simply_ip_vault::db::apply_sqlite_pragmas(&db).await?;
 
+    // Detached, not awaited: a first-time statistics refresh after a migration adds indexes to a
+    // large table can take far longer than this startup sequence should wait on — see
+    // `optimize_in_background`'s doc comment. Nothing below depends on it having finished.
+    tokio::spawn(simply_ip_vault::db::optimize_in_background(db.clone()));
+
     bootstrap_master_key(&db, &cipher).await?;
 
     verify_encryption_key(&db, &cipher).await?;
