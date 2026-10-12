@@ -40,7 +40,10 @@
 //! membership's state cannot be split back onto a shared row without choosing which group's copy
 //! wins. `down` refuses rather than guessing.
 
-use sea_orm::sea_query::{Alias, Asterisk, Expr, ExprTrait, Func, Index as SqIndex, IndexOrder, Query};
+use sea_orm::{
+    DatabaseBackend,
+    sea_query::{Alias, Asterisk, Expr, ExprTrait, Func, Index as SqIndex, IndexOrder, Query},
+};
 use sea_orm_migration::prelude::*;
 
 #[derive(DeriveMigrationName)]
@@ -111,9 +114,18 @@ enum IpGroups {
     Id,
 }
 
-/// Surrogate id: 16 random bytes, stored in the same BLOB form as every other UUID column.
-fn random_id() -> Expr {
-    Func::cust(Alias::new("randomblob")).arg(Expr::val(16)).into()
+/// Surrogate id, generated the way each backend's own `uuid()` column type expects.
+///
+/// SQLite stores a UUID column as a BLOB, so `randomblob(16)` is 16 random bytes in that form.
+/// PostgreSQL's native `uuid` type has its own generator; `randomblob` is not a PostgreSQL
+/// function at all and would fail outright (`function randomblob(integer) does not exist`) —
+/// this project is required to stay SQL-agnostic (`AGENT.MD`), so a function that exists on only
+/// one backend cannot be hardcoded here.
+fn random_id(backend: DatabaseBackend) -> Expr {
+    match backend {
+        DatabaseBackend::Postgres => Func::cust(Alias::new("gen_random_uuid")).into(),
+        _ => Func::cust(Alias::new("randomblob")).arg(Expr::val(16)).into(),
+    }
 }
 
 /// Row count of `table`, computed by the engine. Used to prove a copy kept every row.
@@ -134,6 +146,7 @@ async fn count(manager: &SchemaManager<'_>, table: impl IntoIden) -> Result<i64,
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let conn = manager.get_connection();
+        let backend = manager.get_database_backend();
         // 1. The canonical address table, under a temporary name, filled by one engine-side copy.
         manager
             .create_table(
@@ -208,7 +221,7 @@ impl MigrationTrait for Migration {
             ])
             .select_from(
                 Query::select()
-                    .expr(random_id())
+                    .expr(random_id(backend))
                     .column((Memberships::Table, Memberships::IpRecordId))
                     .column((Memberships::Table, Memberships::GroupId))
                     .column((IpRecords::Table, IpRecords::IsLocked))
@@ -286,7 +299,7 @@ impl MigrationTrait for Migration {
             .columns([Causes::Id, Causes::MembershipId, Causes::Cause, Causes::CreatedAt])
             .select_from(
                 Query::select()
-                    .expr(random_id())
+                    .expr(random_id(backend))
                     .column((MembershipsNew::Table, Memberships::Id))
                     .column((IpRecords::Table, IpRecords::Cause))
                     .column((Memberships::Table, Memberships::CreatedAt))
