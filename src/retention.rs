@@ -72,7 +72,9 @@ fn sweep_seconds_from_env() -> u64 {
 /// destroy live data.
 ///
 /// Order matters: memberships first, then orphaned addresses. The cause history goes with its
-/// membership via `ON DELETE CASCADE`. An address still held by another group keeps its row.
+/// membership via `ON DELETE CASCADE`. An address still held by another group keeps its row. The
+/// orphan scan itself is skipped entirely when this sweep purged zero memberships — see the
+/// comment at that check for why that is always safe, not just an optimistic optimization.
 pub async fn purge_expired_ip_records(
     db: &DatabaseConnection,
     retention_days: i64,
@@ -91,15 +93,36 @@ pub async fn purge_expired_ip_records(
         .exec(&txn)
         .await?;
 
+    // The membership purge above is the *only* place other than the already-self-cleaning hard
+    // delete path (`api::records::delete_ip`, which removes an orphaned `ip_records` row in the
+    // same transaction as the membership it deletes) that ever removes a
+    // `ip_record_group_memberships` row at all. If this sweep purged nothing, nothing could have
+    // become newly orphaned since the last sweep, so the scan below — over the *entire*
+    // `ip_records` table, unconditionally, every hour — is skipped entirely rather than run to
+    // confirm there is nothing to do.
+    if result.rows_affected == 0 {
+        txn.commit().await?;
+        return Ok(0);
+    }
+
+    // A correlated `NOT EXISTS`, not `NOT IN (subquery)`: on PostgreSQL, `NOT IN` against a
+    // subquery cannot in general be rewritten into an index-driven anti-join — the planner has to
+    // account for the subquery possibly containing a NULL, which under NOT IN's three-valued logic
+    // would make the whole condition UNKNOWN for every row. That forces a full materialization of
+    // the subquery and a scan, even though `ip_record_id` is NOT NULL here. `NOT EXISTS` carries no
+    // such ambiguity and reliably plans as an anti-join against `idx-irgm-ip_record_id`. SQLite
+    // doesn't have this particular gap, but the query is the same builder call on every backend.
     ip_record::Entity::delete_many()
-        .filter(
-            Expr::col((ip_record::Entity, ip_record::Column::Id)).not_in_subquery(
-                Query::select()
-                    .column((ip_record_group_membership::Entity, ip_record_group_membership::Column::IpRecordId))
-                    .from(ip_record_group_membership::Entity)
-                    .to_owned(),
-            ),
-        )
+        .filter(Expr::not_exists(
+            Query::select()
+                .expr(Expr::val(1))
+                .from(ip_record_group_membership::Entity)
+                .and_where(
+                    Expr::col((ip_record_group_membership::Entity, ip_record_group_membership::Column::IpRecordId))
+                        .equals((ip_record::Entity, ip_record::Column::Id)),
+                )
+                .to_owned(),
+        ))
         .exec(&txn)
         .await?;
 

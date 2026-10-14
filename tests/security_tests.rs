@@ -3253,6 +3253,29 @@ async fn purge_removes_only_records_past_the_92_day_retention_window() {
     );
 }
 
+/// `purge_expired_ip_records` skips its own orphan-address scan entirely when the membership purge
+/// found nothing to remove — the only other path that ever deletes a membership row (a hard
+/// delete via the API) already removes its own orphan in the same transaction, so a sweep that
+/// purged zero memberships can have nothing new to clean up. This must stay a true no-op: a
+/// positive retention window, with only live, unexpired data present, must neither purge anything
+/// nor disturb that live data.
+#[tokio::test]
+async fn purge_is_a_cheap_no_op_when_nothing_is_expired() {
+    use simply_ip_vault::retention::{purge_expired_ip_records, DEFAULT_RETENTION_DAYS};
+
+    let db = setup_test_db().await;
+    let group_id = insert_group(&db, "no-op-purge-group").await;
+    let live = insert_ip_record(&db, "203.0.113.9", group_id).await;
+
+    assert_eq!(
+        purge_expired_ip_records(&db, DEFAULT_RETENTION_DAYS).await.unwrap(),
+        0,
+        "nothing is expired, so nothing is purged"
+    );
+    assert!(raw_membership(&db, live, group_id).await.is_some(), "the live membership is untouched");
+    assert!(raw_record(&db, live).await.is_some(), "the live address row is untouched");
+}
+
 /// **Successful and failed `webhook_executions` rows are purged on independent windows** — 24h for
 /// successes, 7 days (168h) for failures — and each threshold disables independently at `0`,
 /// mirroring `purge_removes_only_records_past_the_92_day_retention_window`'s coverage of the same
