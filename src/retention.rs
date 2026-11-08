@@ -153,7 +153,13 @@ pub async fn run_retention_worker(db: DatabaseConnection, mut shutdown: mpsc::Re
         "IP retention worker started — soft-deleted records are purged after {retention_days} days."
     );
 
-    let mut ticker = tokio::time::interval(Duration::from_secs(sweep_seconds));
+    // First tick delayed so startup, master key pinning, and initial health checks complete cleanly
+    // before the first retention sweep acquires write transactions.
+    let initial_delay = Duration::from_secs(std::cmp::min(10, sweep_seconds));
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + initial_delay,
+        Duration::from_secs(sweep_seconds),
+    );
     // If a sweep runs long (a large backlog on slow storage), skip the ticks it missed rather than
     // firing them back to back the moment it finishes.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -287,7 +293,11 @@ pub async fn run_webhook_execution_retention_worker(
         "Webhook execution retention worker started."
     );
 
-    let mut ticker = tokio::time::interval(Duration::from_secs(sweep_seconds));
+    let initial_delay = Duration::from_secs(std::cmp::min(10, sweep_seconds));
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + initial_delay,
+        Duration::from_secs(sweep_seconds),
+    );
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {

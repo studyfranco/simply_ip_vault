@@ -979,18 +979,20 @@ class FirewallClient {
         // a key that holds neither).
         executionsTab.style.display = (p.is_master || p.can_manage_webhooks) ? 'inline-block' : 'none';
 
+        // Settings tab — master only
+        const settingsTab = document.getElementById('settings-tab-btn');
+        if (settingsTab) settingsTab.style.display = p.is_master ? 'inline-block' : 'none';
+
         // Audit Logs Tab — the backend restricts GET /audit-logs to master keys, so hide the tab
         // entirely rather than show it and let every request 403.
         auditTab.style.display = p.is_master ? 'inline-block' : 'none';
 
         // ── Key creation: Parent and Master only ────────────────────────────
-        //
-        // A Daughter key (can_manage_keys = false) cannot create keys at all, so the form is removed
-        // rather than disabled. Offering a form whose only possible outcome is 403 teaches the user
-        // that the UI is unreliable, which is worse than not offering it.
-        const createKeyForm = document.getElementById('form-create-apikey');
         const mayCreateKeys = p.is_master || p.can_manage_keys;
-        if (createKeyForm) createKeyForm.classList.toggle('hidden', !mayCreateKeys);
+        const btnOpenCreateKey = document.getElementById('btn-open-create-key');
+        if (btnOpenCreateKey) btnOpenCreateKey.classList.toggle('hidden', !mayCreateKeys);
+        const createKeyForm = document.getElementById('form-create-apikey');
+        if (createKeyForm && !mayCreateKeys) createKeyForm.classList.add('hidden');
 
         // ── Master-only global scopes (R4) ──────────────────────────────────
         //
@@ -1062,6 +1064,7 @@ class FirewallClient {
             await this.loadExecutions();
         }
         if (this.state.profile.is_master) {
+            await this.loadSettings();
             await this.loadAuditLogs();
         }
     }
@@ -1176,9 +1179,88 @@ class FirewallClient {
         } catch(e) {}
     }
 
+    async loadSettings() {
+        if (!this.state.profile?.is_master) return;
+        try {
+            const s = await this.apiFetch('/settings');
+            this.renderSettings(s);
+        } catch(e) {
+            console.error('Failed to load settings', e);
+        }
+    }
+
+    renderSettings(s) {
+        const grid = document.getElementById('settings-grid');
+        if (!grid || !s) return;
+        const item = (label, value) => `
+            <div class="kv-item">
+                <span class="kv-key">${escapeHtml(label)}</span>
+                <span class="kv-value">${value}</span>
+            </div>
+        `;
+        const trustedProxiesDisplay = (s.trusted_proxies && s.trusted_proxies.length > 0)
+            ? `<div class="tag-list">${s.trusted_proxies.map(p => `<span class="badge badge-scope font-mono">${escapeHtml(p)}</span>`).join(' ')}</div>`
+            : '<span class="text-muted">None configured</span>';
+
+        grid.innerHTML = [
+            item('Trusted Proxies', trustedProxiesDisplay),
+            item('Secrets at rest', s.encryption_enabled
+                ? '<span class="badge badge-success">encrypted</span>'
+                : '<span class="badge badge-timeout">unencrypted</span>'),
+            item('Webhook workers', s.webhook_workers),
+            item('Webhook dispatch interval', `${s.webhook_dispatch_interval_ms} ms`),
+            item('Webhook queue capacity', s.webhook_queue_capacity),
+            item('Webhook max retries', s.webhook_max_retries),
+            item('Total IP records', s.ip_record_count),
+            item('Total IP groups', s.ip_group_count),
+            item('Active API keys', s.api_key_count),
+            item('Webhook configurations', s.webhook_count),
+            item('Webhook executions retained', s.execution_count),
+            item('Audit logs retained', s.audit_log_count),
+        ].join('');
+    }
+
     async fetchAuditLogsChunk(offset, limit) {
         const params = new URLSearchParams({ limit, offset });
+        const action = document.getElementById('audit-action-filter')?.value.trim();
+        const clientIp = document.getElementById('audit-ip-filter')?.value.trim();
+        const apiKey = document.getElementById('audit-key-filter')?.value.trim();
+        const since = document.getElementById('audit-since-filter')?.value;
+        const until = document.getElementById('audit-until-filter')?.value;
+
+        if (action) params.append('action', action);
+        if (clientIp) params.append('client_ip', clientIp);
+        if (apiKey) params.append('api_key', apiKey);
+        if (since) {
+            const d = new Date(since);
+            if (!Number.isNaN(d.getTime())) params.append('since', d.toISOString());
+        }
+        if (until) {
+            const d = new Date(until);
+            if (!Number.isNaN(d.getTime())) params.append('until', d.toISOString());
+        }
+
         return await this.apiFetch(`/audit-logs?${params.toString()}`);
+    }
+
+    async triggerAuditSearch() {
+        if (!this.state.profile?.is_master) return;
+        this.auditCache.reset();
+        await this.loadAuditLogs();
+    }
+
+    async clearAuditFilters() {
+        const action = document.getElementById('audit-action-filter');
+        const ip = document.getElementById('audit-ip-filter');
+        const key = document.getElementById('audit-key-filter');
+        const since = document.getElementById('audit-since-filter');
+        const until = document.getElementById('audit-until-filter');
+        if (action) action.value = '';
+        if (ip) ip.value = '';
+        if (key) key.value = '';
+        if (since) since.value = '';
+        if (until) until.value = '';
+        await this.triggerAuditSearch();
     }
 
     async loadAuditLogs() {
@@ -2141,6 +2223,7 @@ class FirewallClient {
             reveal.classList.remove('hidden');
             
             document.getElementById('form-create-apikey').reset();
+            document.getElementById('form-create-apikey').classList.add('hidden');
             this.loadKeys();
         } catch(e) {}
     }
@@ -3063,6 +3146,22 @@ class FirewallClient {
         });
 
         // Admin Forms
+        const btnOpenCreateKey = document.getElementById('btn-open-create-key');
+        const formCreateKey = document.getElementById('form-create-apikey');
+        const btnCancelCreateKey = document.getElementById('btn-cancel-create-key');
+        if (btnOpenCreateKey && formCreateKey) {
+            btnOpenCreateKey.addEventListener('click', () => {
+                formCreateKey.classList.remove('hidden');
+                document.getElementById('apikey-name')?.focus();
+            });
+        }
+        if (btnCancelCreateKey && formCreateKey) {
+            btnCancelCreateKey.addEventListener('click', () => {
+                formCreateKey.classList.add('hidden');
+                formCreateKey.reset();
+            });
+        }
+
         document.getElementById('form-create-apikey').addEventListener('submit', (e) => this.createApiKey(e));
         document.getElementById('form-manage-rights').addEventListener('submit', (e) => this.manageKeyRights(e));
         document.getElementById('form-create-group').addEventListener('submit', (e) => this.createGroup(e));
@@ -3174,6 +3273,18 @@ class FirewallClient {
                 sel.addRange(range);
                 this.showToast('Clipboard unavailable (needs HTTPS) — the secret is selected, press Ctrl+C', 'error');
             }
+        });
+
+        // Audit log search & clear
+        document.getElementById('audit-search-btn')?.addEventListener('click', () => this.triggerAuditSearch());
+        document.getElementById('audit-clear-btn')?.addEventListener('click', () => this.clearAuditFilters());
+        ['audit-action-filter', 'audit-ip-filter', 'audit-key-filter'].forEach(id => {
+            document.getElementById(id)?.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') { e.preventDefault(); this.triggerAuditSearch(); }
+            });
+        });
+        ['audit-since-filter', 'audit-until-filter'].forEach(id => {
+            document.getElementById(id)?.addEventListener('change', () => this.triggerAuditSearch());
         });
 
         // Audit log pagination — same client-side-slice-first model as the IP table above.

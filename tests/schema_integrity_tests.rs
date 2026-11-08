@@ -1181,8 +1181,10 @@ async fn list_ips_query_plan_uses_indexes_not_a_temp_b_tree_or_table_scan() {
          idx-irgm-last_seen_at exists: {unfiltered_plan:?}"
     );
     assert!(
-        unfiltered_plan.iter().any(|l| l.contains("idx-irgm-last_seen_at")),
-        "the unfiltered master listing must be ordered by idx-irgm-last_seen_at: {unfiltered_plan:?}"
+        unfiltered_plan
+            .iter()
+            .any(|l| l.contains("idx-irgm-last_seen_at") || l.contains("idx_memberships_global_active_last_seen")),
+        "the unfiltered master listing must be ordered by idx-irgm-last_seen_at or idx_memberships_global_active_last_seen: {unfiltered_plan:?}"
     );
 
     // The bare group-scoped lookup every RBAC accessible-groups filter (and the `full_replace`
@@ -1791,10 +1793,13 @@ async fn the_delta_sync_columns_are_indexed() {
     let tmp = TempDb::new();
     let db = fresh_db(&tmp).await;
 
-    // The delta columns now live on the membership, so that is where the indexes must be.
+    // The delta and listing columns now live on the membership, so that is where the indexes must be.
     for index in [
         "idx_memberships_deleted_at",
         "idx_memberships_active_last_seen",
+        "idx_memberships_global_active_last_seen",
+        "idx_memberships_global_last_seen",
+        "idx_memberships_global_deleted_at",
         "idx_memberships_group_last_seen",
         "idx_memberships_group_deleted_at",
     ] {

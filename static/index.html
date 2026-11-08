@@ -73,6 +73,7 @@
             <button class="tab-btn" data-tab="keys" id="keys-tab-btn" role="tab" aria-selected="false">API Keys &amp; Permissions</button>
             <button class="tab-btn" data-tab="webhooks" id="webhooks-tab-btn" role="tab" aria-selected="false">Webhooks</button>
             <button class="tab-btn" data-tab="executions" id="executions-tab-btn" role="tab" aria-selected="false">Executions</button>
+            <button class="tab-btn" data-tab="settings" id="settings-tab-btn" role="tab" aria-selected="false">System Settings</button>
             <button class="tab-btn" data-tab="audit" id="audit-tab-btn" role="tab" aria-selected="false">Audit Logs</button>
         </nav>
       </div>
@@ -227,13 +228,16 @@
 
                 <!-- API Keys -->
                 <section class="card admin-section" id="apikey-section">
-                    <h2>API Keys</h2>
+                    <div class="list-header">
+                        <h2>API Keys</h2>
+                        <button type="button" id="btn-open-create-key" class="btn btn-primary">+ New Key</button>
+                    </div>
                     <p class="subtitle">Create and manage API keys (Global Scopes).</p>
 
                     <!-- Hidden entirely for Daughter keys (can_manage_keys = false), which cannot
                          create keys at all. The server refuses regardless; this stops the form being
                          offered only to answer 403. -->
-                    <form id="form-create-apikey" class="admin-form">
+                    <form id="form-create-apikey" class="admin-form hidden">
                         <div class="form-grid">
                             <div class="form-group">
                                 <label for="apikey-name">Key Name <span>*</span></label>
@@ -279,6 +283,7 @@
 
                         <div class="form-actions mt-4">
                             <button type="submit" class="btn btn-primary">Create API Key</button>
+                            <button type="button" id="btn-cancel-create-key" class="btn btn-cancel">Cancel</button>
                         </div>
                     </form>
 
@@ -662,12 +667,57 @@
         </div>
 
         <!-- ═══════════════════════════════════════════════ -->
+        <!-- TAB: System Settings                            -->
+        <!-- ═══════════════════════════════════════════════ -->
+        <main id="tab-settings" class="tab-panel">
+            <div class="admin-grid">
+                <section class="card admin-section">
+                    <h2>System Configuration</h2>
+                    <p class="subtitle">Effective runtime settings and system-wide counters. Master keys only.</p>
+                    <div class="kv-grid" id="settings-grid">
+                        <div class="text-muted text-sm">Loading system configuration...</div>
+                    </div>
+                </section>
+            </div>
+        </main>
+
+        <!-- ═══════════════════════════════════════════════ -->
         <!-- TAB: Audit Logs                                 -->
         <!-- ═══════════════════════════════════════════════ -->
         <main id="tab-audit" class="tab-panel">
             <section class="card audit-section">
                 <h2>Audit Logs</h2>
                 <p class="subtitle">Recent mutating actions across the system. Visible to Master keys only.</p>
+
+                <div class="filters mb-4">
+                    <input type="text" id="audit-action-filter" class="input-field font-mono" list="audit-action-options" placeholder="Filter by action...">
+                    <datalist id="audit-action-options">
+                        <option value="IP_ADD"></option>
+                        <option value="IP_UPDATE"></option>
+                        <option value="IP_DELETE"></option>
+                        <option value="IP_RESTORE"></option>
+                        <option value="IP_PURGE"></option>
+                        <option value="GROUP_CREATE"></option>
+                        <option value="GROUP_UPDATE"></option>
+                        <option value="GROUP_DELETE"></option>
+                        <option value="KEY_CREATE"></option>
+                        <option value="KEY_UPDATE"></option>
+                        <option value="KEY_DELETE"></option>
+                        <option value="KEY_ROTATE"></option>
+                        <option value="KEY_PERM_UPDATE"></option>
+                        <option value="KEY_PERM_REVOKE"></option>
+                        <option value="WEBHOOK_CREATE"></option>
+                        <option value="WEBHOOK_UPDATE"></option>
+                        <option value="WEBHOOK_DELETE"></option>
+                    </datalist>
+                    <input type="text" id="audit-ip-filter" class="input-field font-mono" placeholder="Filter by client IP...">
+                    <input type="text" id="audit-key-filter" class="input-field" placeholder="Filter by API key (name or prefix)...">
+                    <input type="datetime-local" id="audit-since-filter" class="input-field" title="Since (inclusive)">
+                    <input type="datetime-local" id="audit-until-filter" class="input-field" title="Until (exclusive)">
+                    <button type="button" id="audit-search-btn" class="btn btn-icon" title="Search">🔍</button>
+                    <button type="button" id="audit-clear-btn" class="btn btn-secondary btn-sm">Clear</button>
+                </div>
+
                 <div class="table-container table-scroll">
                     <table class="data-table">
                         <thead>

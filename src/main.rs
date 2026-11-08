@@ -315,11 +315,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // not be applied is a performance regression; refusing to boot over it would be an outage.
     simply_ip_vault::db::apply_sqlite_pragmas(&db).await?;
 
-    // Detached, not awaited: a first-time statistics refresh after a migration adds indexes to a
-    // large table can take far longer than this startup sequence should wait on — see
-    // `optimize_in_background`'s doc comment. Nothing below depends on it having finished.
-    tokio::spawn(simply_ip_vault::db::optimize_in_background(db.clone()));
-
     bootstrap_master_key(&db, &cipher).await?;
 
     verify_encryption_key(&db, &cipher).await?;
@@ -328,6 +323,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // discovered as an unexplained 403 later. Detached and non-blocking: an unresolvable entry is
     // retried after a grace period and disabled meanwhile, never a reason to refuse to start.
     trusted_proxies.prime_with_grace();
+
+    let (state, tx, worker_handle) = setup_state(db.clone())?;
+
+    // Fix the Master's identity before anything can be served.
+    //
+    // Ordering is the entire control, so it is stated here rather than left to be inferred: this
+    // runs after migrations and `bootstrap_master_key` (so the master and its uniqueness index both
+    // exist) and before `TcpListener::bind` (so no request can be answered against an unpinned
+    // state). From this line on, `is_master` is authoritative for exactly one id, and promoting a
+    // row in the live database has no runtime effect at all.
+    //
+    // Fatal on every failure. The three ways this fails — no master, several, or a missing
+    // uniqueness index — are each a database that cannot answer "who is Master?", and a service that
+    // starts anyway would answer it with whichever row a query happened to return. Refusing to start
+    // is loud, immediate, and leaves the evidence intact; the alternative is a running service whose
+    // most powerful credential is decided by row order.
+    let master_key_id = state.master_pin.pin_at_boot(&state.db).await.map_err(|e| {
+        tracing::error!("Refusing to start: {e}");
+        e
+    })?;
+    tracing::info!(
+        "Master key pinned for the life of this process: {master_key_id}. A key promoted in the \
+         database from now on will be treated as an ordinary key."
+    );
+
+    // Background optimization and retention workers are spawned only after setup and master key
+    // pinning succeed, avoiding startup lock contention against the master pin query.
+    tokio::spawn(simply_ip_vault::db::optimize_in_background(db.clone()));
 
     // Retention sweep for soft-deleted IP records. Its own shutdown channel, so it drains on
     // SIGTERM instead of being cancelled mid-delete.
@@ -356,30 +379,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await;
     });
-
-    let (state, tx, worker_handle) = setup_state(db)?;
-
-    // Fix the Master's identity before anything can be served.
-    //
-    // Ordering is the entire control, so it is stated here rather than left to be inferred: this
-    // runs after migrations and `bootstrap_master_key` (so the master and its uniqueness index both
-    // exist) and before `TcpListener::bind` (so no request can be answered against an unpinned
-    // state). From this line on, `is_master` is authoritative for exactly one id, and promoting a
-    // row in the live database has no runtime effect at all.
-    //
-    // Fatal on every failure. The three ways this fails — no master, several, or a missing
-    // uniqueness index — are each a database that cannot answer "who is Master?", and a service that
-    // starts anyway would answer it with whichever row a query happened to return. Refusing to start
-    // is loud, immediate, and leaves the evidence intact; the alternative is a running service whose
-    // most powerful credential is decided by row order.
-    let master_key_id = state.master_pin.pin_at_boot(&state.db).await.map_err(|e| {
-        tracing::error!("Refusing to start: {e}");
-        e
-    })?;
-    tracing::info!(
-        "Master key pinned for the life of this process: {master_key_id}. A key promoted in the \
-         database from now on will be treated as an ordinary key."
-    );
 
     let app = create_app(state);
 

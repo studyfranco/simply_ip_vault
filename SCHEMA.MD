@@ -20,8 +20,15 @@ Indexes that matter for the read path:
 
 - `idx_memberships_ip_group` UNIQUE on `(ip_record_id, group_id)`: one membership per address per group.
 - `idx_memberships_active_last_seen`: partial covering, `(group_id, last_seen_at DESC, id, …) WHERE is_deleted = FALSE`.
-  This serves the default listing (offset and keyset cursor) and its count without a temp B-tree. Measured at 100k rows in
+  This serves the default group-scoped listing (offset and keyset cursor) and its count without a temp B-tree. Measured at 100k rows in
   `tests/benchmark_tests.rs`: group-scoped page about 1.2 ms, group-scoped count about 2.3 ms.
+- `idx_memberships_global_active_last_seen`: partial covering, `(last_seen_at DESC, id ASC, group_id, …) WHERE is_deleted = FALSE`
+  (`m20261011_120000`): serves global active listings (`GET /api/ips`) in exact sort order without a temp B-tree (< 1 ms).
+- `idx_memberships_is_deleted` on `(is_deleted)` (`m20261011_120000`): compact single-column index serving global active/trash
+  row count queries (`SELECT COUNT(*) FROM ip_record_group_memberships WHERE is_deleted = ?`) via index range search (< 2 ms).
+- `idx_memberships_global_last_seen` `(last_seen_at DESC, id ASC)` and `idx_memberships_global_deleted_at`
+  `(deleted_at DESC, id ASC) WHERE is_deleted = TRUE` (`m20261011_120000`): serve global differential sync and unfiltered listings
+  under `include_deleted=true` without a temp B-tree.
 - `idx_memberships_group_last_seen` `(group_id, last_seen_at DESC, id)` and `idx_memberships_group_deleted_at`
   `(group_id, deleted_at DESC, id) WHERE is_deleted = TRUE` (`m20261010_120000`): serve group-scoped differential
   sync (`since` + `include_deleted=true`) via SQLite's `MULTI-INDEX OR` as well as `include_deleted=true` listings
@@ -32,9 +39,10 @@ Indexes that matter for the read path:
 - `idx-audit_logs-api_key_id`, `idx_audit_logs_action_timestamp`, `idx-webhook_configs-group_id`: foreign-key child and composite audit indexes.
 
 Pragmas, set per connection and checked at boot (`src/db.rs`): `journal_mode=WAL`, `synchronous=NORMAL`,
-`foreign_keys=ON`, `busy_timeout=10000`, `temp_store=MEMORY`, `mmap_size=256 MB`, `cache_size=-64000`,
-`auto_vacuum=INCREMENTAL`. An existing database is converted to incremental auto-vacuum once, at boot,
-with `VACUUM`. `PRAGMA optimize` runs after the pragmas are applied. The maintenance worker
+`foreign_keys=ON`, `busy_timeout=10000`, `temp_store=MEMORY`, `mmap_size=512 MB`, `cache_size=-131072`.
+Incremental auto-vacuum (`auto_vacuum=INCREMENTAL`) is handled once at boot during migration via `ensure_incremental_auto_vacuum`,
+preventing connection-time exclusive schema lock requests. `PRAGMA optimize(0x10002)` runs in the background after boot
+to ensure all tables and indexes receive up-to-date planner statistics. The maintenance worker
 (`src/maintenance.rs`) runs `incremental_vacuum(1000)` and `wal_checkpoint(TRUNCATE)` every 12 hours.
 
 The membership migration is not reversible. Membership state cannot be split back onto a shared address row

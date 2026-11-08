@@ -45,6 +45,7 @@ mod guards;
 mod health;
 mod keys;
 mod records;
+mod settings;
 mod support;
 mod webhooks;
 
@@ -60,6 +61,7 @@ pub use groups::*;
 pub use health::*;
 pub use keys::*;
 pub use records::*;
+pub use settings::*;
 pub use webhooks::*;
 
 // The credential primitives and the shared owner payload are public because the integration suites

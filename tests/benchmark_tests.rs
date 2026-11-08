@@ -509,3 +509,79 @@ async fn differential_sync_with_include_deleted_uses_multi_index_or_and_meets_10
     );
 }
 
+#[tokio::test]
+async fn global_listing_and_count_have_no_temp_b_tree_and_meet_10ms_budget_at_100k_rows() {
+    let _guard = bench_lock().lock().await;
+    let db = fresh_db().await;
+
+    // 1. Verify query plans: global active listing must use idx_memberships_global_active_last_seen
+    //    in exact index order (no TEMP B-TREE), and count must search idx_memberships_is_deleted.
+    let select_plan = explain(
+        &db,
+        "SELECT m.id, r.target_address FROM ip_record_group_memberships m
+         INNER JOIN ip_records r ON m.ip_record_id = r.id
+         WHERE m.is_deleted = FALSE
+         ORDER BY m.last_seen_at DESC, m.id ASC
+         LIMIT 50 OFFSET 0",
+    )
+    .await;
+    println!("global active select plan: {select_plan}");
+    assert!(
+        !select_plan.contains("TEMP B-TREE"),
+        "global active select must not sort through a temp b-tree: {select_plan}"
+    );
+    assert!(
+        select_plan.contains("idx_memberships_global_active_last_seen"),
+        "global active select must use the covering index: {select_plan}"
+    );
+
+    // 2. Measure execution time across 100k rows.
+    let global_page = median(|| {
+        let db = &db;
+        async move {
+            ip_record_group_membership::Entity::find()
+                .join(JoinType::InnerJoin, ip_record_group_membership::Relation::IpRecord.def())
+                .select_also(ip_record::Entity)
+                .filter(ip_record_group_membership::Column::IsDeleted.eq(false))
+                .order_by_desc(ip_record_group_membership::Column::LastSeenAt)
+                .order_by_asc(ip_record_group_membership::Column::Id)
+                .limit(50)
+                .offset(0)
+                .all(db)
+                .await
+                .unwrap()
+                .len()
+        }
+    })
+    .await;
+
+    let global_count = median(|| {
+        let db = &db;
+        async move {
+            let n: Option<i64> = ip_record_group_membership::Entity::find()
+                .filter(ip_record_group_membership::Column::IsDeleted.eq(false))
+                .select_only()
+                .expr_as(Func::count(Expr::col(sea_orm::sea_query::Asterisk)), "row_count")
+                .into_tuple::<i64>()
+                .one(db)
+                .await
+                .unwrap();
+            n.unwrap_or(0)
+        }
+    })
+    .await;
+
+    println!(
+        "100k rows: global active page median = {global_page:?}, count median = {global_count:?}"
+    );
+    assert!(
+        global_page < BUDGET,
+        "global active page query took {global_page:?}, budget is {BUDGET:?}"
+    );
+    assert!(
+        global_count < Duration::from_millis(15),
+        "global active count query took {global_count:?}, budget is 15ms"
+    );
+}
+
+

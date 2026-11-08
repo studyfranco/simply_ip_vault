@@ -217,10 +217,6 @@ fn build_sqlite_connect_options(db_url: &str) -> Result<SqliteConnectOptions, Db
         // method exists for this pragma, hence the generic `.pragma()` escape hatch rather than a
         // typed setter like the others above.
         .pragma("temp_store", "MEMORY")
-        // Persistent in the file header, so only a database created under this setting (or one that
-        // has been VACUUMed under it — see `ensure_incremental_auto_vacuum`) is actually incremental.
-        // On an existing NONE database this per-connection value is inert until that conversion runs.
-        .pragma("auto_vacuum", "INCREMENTAL")
         // Memory-mapped reads: hot pages are served without a `read(2)` copy per page. See
         // `SQLITE_MMAP_SIZE_BYTES_ENV`'s doc comment for the default and how to override it.
         .pragma("mmap_size", sqlite_mmap_size_bytes().to_string())
@@ -514,7 +510,6 @@ pub async fn apply_sqlite_pragmas(db: &DatabaseConnection) -> Result<(), DbErr> 
     let mmap_bytes = sqlite_mmap_size_bytes();
     let cache_kib = sqlite_cache_size_kib();
     for (label, statement) in [
-        ("auto vacuum", "PRAGMA auto_vacuum=INCREMENTAL;".to_owned()),
         ("mmap size", format!("PRAGMA mmap_size={mmap_bytes};")),
         ("page cache size", format!("PRAGMA cache_size=-{cache_kib};")),
     ] {
@@ -526,7 +521,7 @@ pub async fn apply_sqlite_pragmas(db: &DatabaseConnection) -> Result<(), DbErr> 
     }
     tracing::info!(
         "SQLite session pragmas applied: foreign_keys=ON, synchronous=NORMAL, \
-         busy_timeout={SQLITE_BUSY_TIMEOUT_MS}ms, temp_store=MEMORY, auto_vacuum=INCREMENTAL, \
+         busy_timeout={SQLITE_BUSY_TIMEOUT_MS}ms, temp_store=MEMORY, \
          mmap_size={}MiB, cache_size={}MiB.",
         mmap_bytes / (1024 * 1024),
         cache_kib / 1024,
@@ -553,7 +548,7 @@ pub async fn optimize_in_background(db: DatabaseConnection) {
     }
     tracing::info!("SQLite planner statistics refresh (PRAGMA optimize) started in the background.");
     let started = std::time::Instant::now();
-    match db.execute_raw(Statement::from_string(DatabaseBackend::Sqlite, "PRAGMA optimize;".to_owned())).await {
+    match db.execute_raw(Statement::from_string(DatabaseBackend::Sqlite, "PRAGMA optimize(0x10002);".to_owned())).await {
         Ok(_) => tracing::info!("SQLite planner statistics refreshed (PRAGMA optimize) in {:?}.", started.elapsed()),
         Err(e) => tracing::warn!("Could not run PRAGMA optimize: {e}."),
     }

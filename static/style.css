@@ -1704,9 +1704,37 @@ body {
    and screen readers announce the pairing for free. */
 .kv-grid {
     display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 0.75rem;
+    margin: 0 0 1rem;
+}
+
+dl.kv-grid {
     grid-template-columns: auto 1fr;
     gap: 0.4rem 1rem;
-    margin: 0 0 1rem;
+}
+
+.kv-item {
+    background-color: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 0.6rem 0.85rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    min-width: 0;
+}
+
+.kv-key {
+    color: var(--text-muted);
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.kv-value {
+    font-weight: 500;
+    word-break: break-word;
 }
 
 .kv-grid dt {
