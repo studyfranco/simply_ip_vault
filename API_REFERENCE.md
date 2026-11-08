@@ -228,13 +228,14 @@ holds `can_read` on. Master sees everything.
 | `since` | i64 (unix) | no | — | Delta-sync cutoff. In scope when this membership's `last_seen_at >= since`, **or** — with `include_deleted=true` — when `is_deleted` and `deleted_at >= since`. Scoped per membership: a change in one group never makes the same address look changed in another |
 | `include_deleted` | bool | no | `false` | Include soft-deleted records. Scoped exactly as live ones; **not** master-gated |
 | `limit` | u64 | no | `50` | Page size |
-| `offset` | u64 | no | `0` | Page offset |
-| `format` | string | no | — | `iplist` returns a flat address list instead of full records |
+| `offset` | u64 | no | `0` | Page offset (mutually exclusive with `cursor`) |
+| `cursor` | string | no | — | Opt-in keyset pagination cursor. Pass an empty string (`cursor=`) for the first page, then pass the returned `next_cursor` opaque token on subsequent pages until `next_cursor` is `null`. Mutually exclusive with `offset` and `format=iplist` |
+| `format` | string | no | — | `iplist` returns a flat address list (`{"ip_list": [...]}`); `minimal` returns lightweight items (`{"target_address", "last_seen_at", "is_deleted"}`) skipping group and cause lookups |
 | `mode` | string | no | — | Synonym for `format` |
-| `include_total` | bool | no | `false` | Wrap the response in a `{data, total, limit, offset, total_pages}` envelope instead of the bare array. Ignored under `format=iplist`/`mode=iplist` |
+| `include_total` | bool | no | `false` | Wrap the response in a `{data, total, limit, offset, total_pages, next_cursor}` envelope instead of the bare array. Ignored under `format=iplist`/`mode=iplist` |
 
-**Response `200`** — by default, an array of `IpRecordResponse`, ordered by `last_seen_at`
-descending. Each item is one **membership**: an address's state within one group.
+**Response `200`** — by default, an array of `IpRecordResponse`, ordered by `(last_seen_at DESC, id ASC)`.
+Each item is one **membership**: an address's state within one group.
 
 ```json
 [{
@@ -256,16 +257,44 @@ descending. Each item is one **membership**: an address's state within one group
 With `format=iplist` or `mode=iplist`, the shape is instead `{"ip_list": ["192.0.2.10", ...]}` —
 sorted and de-duplicated, skipping the per-row group lookup.
 
-With `include_total=true` (and no `format`/`mode=iplist`), the same array is returned under `data`,
-alongside pagination metadata:
+With `format=minimal` or `mode=minimal`, each item in the bare array (or inside `data` when combined
+with `cursor` or `include_total=true`) is projected to `MinimalIpRecordResponse`:
+
+```json
+[
+  { "target_address": "192.0.2.10", "last_seen_at": "2026-06-01T12:00:00", "is_deleted": false }
+]
+```
+
+This mode skips the `ip_groups` and `ip_record_causes` lookup queries entirely, minimizing per-page
+SQL work and payload size for bulk exporter/firewall syncs.
+
+With `cursor=` (first page) or `cursor=<opaque>` (subsequent pages) and without `include_total=true`,
+the response is wrapped in `IpRecordsCursorEnvelope` and skips `COUNT(*)`:
 
 ```json
 {
-  "data": [ /* IpRecordResponse[], identical shape and ordering to the bare-array response */ ],
+  "data": [ /* IpRecordResponse[] or MinimalIpRecordResponse[] */ ],
+  "next_cursor": "323032362d..." // opaque string, or null on the final page
+}
+```
+
+Keyset pagination seeks directly into the `(group_id, last_seen_at DESC, id)` covering index for
+both single-group and multi-group (`fetch_merged_page`) queries without an `OFFSET` scan or
+temporary B-tree sort, keeping page latency constant (`O(limit)`) at arbitrary depth. It works with
+all filters, including differential sync (`since` + `include_deleted=true`).
+
+With `include_total=true` (and no `format`/`mode=iplist`), the array is returned under `data`,
+alongside pagination metadata (and `next_cursor` when `cursor` is also supplied):
+
+```json
+{
+  "data": [ /* IpRecordResponse[] or MinimalIpRecordResponse[] */ ],
   "total": 3214,
   "limit": 50,
   "offset": 0,
-  "total_pages": 65
+  "total_pages": 65,
+  "next_cursor": null
 }
 ```
 

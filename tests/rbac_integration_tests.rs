@@ -8367,3 +8367,311 @@ async fn test_ip_groups_alias_returns_same_result_as_groups() {
         "/api/ip_groups and /api/groups must return identical JSON for the same key"
     );
 }
+
+// ─────────────────────────────────────────────────────────────
+// Cursor (Keyset) Pagination & Minimal Format on GET /api/ips
+// ─────────────────────────────────────────────────────────────
+
+/// Full keyset walk across single-group and multi-group queries, including ties on `last_seen_at`
+/// and an exact page-multiple record count (`6` records with `limit=2` must terminate in `3`
+/// requests with `next_cursor: null` on the third page, not a fourth empty request).
+#[tokio::test]
+async fn test_cursor_pagination_single_and_multi_group_handles_ties_and_exact_page_multiples() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let group_a = insert_group_row(&db, "cursor-group-a").await;
+    let group_b = insert_group_row(&db, "cursor-group-b").await;
+
+    let t_high = chrono::NaiveDateTime::parse_from_str("2026-06-01 12:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+    let t_mid = chrono::NaiveDateTime::parse_from_str("2026-06-01 11:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+    let t_low = chrono::NaiveDateTime::parse_from_str("2026-06-01 10:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+
+    // Seed 6 memberships across two groups, with deliberate timestamp ties at `t_mid` (4 rows share
+    // the exact same second across both groups) to exercise the `m.id ASC` tie-breaker.
+    let specs = [
+        ("198.51.100.10", group_a, t_high),
+        ("198.51.100.11", group_a, t_mid),
+        ("198.51.100.12", group_b, t_mid),
+        ("198.51.100.13", group_a, t_mid),
+        ("198.51.100.14", group_b, t_mid),
+        ("198.51.100.15", group_b, t_low),
+    ];
+    for (addr, gid, ts) in specs {
+        let rid = seed_ip_record(&db, addr, ts).await;
+        let mid = seed_membership(&db, rid, gid, SeededMembership::live_at(ts)).await;
+        seed_cause(&db, mid, "cursor-test", ts).await;
+    }
+
+    let get_json = |uri: String, tick: i64| {
+        let (app, key) = (app.clone(), master_key.clone());
+        async move {
+            let req = signed_later(
+                inject_connect_info(Request::builder().uri(&uri).header("X-API-Key", &key)),
+                tick,
+                "",
+            );
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            (status, serde_json::from_slice::<serde_json::Value>(&bytes).unwrap())
+        }
+    };
+
+    // Baseline: fetch all 6 in one unpaginated call across both groups.
+    let (status, full) = get_json(
+        "/api/ips?groups=cursor-group-a,cursor-group-b&limit=100".to_owned(),
+        1,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let expected_ids: Vec<String> = full
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(expected_ids.len(), 6);
+
+    // Multi-group cursor walk with limit=2 (exact divisor of 6 -> must take exactly 3 pages).
+    let mut collected_ids = Vec::new();
+    let mut cursor = String::new();
+    let mut pages = 0usize;
+    loop {
+        pages += 1;
+        let uri = format!(
+            "/api/ips?groups=cursor-group-a,cursor-group-b&limit=2&cursor={cursor}"
+        );
+        let (status, env) = get_json(uri, 10 + pages as i64).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            env.get("total").is_none(),
+            "cursor mode without include_total must omit COUNT(*) metadata: {env}"
+        );
+        let data = env["data"].as_array().expect("cursor envelope must carry data[]");
+        for item in data {
+            collected_ids.push(item["id"].as_str().unwrap().to_owned());
+        }
+        match env["next_cursor"].as_str() {
+            Some(next) => cursor = next.to_owned(),
+            None => break,
+        }
+        assert!(pages <= 10, "cursor loop did not terminate");
+    }
+    assert_eq!(
+        pages, 3,
+        "6 items at limit=2 must finish in 3 pages via limit+1 lookahead, not 4"
+    );
+    assert_eq!(
+        collected_ids, expected_ids,
+        "multi-group cursor walk must visit every record in exact (last_seen_at DESC, id ASC) order"
+    );
+
+    // Single-group cursor walk with include_total=true must populate the full envelope + next_cursor.
+    let (status, env) = get_json(
+        "/api/ips?groups=cursor-group-a&limit=2&cursor=&include_total=true".to_owned(),
+        30,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(env["total"], 3);
+    assert_eq!(env["limit"], 2);
+    assert_eq!(env["offset"], 0);
+    assert_eq!(env["total_pages"], 2);
+    let next_cur = env["next_cursor"].as_str().expect("first page of 3 items at limit=2 has next_cursor");
+
+    let (status, env2) = get_json(
+        format!("/api/ips?groups=cursor-group-a&limit=2&cursor={next_cur}&include_total=true"),
+        31,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(env2["data"].as_array().unwrap().len(), 1);
+    assert_eq!(env2["total_pages"], 2);
+    assert!(env2["next_cursor"].is_null(), "last page must have next_cursor = null");
+}
+
+/// Cursor pagination works with differential sync (`since` + `include_deleted=true`) and
+/// `format=minimal` / `mode=minimal` (returning only `target_address`, `last_seen_at`, `is_deleted`).
+#[tokio::test]
+async fn test_cursor_pagination_with_differential_sync_and_minimal_format() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let group_id = insert_group_row(&db, "diff-minimal-group").await;
+
+    let t_old = chrono::Utc::now().naive_utc() - chrono::Duration::hours(3);
+    let t_recent = chrono::Utc::now().naive_utc() - chrono::Duration::minutes(30);
+    let cutoff = (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp();
+
+    // 1. Untouched old live record -> excluded by `since`.
+    let r_old = seed_ip_record(&db, "198.51.100.20", t_old).await;
+    seed_membership(&db, r_old, group_id, SeededMembership::live_at(t_old)).await;
+
+    // 2. Old live record deleted recently -> included as tombstone (`is_deleted: true`).
+    let r_del = seed_ip_record(&db, "198.51.100.21", t_old).await;
+    seed_membership(
+        &db,
+        r_del,
+        group_id,
+        SeededMembership {
+            is_deleted: true,
+            deleted_at: Some(t_recent),
+            ..SeededMembership::live_at(t_old)
+        },
+    )
+    .await;
+
+    // 3. Recently seen live record -> included (`is_deleted: false`).
+    let r_live = seed_ip_record(&db, "198.51.100.22", t_recent).await;
+    seed_membership(&db, r_live, group_id, SeededMembership::live_at(t_recent)).await;
+
+    let get_json = |uri: String, tick: i64| {
+        let (app, key) = (app.clone(), master_key.clone());
+        async move {
+            let req = signed_later(
+                inject_connect_info(Request::builder().uri(&uri).header("X-API-Key", &key)),
+                tick,
+                "",
+            );
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            (status, serde_json::from_slice::<serde_json::Value>(&bytes).unwrap())
+        }
+    };
+
+    // Walk with limit=1, cursor, since, include_deleted=true, and format=minimal.
+    let (status, page1) = get_json(
+        format!(
+            "/api/ips?groups=diff-minimal-group&since={cutoff}&include_deleted=true&format=minimal&limit=1&cursor="
+        ),
+        1,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let d1 = page1["data"].as_array().unwrap();
+    assert_eq!(d1.len(), 1);
+    assert_eq!(d1[0]["target_address"], "198.51.100.22");
+    assert_eq!(d1[0]["is_deleted"], false);
+    // Verify minimal projection: only the 3 fields exist on the object.
+    assert_eq!(
+        d1[0].as_object().unwrap().len(),
+        3,
+        "format=minimal must serialize only target_address, last_seen_at, is_deleted: {:?}",
+        d1[0]
+    );
+    let cur1 = page1["next_cursor"].as_str().expect("second item awaits");
+
+    let (status, page2) = get_json(
+        format!(
+            "/api/ips?groups=diff-minimal-group&since={cutoff}&include_deleted=true&mode=minimal&limit=1&cursor={cur1}"
+        ),
+        2,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let d2 = page2["data"].as_array().unwrap();
+    assert_eq!(d2.len(), 1);
+    assert_eq!(d2[0]["target_address"], "198.51.100.21");
+    assert_eq!(d2[0]["is_deleted"], true);
+    assert_eq!(d2[0].as_object().unwrap().len(), 3);
+    assert!(page2["next_cursor"].is_null(), "only 2 records matched `since`");
+}
+
+/// Rejects malformed cursors and incompatible parameter combinations with `400 Bad Request`,
+/// and enforces RBAC read-scoping in cursor mode.
+#[tokio::test]
+async fn test_cursor_pagination_validation_and_rbac_scoping() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (scoped_id, scoped_key) = insert_key(&db, "Scoped", false, false, false, false).await;
+    let (_empty_id, empty_key) = insert_key(&db, "Zero", false, false, false, false).await;
+
+    let group_a = insert_group_row(&db, "rbac-cur-a").await;
+    let group_b = insert_group_row(&db, "rbac-cur-b").await;
+    grant_perm(&db, scoped_id, group_a, true, false, false, false).await;
+
+    let now = chrono::Utc::now().naive_utc();
+    let ra = seed_ip_record(&db, "198.51.100.30", now).await;
+    seed_membership(&db, ra, group_a, SeededMembership::live_at(now)).await;
+    let rb = seed_ip_record(&db, "198.51.100.31", now).await;
+    seed_membership(&db, rb, group_b, SeededMembership::live_at(now)).await;
+
+    let status_for = |uri: &str, key: &str, tick: i64| {
+        let (app, uri, key) = (app.clone(), uri.to_owned(), key.to_owned());
+        async move {
+            let req = signed_later(
+                inject_connect_info(Request::builder().uri(&uri).header("X-API-Key", &key)),
+                tick,
+                "",
+            );
+            app.oneshot(req).await.unwrap().status()
+        }
+    };
+
+    // Incompatible combinations and malformed cursors must all yield 400 Bad Request.
+    for (idx, bad_uri) in [
+        "/api/ips?cursor=&offset=10",
+        "/api/ips?cursor=&format=iplist",
+        "/api/ips?cursor=xyz",
+        "/api/ips?cursor=zzzz",
+        "/api/ips?cursor=6e6f742d612d637572736f72", // "not-a-cursor" (no '|')
+        "/api/ips?cursor=6261642d74737c30303030303030302d303030302d303030302d303030302d303030303030303030303030", // bad timestamp
+        "/api/ips?cursor=323032362d30362d30312031323a30303a30307c6e6f742d612d75756964", // valid ts, bad UUID
+        "/api/ips?unknown_param=1", // deny_unknown_fields
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(
+            status_for(bad_uri, &master_key, 1 + idx as i64).await,
+            StatusCode::BAD_REQUEST,
+            "expected 400 Bad Request for {bad_uri}"
+        );
+    }
+
+    // Zero-permission key in cursor mode receives 200 OK with `{ data: [], next_cursor: null }`.
+    let req = signed_later(
+        inject_connect_info(
+            Request::builder()
+                .uri("/api/ips?cursor=&format=minimal")
+                .header("X-API-Key", &empty_key),
+        ),
+        20,
+        "",
+    );
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let zero_env: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(zero_env["data"], json!([]));
+    assert!(zero_env["next_cursor"].is_null());
+
+    // Scoped key sees only Group A's record in cursor mode.
+    let req = signed_later(
+        inject_connect_info(
+            Request::builder()
+                .uri("/api/ips?cursor=&format=minimal")
+                .header("X-API-Key", &scoped_key),
+        ),
+        21,
+        "",
+    );
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let scoped_env: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let arr = scoped_env["data"].as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["target_address"], "198.51.100.30");
+    assert!(scoped_env["next_cursor"].is_null());
+}
+

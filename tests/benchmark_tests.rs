@@ -316,3 +316,84 @@ async fn multi_group_db_queries_meet_the_10ms_budget_at_100k_rows() {
     assert!(page < BUDGET, "multi-group DB page reads took {page:?}, budget is {BUDGET:?}");
     assert!(count < BUDGET, "multi-group DB count reads took {count:?}, budget is {BUDGET:?}");
 }
+
+#[tokio::test]
+async fn keyset_cursor_plan_uses_covering_index_with_no_temp_b_tree_and_stays_fast_at_depth() {
+    let _guard = bench_lock().lock().await;
+    let db = fresh_db().await;
+    let plan = explain(
+        &db,
+        "SELECT m.id, r.target_address FROM ip_record_group_memberships m
+         INNER JOIN ip_records r ON r.id = m.ip_record_id
+         WHERE m.group_id = x'00000000000000000000000000000001'
+           AND m.is_deleted = FALSE
+           AND m.last_seen_at <= '2026-01-01 00:00:00'
+           AND (m.last_seen_at < '2026-01-01 00:00:00'
+                OR (m.last_seen_at = '2026-01-01 00:00:00' AND m.id > x'00000000000000000000000000000001'))
+         ORDER BY m.last_seen_at DESC, m.id ASC
+         LIMIT 50",
+    )
+    .await;
+    println!("cursor plan: {plan}");
+    assert!(
+        !plan.contains("TEMP B-TREE"),
+        "cursor query must not sort through a temp b-tree: {plan}"
+    );
+    assert!(
+        plan.contains("USING COVERING INDEX idx_memberships_active_last_seen"),
+        "cursor query must use the covering partial index: {plan}"
+    );
+    assert!(
+        plan.contains("last_seen_at<?"),
+        "cursor query must seek on last_seen_at in the index rather than scanning from the top of the group: {plan}"
+    );
+
+    // Measure a deep cursor seek (near the tail of a 10k-row group) vs top-of-group: keyset seek
+    // cost must remain under the same 10 ms budget regardless of depth.
+    let g = bench_group_id(1);
+    let tail_boundary = ip_record_group_membership::Entity::find()
+        .filter(ip_record_group_membership::Column::GroupId.eq(g))
+        .filter(ip_record_group_membership::Column::IsDeleted.eq(false))
+        .order_by_asc(ip_record_group_membership::Column::LastSeenAt)
+        .order_by_asc(ip_record_group_membership::Column::Id)
+        .offset(100)
+        .limit(1)
+        .one(&db)
+        .await
+        .unwrap()
+        .expect("seeded group has >100 live rows");
+
+    let cur_ts = tail_boundary.last_seen_at;
+    let cur_id = tail_boundary.id;
+    let deep_seek = median(|| async {
+        ip_record_group_membership::Entity::find()
+            .join(JoinType::InnerJoin, ip_record_group_membership::Relation::IpRecord.def())
+            .select_also(ip_record::Entity)
+            .filter(ip_record_group_membership::Column::GroupId.eq(g))
+            .filter(ip_record_group_membership::Column::IsDeleted.eq(false))
+            .filter(ip_record_group_membership::Column::LastSeenAt.lte(cur_ts))
+            .filter(
+                sea_orm::Condition::any()
+                    .add(ip_record_group_membership::Column::LastSeenAt.lt(cur_ts))
+                    .add(
+                        sea_orm::Condition::all()
+                            .add(ip_record_group_membership::Column::LastSeenAt.eq(cur_ts))
+                            .add(ip_record_group_membership::Column::Id.gt(cur_id)),
+                    ),
+            )
+            .order_by_desc(ip_record_group_membership::Column::LastSeenAt)
+            .order_by_asc(ip_record_group_membership::Column::Id)
+            .limit(50)
+            .all(&db)
+            .await
+            .unwrap()
+            .len()
+    })
+    .await;
+    println!("100k rows: deep cursor seek (near tail of group) median = {deep_seek:?}");
+    assert!(
+        deep_seek < BUDGET,
+        "deep keyset cursor seek took {deep_seek:?}, budget is {BUDGET:?}"
+    );
+}
+

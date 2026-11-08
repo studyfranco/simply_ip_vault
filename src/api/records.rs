@@ -363,16 +363,23 @@ pub struct QueryFilters {
     pub since: Option<i64>,
     /// Pagination limit.
     pub limit: Option<u64>,
-    /// Pagination offset.
+    /// Pagination offset. Mutually exclusive with `cursor`.
     pub offset: Option<u64>,
-    /// `"iplist"` (accepted under either key) returns `{"ip_list": [...]}` of matched addresses.
+    /// Keyset pagination cursor. Pass an empty string (`cursor=`) for the first page, or the
+    /// `next_cursor` returned by the previous page. Mutually exclusive with `offset` and
+    /// `format=iplist`. Wraps the response in `{data, next_cursor}`.
+    pub cursor: Option<String>,
+    /// `"iplist"` (accepted under either key) returns `{"ip_list": [...]}` of matched addresses;
+    /// `"minimal"` returns only `(target_address, last_seen_at, is_deleted)` per row, skipping the
+    /// group and cause resolution queries.
     pub format: Option<String>,
     /// Synonym for `format`.
     pub mode: Option<String>,
     /// Also return soft-deleted memberships. Available to any caller, scoped exactly as live ones.
     pub include_deleted: Option<bool>,
-    /// Wrap the response in `{data, total, limit, offset, total_pages}`. Opt-in; the bare array is
-    /// the default. Ignored under `format=iplist`.
+    /// Wrap the response in `{data, total, limit, offset, total_pages, next_cursor}`. Opt-in; the
+    /// bare array is the default when neither `include_total` nor `cursor` is passed. Ignored under
+    /// `format=iplist`.
     pub include_total: Option<bool>,
 }
 
@@ -407,11 +414,26 @@ pub struct IpRecordResponse {
     pub deleted_by: Option<String>,
 }
 
+/// Stripped membership row returned under `format=minimal` / `mode=minimal`.
+///
+/// Carries only the three fields a downstream feed exporter consumes (`target_address`,
+/// `last_seen_at`, `is_deleted`), allowing [`list_ips`] to skip the per-page `ip_groups` and
+/// `ip_record_causes` lookup queries entirely.
+#[derive(Serialize)]
+pub struct MinimalIpRecordResponse {
+    /// The address or CIDR range.
+    pub target_address: String,
+    /// The latest observation of this address in this group.
+    pub last_seen_at: chrono::NaiveDateTime,
+    /// Whether this membership is soft-deleted.
+    pub is_deleted: bool,
+}
+
 /// Response envelope for `GET /api/ips?include_total=true`.
 #[derive(Serialize)]
-pub struct IpRecordsEnvelope {
+pub struct IpRecordsEnvelope<T = IpRecordResponse> {
     /// The page of memberships.
-    pub data: Vec<IpRecordResponse>,
+    pub data: Vec<T>,
     /// Total memberships matching every filter, across all pages.
     pub total: u64,
     /// The effective `limit`.
@@ -420,15 +442,108 @@ pub struct IpRecordsEnvelope {
     pub offset: u64,
     /// `ceil(total / limit)`, or `0` when there is nothing to page through.
     pub total_pages: u64,
+    /// Opaque keyset cursor for the next page, or `None` when this page reached the end.
+    pub next_cursor: Option<String>,
+}
+
+/// Response envelope for `GET /api/ips?cursor=…` when `include_total` is not requested.
+///
+/// Omits `total` / `total_pages` so cursor pagination never pays for a `COUNT(*)` query; the end of
+/// the walk is signalled by `next_cursor: None`.
+#[derive(Serialize)]
+pub struct IpRecordsCursorEnvelope<T = IpRecordResponse> {
+    /// The page of memberships.
+    pub data: Vec<T>,
+    /// Opaque keyset cursor for the next page, or `None` when this page reached the end.
+    pub next_cursor: Option<String>,
+}
+
+/// Decoded keyset cursor: the `(last_seen_at, membership_id)` boundary of the previous page's last
+/// row, matching `ORDER BY last_seen_at DESC, id ASC`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KeysetCursor {
+    last_seen_at: chrono::NaiveDateTime,
+    id: Uuid,
+}
+
+impl KeysetCursor {
+    /// Encodes a row's sort key into an opaque hex token (`hex("<last_seen_at>|<id>")`).
+    ///
+    /// Hex is URL-safe without percent-encoding (`0-9a-f` only) and already in the dependency tree.
+    fn encode(last_seen_at: chrono::NaiveDateTime, id: Uuid) -> String {
+        let raw = format!("{}|{id}", last_seen_at.format("%Y-%m-%dT%H:%M:%S%.f"));
+        hex::encode(raw.as_bytes())
+    }
+
+    /// Parses an opaque cursor token. Rejects malformed hex, missing delimiters, or invalid
+    /// timestamps/UUIDs with `400 Bad Request`.
+    fn decode(encoded: &str) -> Result<Self, AppError> {
+        let bytes = hex::decode(encoded.trim())
+            .map_err(|_| AppError::InvalidInput("Invalid cursor: malformed encoding".to_owned()))?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| AppError::InvalidInput("Invalid cursor: non-UTF-8 payload".to_owned()))?;
+        let (ts_str, id_str) = text
+            .split_once('|')
+            .ok_or_else(|| AppError::InvalidInput("Invalid cursor: missing delimiter".to_owned()))?;
+        let last_seen_at = chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%dT%H:%M:%S%.f")
+            .or_else(|_| chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S%.f"))
+            .map_err(|_| AppError::InvalidInput("Invalid cursor: bad timestamp".to_owned()))?;
+        let id = Uuid::parse_str(id_str)
+            .map_err(|_| AppError::InvalidInput("Invalid cursor: bad membership id".to_owned()))?;
+        Ok(Self { last_seen_at, id })
+    }
+
+    /// Keyset seek predicate for `ORDER BY last_seen_at DESC, id ASC`:
+    /// `last_seen_at <= :cur_ts AND (last_seen_at < :cur_ts OR (last_seen_at = :cur_ts AND id > :cur_id))`.
+    ///
+    /// The leading `last_seen_at <= :cur_ts` conjunct is algebraically redundant with the `OR`
+    /// clause beside it, and load-bearing for SQLite's query planner: SQLite does not extract a
+    /// range bound on `last_seen_at` out of a disjunction, so without the top-level `<=` term it
+    /// scans the `group_id = ?` index partition from the newest row down (`O(offset)`). With it,
+    /// the B-tree seek jumps straight to `(group_id = ?, last_seen_at <= :cur_ts)`.
+    fn condition(self) -> Condition {
+        Condition::all()
+            .add(ip_record_group_membership::Column::LastSeenAt.lte(self.last_seen_at))
+            .add(
+                Condition::any()
+                    .add(ip_record_group_membership::Column::LastSeenAt.lt(self.last_seen_at))
+                    .add(
+                        Condition::all()
+                            .add(ip_record_group_membership::Column::LastSeenAt.eq(self.last_seen_at))
+                            .add(ip_record_group_membership::Column::Id.gt(self.id)),
+                    ),
+            )
+    }
 }
 
 /// The empty-result shape for [`list_ips`] in whichever response form the caller asked for.
-fn empty_ips_response(format_iplist: bool, include_total: bool, limit: u64, offset: u64) -> axum::response::Response {
+fn empty_ips_response(
+    format_iplist: bool,
+    include_total: bool,
+    cursor_mode: bool,
+    limit: u64,
+    offset: u64,
+) -> axum::response::Response {
     if format_iplist {
         return Json(serde_json::json!({ "ip_list": Vec::<String>::new() })).into_response();
     }
     if include_total {
-        return Json(IpRecordsEnvelope { data: Vec::new(), total: 0, limit, offset, total_pages: 0 }).into_response();
+        return Json(IpRecordsEnvelope::<IpRecordResponse> {
+            data: Vec::new(),
+            total: 0,
+            limit,
+            offset,
+            total_pages: 0,
+            next_cursor: None,
+        })
+        .into_response();
+    }
+    if cursor_mode {
+        return Json(IpRecordsCursorEnvelope::<IpRecordResponse> {
+            data: Vec::new(),
+            next_cursor: None,
+        })
+        .into_response();
     }
     Json(Vec::<IpRecordResponse>::new()).into_response()
 }
@@ -488,14 +603,14 @@ async fn count_matching(
 /// Fetches one page across a small, explicit set of groups without an SQL `ORDER BY` that spans
 /// them.
 ///
-/// The partial index `idx_memberships_active_last_seen` is `(group_id, last_seen_at DESC) WHERE
-/// is_deleted = FALSE` — it sorts *within* one `group_id`, not across several. A `GroupId IN
-/// (...)` with `ORDER BY last_seen_at` therefore cannot be served from it directly; SQLite scans
+/// The partial index `idx_memberships_active_last_seen` is `(group_id, last_seen_at DESC, id ASC,
+/// …) WHERE is_deleted = FALSE` — it sorts *within* one `group_id`, not across several. A `GroupId
+/// IN (...)` with `ORDER BY last_seen_at` therefore cannot be served from it directly; SQLite scans
 /// the matching rows and sorts them in a temp b-tree instead, which is what turns a page read into
 /// a full scan as a group grows. Querying each group individually keeps every query on the
-/// indexed, pre-sorted path: no sort, and no more than `offset + limit` rows read per group. The
-/// (small, bounded) merge happens in Rust instead, which is cheap exactly because each input is
-/// already sorted and the inputs are few.
+/// indexed, pre-sorted path: no sort, and no more than `offset + limit` rows read per group (just
+/// `limit` in cursor mode, where `offset` is `0`). The merge happens in Rust instead, which is
+/// cheap because each input is already sorted and the inputs are few.
 async fn fetch_merged_page(
     db: &sea_orm::DatabaseConnection,
     condition: &Condition,
@@ -512,12 +627,13 @@ async fn fetch_merged_page(
             .select_also(ip_record::Entity)
             .filter(scoped)
             .order_by_desc(ip_record_group_membership::Column::LastSeenAt)
+            .order_by_asc(ip_record_group_membership::Column::Id)
             .limit(take)
             .all(db)
             .await?;
         merged.extend(rows);
     }
-    merged.sort_by_key(|(m, _)| std::cmp::Reverse(m.last_seen_at));
+    merged.sort_by_key(|(m, _)| (std::cmp::Reverse(m.last_seen_at), m.id));
     Ok(merged.into_iter().skip(offset as usize).take(limit as usize).collect())
 }
 
@@ -530,9 +646,27 @@ pub async fn list_ips(
     let include_deleted = filters.include_deleted.unwrap_or(false);
     let format_iplist = matches!(filters.format.as_deref(), Some("iplist"))
         || matches!(filters.mode.as_deref(), Some("iplist"));
+    let format_minimal = matches!(filters.format.as_deref(), Some("minimal"))
+        || matches!(filters.mode.as_deref(), Some("minimal"));
     let include_total = filters.include_total.unwrap_or(false) && !format_iplist;
     let limit = filters.limit.unwrap_or(50);
     let offset = filters.offset.unwrap_or(0);
+
+    if filters.cursor.is_some() && filters.offset.is_some() {
+        return Err(AppError::InvalidInput(
+            "`cursor` and `offset` are mutually exclusive".to_owned(),
+        ));
+    }
+    if filters.cursor.is_some() && format_iplist {
+        return Err(AppError::InvalidInput(
+            "`cursor` cannot be combined with `format=iplist`".to_owned(),
+        ));
+    }
+    let cursor_mode = filters.cursor.is_some();
+    let parsed_cursor = match filters.cursor.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(token) => Some(KeysetCursor::decode(token)?),
+    };
 
     let mut condition = Condition::all();
     if !include_deleted {
@@ -556,7 +690,7 @@ pub async fn list_ips(
             .map(|p| p.group_id)
             .collect();
         if accessible_groups.is_empty() {
-            return Ok(empty_ips_response(format_iplist, include_total, limit, offset));
+            return Ok(empty_ips_response(format_iplist, include_total, cursor_mode, limit, offset));
         }
         group_constraints.push(accessible_groups);
     }
@@ -617,18 +751,22 @@ pub async fn list_ips(
     // `fetch_merged_page`'s doc comment for why: SQLite's partial index sorts within one group_id,
     // not across several, so `IN (...)` with `ORDER BY last_seen_at` falls back to a full sort —
     // confirmed against this schema as the cause of the reported 56–91s multi-group query.
+    // In cursor mode `offset` is always 0, so each group reads only `limit` rows after the cursor
+    // and the `MERGE_MAX_FETCH` offset ceiling does not apply.
     let mut merge_group_ids: Option<Vec<Uuid>> = None;
-    if !group_constraints.is_empty() {
-        let mut intersected = group_constraints.pop().expect("just checked non-empty");
+    if let Some(mut intersected) = group_constraints.pop() {
         for set in &group_constraints {
             intersected.retain(|g| set.contains(g));
         }
         if intersected.is_empty() {
-            return Ok(empty_ips_response(format_iplist, include_total, limit, offset));
+            return Ok(empty_ips_response(format_iplist, include_total, cursor_mode, limit, offset));
         }
-        if intersected.len() > 1
-            && intersected.len() <= MERGE_MAX_GROUPS
-            && offset.saturating_add(limit) <= MERGE_MAX_FETCH
+        if intersected.len() == 1 {
+            if let Some(only_id) = intersected.into_iter().next() {
+                condition = condition.add(ip_record_group_membership::Column::GroupId.eq(only_id));
+            }
+        } else if intersected.len() <= MERGE_MAX_GROUPS
+            && (cursor_mode || offset.saturating_add(limit) <= MERGE_MAX_FETCH)
         {
             merge_group_ids = Some(intersected.into_iter().collect());
         } else {
@@ -686,19 +824,48 @@ pub async fn list_ips(
         None
     };
 
-    let page = match &merge_group_ids {
-        Some(ids) => fetch_merged_page(&state.db, &condition, ids, offset, limit).await?,
-        None => {
-            ip_record_group_membership::Entity::find()
-                .join(JoinType::InnerJoin, ip_record_group_membership::Relation::IpRecord.def())
-                .select_also(ip_record::Entity)
-                .filter(condition)
-                .order_by_desc(ip_record_group_membership::Column::LastSeenAt)
-                .limit(limit)
-                .offset(offset)
-                .all(&state.db)
-                .await?
+    let mut page_condition = condition;
+    if let Some(cursor) = parsed_cursor {
+        page_condition = page_condition.add(cursor.condition());
+    }
+
+    // When `next_cursor` is needed, fetch `limit + 1` rows so an exact-multiple final page can
+    // report `next_cursor: None` immediately without an extra empty round trip.
+    let needs_next_cursor = (cursor_mode || include_total) && limit > 0;
+    let fetch_limit = if needs_next_cursor {
+        limit.saturating_add(1)
+    } else {
+        limit
+    };
+
+    let mut page = if limit == 0 {
+        Vec::new()
+    } else {
+        match &merge_group_ids {
+            Some(ids) => fetch_merged_page(&state.db, &page_condition, ids, offset, fetch_limit).await?,
+            None => {
+                ip_record_group_membership::Entity::find()
+                    .join(JoinType::InnerJoin, ip_record_group_membership::Relation::IpRecord.def())
+                    .select_also(ip_record::Entity)
+                    .filter(page_condition)
+                    .order_by_desc(ip_record_group_membership::Column::LastSeenAt)
+                    .order_by_asc(ip_record_group_membership::Column::Id)
+                    .limit(fetch_limit)
+                    .offset(offset)
+                    .all(&state.db)
+                    .await?
+            }
         }
+    };
+
+    let has_more = needs_next_cursor && (page.len() as u64) > limit;
+    if has_more {
+        page.truncate(limit as usize);
+    }
+    let next_cursor = if has_more {
+        page.last().map(|(m, _)| KeysetCursor::encode(m.last_seen_at, m.id))
+    } else {
+        None
     };
 
     if format_iplist {
@@ -709,6 +876,40 @@ pub async fn list_ips(
         ip_list.sort();
         ip_list.dedup();
         return Ok(Json(serde_json::json!({ "ip_list": ip_list })).into_response());
+    }
+
+    if format_minimal {
+        let items: Vec<MinimalIpRecordResponse> = page
+            .into_iter()
+            .filter_map(|(mem, record)| {
+                let record = record?;
+                Some(MinimalIpRecordResponse {
+                    target_address: record.target_address,
+                    last_seen_at: mem.last_seen_at,
+                    is_deleted: mem.is_deleted,
+                })
+            })
+            .collect();
+        if let Some(total) = total {
+            let total_pages = if limit == 0 { 0 } else { total.div_ceil(limit) };
+            return Ok(Json(IpRecordsEnvelope {
+                data: items,
+                total,
+                limit,
+                offset,
+                total_pages,
+                next_cursor,
+            })
+            .into_response());
+        }
+        if cursor_mode {
+            return Ok(Json(IpRecordsCursorEnvelope {
+                data: items,
+                next_cursor,
+            })
+            .into_response());
+        }
+        return Ok(Json(items).into_response());
     }
 
     // Resolve group names and the latest cause for the whole page in two queries, not one per row.
@@ -760,7 +961,22 @@ pub async fn list_ips(
 
     if let Some(total) = total {
         let total_pages = if limit == 0 { 0 } else { total.div_ceil(limit) };
-        return Ok(Json(IpRecordsEnvelope { data: items, total, limit, offset, total_pages }).into_response());
+        return Ok(Json(IpRecordsEnvelope {
+            data: items,
+            total,
+            limit,
+            offset,
+            total_pages,
+            next_cursor,
+        })
+        .into_response());
+    }
+    if cursor_mode {
+        return Ok(Json(IpRecordsCursorEnvelope {
+            data: items,
+            next_cursor,
+        })
+        .into_response());
     }
     Ok(Json(items).into_response())
 }

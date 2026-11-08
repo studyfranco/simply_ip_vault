@@ -4659,6 +4659,44 @@ api_call GET "/api/ips?groups=$GROUP_MB" "$MASTER_KEY"
 check_true "[.[] | select(.target_address == \"$ADDR_M\")] | length == 1" \
     "#35 the address survives a hard delete while another group still holds it"
 
+# ── 36. Keyset (cursor) pagination and minimal format on GET /api/ips ─────────────────────────
+
+log_section "36. Keyset (Cursor) Pagination & Minimal Format (GET /api/ips)"
+
+CUR_GA="cursor-e2e-a"
+CUR_GB="cursor-e2e-b"
+api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"198.51.100.241\",\"group_name\":\"$CUR_GA\",\"cause\":\"c1\"}"
+check "200" "#36 seed 198.51.100.241 in $CUR_GA"
+api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"198.51.100.242\",\"group_name\":\"$CUR_GB\",\"cause\":\"c2\"}"
+check "200" "#36 seed 198.51.100.242 in $CUR_GB"
+api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"198.51.100.243\",\"group_name\":\"$CUR_GA\",\"cause\":\"c3\"}"
+check "200" "#36 seed 198.51.100.243 in $CUR_GA"
+api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"198.51.100.244\",\"group_name\":\"$CUR_GB\",\"cause\":\"c4\"}"
+check "200" "#36 seed 198.51.100.244 in $CUR_GB"
+
+# First page (cursor= empty, limit=2, format=minimal across two groups).
+api_call GET "/api/ips?groups=$CUR_GA,$CUR_GB&limit=2&cursor=&format=minimal" "$MASTER_KEY"
+check "200" "#36 first cursor page with format=minimal"
+check_true '(.data | length == 2) and (.next_cursor != null) and (has("total") | not)' \
+    "#36 first cursor page returns 2 items, non-null next_cursor, and omits total"
+check_true '(.data[0] | keys | sort) == ["is_deleted", "last_seen_at", "target_address"]' \
+    "#36 format=minimal projects only target_address, last_seen_at, is_deleted"
+NEXT_CUR_1=$(echo "$RESP_BODY" | jq -r '.next_cursor')
+
+# Second (final) page of 4 items at limit=2 -> limit+1 lookahead detects end immediately.
+api_call GET "/api/ips?groups=$CUR_GA,$CUR_GB&limit=2&cursor=$NEXT_CUR_1&mode=minimal" "$MASTER_KEY"
+check "200" "#36 second cursor page with mode=minimal"
+check_true '(.data | length == 2) and (.next_cursor == null)' \
+    "#36 exact-multiple final page sets next_cursor to null without needing an extra empty request"
+
+# Validation errors (400 Bad Request).
+api_call GET "/api/ips?cursor=&offset=5" "$MASTER_KEY"
+check "400" "#36 cursor combined with offset is rejected with 400"
+api_call GET "/api/ips?cursor=&format=iplist" "$MASTER_KEY"
+check "400" "#36 cursor combined with format=iplist is rejected with 400"
+api_call GET "/api/ips?cursor=invalid-hex" "$MASTER_KEY"
+check "400" "#36 malformed cursor is rejected with 400"
+
 log_section "Summary"
 echo -e "$(ts) ${GREEN}Passed: $PASS_COUNT${RESET}   ${RED}Failed: $FAIL_COUNT${RESET}" >&2
 

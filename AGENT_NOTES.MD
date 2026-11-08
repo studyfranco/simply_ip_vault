@@ -10063,3 +10063,40 @@ pin fix is.
 - Retention purges memberships first, then address rows that no group holds.
 - Pragmas and maintenance are described in `SCHEMA.MD` ("Current model").
 
+## Addendum: Keyset (`cursor`) pagination and `format=minimal` on `GET /api/ips`
+
+- **Peer pull check (`AGENT.MD` mandatory rule):**
+  - `git -C example/simply_ip_exporter pull` → `Already up to date.` (`f3f1580`)
+  - `git -C example/simply_ip_sync pull` → `Already up to date.` (`37dc80b`)
+- **Problem reported by `simply_ip_exporter` (against `simply_ip_vault` `be355b2`):**
+  1. Multi-group queries (`groups=Seedbox_Ban,MainServ_Ban,external_banlist,abuseipdb`) fell out of
+     `fetch_merged_page` once `offset + limit > MERGE_MAX_FETCH (2000)`, hitting `WHERE group_id IN (...)
+     ORDER BY last_seen_at DESC` which sorts all ~7M rows in a temporary B-tree on every page.
+  2. Even per-group, `OFFSET n` scans and discards `n` index entries + `ip_records` joins per page
+     (`O(N^2 / limit)` across a full sync), and `ORDER BY last_seen_at DESC` had no tie-breaker when
+     multiple memberships share a timestamp.
+- **Solution implemented (`src/api/records.rs`):**
+  - Added deterministic tie-breaker `ORDER BY m.last_seen_at DESC, m.id ASC` to both the single-group
+    query and `fetch_merged_page`, matching the column order of `idx_memberships_active_last_seen`
+    (`(group_id, last_seen_at DESC, id, ip_record_id, is_locked, created_at)`). Because SeaORM stores
+    `Uuid` as a 16-byte big-endian `BLOB` in SQLite, SQLite's `BLOB` `memcmp`, PostgreSQL's `uuid`
+    comparison, and Rust's `Uuid::cmp` in `fetch_merged_page` all sort in identical order.
+  - Added opt-in `cursor: Option<String>` to `QueryFilters` (`#[serde(deny_unknown_fields)]`):
+    - `cursor=` (empty string) requests the first page; `cursor=<hex>` seeks past `(last_seen_at, id)`.
+    - Returns `IpRecordsCursorEnvelope { data, next_cursor }` when `include_total` is false (skipping
+      `COUNT(*)`), or `IpRecordsEnvelope` (now also carrying `next_cursor`) when `include_total=true`.
+    - Uses `limit + 1` lookahead so `next_cursor` is `None` immediately on the final page even when
+      total matching rows is an exact multiple of `limit`.
+    - **Planner-friendly keyset predicate:** SQLite's query planner does not extract a range bound on
+      `last_seen_at` from the bare disjunction `(last_seen_at < :ts OR (last_seen_at = :ts AND id > :id))`
+      alone. Prepending the redundant top-level conjunct `last_seen_at <= :ts` produces
+      `SEARCH m USING COVERING INDEX idx_memberships_active_last_seen (group_id=? AND last_seen_at<?)`
+      with zero temporary B-tree and `O(limit)` cost at arbitrary depth (~1.6 ms at 100k rows, verified
+      in `tests/benchmark_tests.rs::keyset_cursor_plan_uses_covering_index_with_no_temp_b_tree_and_stays_fast_at_depth`).
+    - In `cursor_mode`, `offset` is 0, so `fetch_merged_page` reads only `limit + 1` rows per group
+      after the cursor and bypasses the `MERGE_MAX_FETCH` ceiling for multi-group queries (`<= 16` groups).
+    - Single-group intersections now emit `Column::GroupId.eq(only_id)` instead of a 1-element `IN (?)`.
+  - Added `format=minimal` / `mode=minimal` (`MinimalIpRecordResponse { target_address, last_seen_at, is_deleted }`),
+    skipping the `ip_groups` and `ip_record_causes` queries when projecting a page.
+
+

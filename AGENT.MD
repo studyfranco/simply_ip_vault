@@ -240,7 +240,9 @@ directly — do it yourself in that case.
   - Parameter `ip=<substring>`: Filters by a substring of `target_address`.
   - Parameter `cause=<substring>`: Filters by a substring of `cause`.
   - Parameter `status=ban|white`: Filters to only the group type (`banlist`/`whitelist`) matching the associated IP group.
-  - Each result row includes the associated `group_type`, so a single address in both a `banlist` and a `whitelist` group is distinguishable per-row (used by the dashboard's conflict-highlighting badge).
+  - Parameter `cursor=<opaque>` (or `cursor=` for the first page): Opt-in keyset pagination ordered by `(last_seen_at DESC, id ASC)`. Returns `{ "data": [...], "next_cursor": "..." | null }`, seeking directly into `idx_memberships_active_last_seen` without an `OFFSET` scan or temporary B-tree sort, and bypassing `MERGE_MAX_FETCH` on multi-group queries.
+  - Parameter `format=minimal` (or `mode=minimal`): Projects each item to `{ "target_address", "last_seen_at", "is_deleted" }`, skipping the `ip_groups` and `ip_record_causes` lookup queries.
+  - Each full result row includes the associated `group_type`, so a single address in both a `banlist` and a `whitelist` group is distinguishable per-row (used by the dashboard's conflict-highlighting badge).
 
 ### 4. Advanced & Secure Webhooks
 
