@@ -18,7 +18,7 @@ RUN set -x \
 RUN cargo build --release
 
 # Runtime stage
-ARG BASE_IMAGE=debian:testing-slim
+ARG BASE_IMAGE=ghcr.io/studyfranco/docker-baseimages-debian:testing
 FROM ${BASE_IMAGE}
 
 RUN set -x \
