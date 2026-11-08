@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:slim as builder
+FROM rust:slim AS builder
 
 WORKDIR /app
 
@@ -18,8 +18,7 @@ RUN set -x \
 RUN cargo build --release
 
 # Runtime stage
-ARG BASE_IMAGE=ghcr.io/studyfranco/docker-baseimages-debian:testing
-FROM ${BASE_IMAGE}
+FROM ghcr.io/studyfranco/docker-baseimages-debian:testing
 
 RUN set -x \
     && apt update \
