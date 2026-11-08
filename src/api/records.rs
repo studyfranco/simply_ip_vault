@@ -6,14 +6,19 @@
 //! Every endpoint here that changes state therefore acts on a `(target_address, group)` pair, and
 //! a change in one group never touches the same address's membership in another.
 
-use axum::{Extension, extract::{Json, State}, response::IntoResponse};
+use axum::{
+    Extension,
+    extract::{Json, State},
+    response::IntoResponse,
+};
 use chrono::Utc;
 use ipnetwork::IpNetwork;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, ConnectionTrait,
-    DatabaseTransaction, EntityTrait, JoinType, PaginatorTrait, QueryFilter, QueryOrder,
-    QuerySelect, RelationTrait, SqlErr, SqliteTransactionMode, TransactionOptions,
-    TransactionTrait,
+    ActiveModelTrait,
+    ActiveValue::Set,
+    ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction, EntityTrait, JoinType,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait, SqlErr,
+    SqliteTransactionMode, TransactionOptions, TransactionTrait,
     sea_query::{Expr, ExprTrait, Func, Query},
 };
 use serde::{Deserialize, Serialize};
@@ -73,19 +78,25 @@ pub async fn handle_ban(
 pub(crate) fn guard_bannable_address(network: &IpNetwork) -> Result<(), AppError> {
     let ip = network.network();
     if ip.is_loopback() || ip.is_unspecified() {
-        return Err(AppError::InvalidInput("Cannot ban loopback or unspecified addresses".to_owned()));
+        return Err(AppError::InvalidInput(
+            "Cannot ban loopback or unspecified addresses".to_owned(),
+        ));
     }
     match ip {
         std::net::IpAddr::V4(v4) => {
             if v4.is_private() || v4.is_link_local() {
-                return Err(AppError::InvalidInput("Cannot ban private or link-local IPv4 addresses".to_owned()));
+                return Err(AppError::InvalidInput(
+                    "Cannot ban private or link-local IPv4 addresses".to_owned(),
+                ));
             }
         }
         std::net::IpAddr::V6(v6) => {
             let is_link_local = (v6.segments()[0] & 0xffc0) == 0xfe80;
             let is_unique_local = (v6.segments()[0] & 0xfe00) == 0xfc00;
             if is_link_local || is_unique_local {
-                return Err(AppError::InvalidInput("Cannot ban link-local or unique-local IPv6 addresses".to_owned()));
+                return Err(AppError::InvalidInput(
+                    "Cannot ban link-local or unique-local IPv6 addresses".to_owned(),
+                ));
             }
         }
     }
@@ -144,7 +155,9 @@ pub(crate) async fn handle_ip_upsert(
     payload: BanWhitePayload,
     is_whitelist: bool,
 ) -> Result<impl IntoResponse, AppError> {
-    let network: IpNetwork = payload.target_address.parse()
+    let network: IpNetwork = payload
+        .target_address
+        .parse()
         .map_err(|_| AppError::InvalidInput("Invalid IP or CIDR format".to_owned()))?;
     let normalized_address = normalize_ip_or_cidr(&payload.target_address);
 
@@ -155,7 +168,8 @@ pub(crate) async fn handle_ip_upsert(
     let target_group_id: Uuid;
     let resolved_group_name: String;
 
-    let existing_group = resolve_group_ref(&state.db, payload.group_id, payload.group_name.as_deref()).await?;
+    let existing_group =
+        resolve_group_ref(&state.db, payload.group_id, payload.group_name.as_deref()).await?;
 
     if let Some(g) = existing_group {
         target_group_id = g.id;
@@ -166,17 +180,22 @@ pub(crate) async fn handle_ip_upsert(
                 .filter(
                     Condition::all()
                         .add(api_key_group_permission::Column::ApiKeyId.eq(key.id))
-                        .add(api_key_group_permission::Column::GroupId.eq(target_group_id))
+                        .add(api_key_group_permission::Column::GroupId.eq(target_group_id)),
                 )
                 .one(&state.db)
                 .await?;
 
             if let Some(p) = perm {
                 if !p.can_write {
-                    return Err(AppError::Forbidden("Permission denied: You do not have write access to this group".to_owned()));
+                    return Err(AppError::Forbidden(
+                        "Permission denied: You do not have write access to this group".to_owned(),
+                    ));
                 }
             } else {
-                return Err(AppError::Forbidden("Permission denied: You have no access strictly mapped to this group".to_owned()));
+                return Err(AppError::Forbidden(
+                    "Permission denied: You have no access strictly mapped to this group"
+                        .to_owned(),
+                ));
             }
         }
 
@@ -194,11 +213,15 @@ pub(crate) async fn handle_ip_upsert(
         }
     } else if let Some(group_name) = &payload.group_name {
         if !key.is_master && !key.can_create_groups {
-            return Err(AppError::Forbidden("Permission denied: Target group does not exist and you cannot create groups".to_owned()));
+            return Err(AppError::Forbidden(
+                "Permission denied: Target group does not exist and you cannot create groups"
+                    .to_owned(),
+            ));
         }
 
         let default_type = if is_whitelist { "whitelist" } else { "banlist" };
-        let group = get_or_create_group(&state.db, group_name, default_type, resource_owner(&key)).await?;
+        let group =
+            get_or_create_group(&state.db, group_name, default_type, resource_owner(&key)).await?;
         target_group_id = group.id;
         resolved_group_name = group.name;
 
@@ -222,7 +245,7 @@ pub(crate) async fn handle_ip_upsert(
                         api_key_group_permission::Column::GroupId,
                     ])
                     .do_nothing()
-                    .to_owned()
+                    .to_owned(),
                 )
                 .exec_without_returning(&state.db)
                 .await?;
@@ -262,7 +285,9 @@ pub(crate) async fn handle_ip_upsert(
     let (membership_id, action) = match existing {
         Some(membership) => {
             if membership.is_locked {
-                return Err(AppError::Forbidden("This IP is protected and cannot be modified".to_owned()));
+                return Err(AppError::Forbidden(
+                    "This IP is protected and cannot be modified".to_owned(),
+                ));
             }
             // Re-registering a soft-deleted membership resurrects it, so a deletion never makes the
             // address permanently unbannable in that group.
@@ -482,9 +507,9 @@ impl KeysetCursor {
             .map_err(|_| AppError::InvalidInput("Invalid cursor: malformed encoding".to_owned()))?;
         let text = std::str::from_utf8(&bytes)
             .map_err(|_| AppError::InvalidInput("Invalid cursor: non-UTF-8 payload".to_owned()))?;
-        let (ts_str, id_str) = text
-            .split_once('|')
-            .ok_or_else(|| AppError::InvalidInput("Invalid cursor: missing delimiter".to_owned()))?;
+        let (ts_str, id_str) = text.split_once('|').ok_or_else(|| {
+            AppError::InvalidInput("Invalid cursor: missing delimiter".to_owned())
+        })?;
         let last_seen_at = chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%dT%H:%M:%S%.f")
             .or_else(|_| chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S%.f"))
             .map_err(|_| AppError::InvalidInput("Invalid cursor: bad timestamp".to_owned()))?;
@@ -509,7 +534,10 @@ impl KeysetCursor {
                     .add(ip_record_group_membership::Column::LastSeenAt.lt(self.last_seen_at))
                     .add(
                         Condition::all()
-                            .add(ip_record_group_membership::Column::LastSeenAt.eq(self.last_seen_at))
+                            .add(
+                                ip_record_group_membership::Column::LastSeenAt
+                                    .eq(self.last_seen_at),
+                            )
                             .add(ip_record_group_membership::Column::Id.gt(self.id)),
                     ),
             )
@@ -560,30 +588,102 @@ const MERGE_MAX_GROUPS: usize = 16;
 /// the first few pages a dashboard actually loads.
 const MERGE_MAX_FETCH: u64 = 2000;
 
-/// Counts memberships matching `condition`, scoped to `groups` when given.
+/// How the resolved group constraint is applied to the membership query.
+enum GroupScope {
+    /// No group constraint (master querying all groups).
+    Unfiltered,
+    /// Exactly one group ID.
+    Single(Uuid),
+    /// A small set of groups (`<= MERGE_MAX_GROUPS`) fetched individually by [`fetch_merged_page`]
+    /// and counted with a single `IN (...)` predicate in [`count_matching`].
+    Merge(Vec<Uuid>),
+    /// A large set of groups or deep offset pagination that uses `GroupId IN (...)`.
+    In(Vec<Uuid>),
+}
+
+/// Combines a base [`Condition`] with an optional group predicate and an optional `since` window.
 ///
-/// With `groups`, this sums one indexed per-group count instead of running a single `GroupId IN
-/// (...)` count — kept symmetric with [`fetch_merged_page`] so the two agree on what the group
-/// filter means, even though a count has no `ORDER BY` to break and `IN (...)` alone would already
-/// be index-covered.
+/// When both `since` and `include_deleted` are active alongside a group predicate (`group_id = ?`
+/// or `group_id IN (...)`), the group predicate is distributed into both arms of the `OR`:
+///
+/// ```sql
+/// ((group_id = ? AND last_seen_at >= ?) OR (group_id = ? AND is_deleted = ? AND deleted_at >= ?))
+/// ```
+///
+/// Factoring `group_id = ?` out at the top level (`group_id = ? AND (last_seen_at >= ? OR ...)`)
+/// tempts SQLite's planner into scanning the entire `group_id` partition of
+/// `idx_memberships_group_last_seen` in `ORDER BY last_seen_at DESC` order — which cannot stop at
+/// `last_seen_at < threshold` because older rows might still satisfy `deleted_at >= threshold`.
+/// Distributing `group_id` into each arm removes the top-level equality, forcing SQLite's planner
+/// to use `MULTI-INDEX OR` (`idx_memberships_group_last_seen` for the `last_seen_at` range seek +
+/// `idx_memberships_group_deleted_at` for the `deleted_at` range seek).
+pub fn apply_group_and_since_scope(
+    base: &Condition,
+    group_pred: Option<sea_orm::sea_query::SimpleExpr>,
+    since_threshold: Option<chrono::NaiveDateTime>,
+    include_deleted: bool,
+) -> Condition {
+    let mut cond = base.clone();
+    match (group_pred, since_threshold, include_deleted) {
+        (Some(gp), Some(threshold), true) => {
+            cond = cond.add(
+                Condition::any()
+                    .add(
+                        Condition::all()
+                            .add(gp.clone())
+                            .add(ip_record_group_membership::Column::LastSeenAt.gte(threshold)),
+                    )
+                    .add(
+                        Condition::all()
+                            .add(gp)
+                            .add(ip_record_group_membership::Column::IsDeleted.eq(true))
+                            .add(ip_record_group_membership::Column::DeletedAt.gte(threshold)),
+                    ),
+            );
+        }
+        (None, Some(threshold), true) => {
+            cond = cond.add(
+                Condition::any()
+                    .add(ip_record_group_membership::Column::LastSeenAt.gte(threshold))
+                    .add(
+                        Condition::all()
+                            .add(ip_record_group_membership::Column::IsDeleted.eq(true))
+                            .add(ip_record_group_membership::Column::DeletedAt.gte(threshold)),
+                    ),
+            );
+        }
+        (gp, since_opt, _) => {
+            if let Some(gp) = gp {
+                cond = cond.add(gp);
+            }
+            if let Some(threshold) = since_opt {
+                cond = cond.add(
+                    Condition::any()
+                        .add(ip_record_group_membership::Column::LastSeenAt.gte(threshold)),
+                );
+            }
+        }
+    }
+    cond
+}
+
+/// Counts memberships matching `scoped`, joining `ip_records` only when an address filter is present.
 async fn count_matching(
     db: &sea_orm::DatabaseConnection,
-    condition: &Condition,
+    scoped: Condition,
     address_filter_present: bool,
-    groups: Option<&[Uuid]>,
 ) -> Result<u64, AppError> {
     // One query, never split per group. `fetch_merged_page` splits because an `ORDER BY` across a
     // `GroupId IN (...)` cannot be served from the per-group partial index without a sort. A count
     // has no order to satisfy, so that reason never applied to it: `GroupId IN (...)` stays a
     // covering-index scan (confirmed with `EXPLAIN QUERY PLAN` against this schema). Splitting it
     // would only add round trips for no benefit.
-    let mut scoped = condition.clone();
-    if let Some(ids) = groups {
-        scoped = scoped.add(ip_record_group_membership::Column::GroupId.is_in(ids.iter().copied()));
-    }
     let mut query = ip_record_group_membership::Entity::find();
     if address_filter_present {
-        query = query.join(JoinType::InnerJoin, ip_record_group_membership::Relation::IpRecord.def());
+        query = query.join(
+            JoinType::InnerJoin,
+            ip_record_group_membership::Relation::IpRecord.def(),
+        );
     }
     // `COUNT(*)`, not `COUNT(id)`: the partial index on `(group_id, last_seen_at)` does not carry
     // `id`, so counting that column forces a table lookup per matching row and loses "COVERING
@@ -593,7 +693,10 @@ async fn count_matching(
     let count: Option<i64> = query
         .filter(scoped)
         .select_only()
-        .expr_as(Func::count(Expr::col(sea_orm::sea_query::Asterisk)), "row_count")
+        .expr_as(
+            Func::count(Expr::col(sea_orm::sea_query::Asterisk)),
+            "row_count",
+        )
         .into_tuple::<i64>()
         .one(db)
         .await?;
@@ -603,6 +706,16 @@ async fn count_matching(
 /// Fetches one page across a small, explicit set of groups without an SQL `ORDER BY` that spans
 /// them.
 ///
+struct MergedPageFetch<'a> {
+    base_condition: &'a Condition,
+    since_threshold: Option<chrono::NaiveDateTime>,
+    include_deleted: bool,
+    cursor: Option<KeysetCursor>,
+    group_ids: &'a [Uuid],
+    offset: u64,
+    limit: u64,
+}
+
 /// The partial index `idx_memberships_active_last_seen` is `(group_id, last_seen_at DESC, id ASC,
 /// …) WHERE is_deleted = FALSE` — it sorts *within* one `group_id`, not across several. A `GroupId
 /// IN (...)` with `ORDER BY last_seen_at` therefore cannot be served from it directly; SQLite scans
@@ -613,17 +726,25 @@ async fn count_matching(
 /// cheap because each input is already sorted and the inputs are few.
 async fn fetch_merged_page(
     db: &sea_orm::DatabaseConnection,
-    condition: &Condition,
-    group_ids: &[Uuid],
-    offset: u64,
-    limit: u64,
+    fetch: MergedPageFetch<'_>,
 ) -> Result<Vec<(ip_record_group_membership::Model, Option<ip_record::Model>)>, AppError> {
-    let take = offset.saturating_add(limit);
-    let mut merged = Vec::with_capacity(group_ids.len() * take as usize);
-    for &group_id in group_ids {
-        let scoped = condition.clone().add(ip_record_group_membership::Column::GroupId.eq(group_id));
+    let take = fetch.offset.saturating_add(fetch.limit);
+    let mut merged = Vec::with_capacity(fetch.group_ids.len() * take as usize);
+    for &group_id in fetch.group_ids {
+        let mut scoped = apply_group_and_since_scope(
+            fetch.base_condition,
+            Some(ip_record_group_membership::Column::GroupId.eq(group_id)),
+            fetch.since_threshold,
+            fetch.include_deleted,
+        );
+        if let Some(cur) = fetch.cursor {
+            scoped = scoped.add(cur.condition());
+        }
         let rows = ip_record_group_membership::Entity::find()
-            .join(JoinType::InnerJoin, ip_record_group_membership::Relation::IpRecord.def())
+            .join(
+                JoinType::InnerJoin,
+                ip_record_group_membership::Relation::IpRecord.def(),
+            )
             .select_also(ip_record::Entity)
             .filter(scoped)
             .order_by_desc(ip_record_group_membership::Column::LastSeenAt)
@@ -634,7 +755,11 @@ async fn fetch_merged_page(
         merged.extend(rows);
     }
     merged.sort_by_key(|(m, _)| (std::cmp::Reverse(m.last_seen_at), m.id));
-    Ok(merged.into_iter().skip(offset as usize).take(limit as usize).collect())
+    Ok(merged
+        .into_iter()
+        .skip(fetch.offset as usize)
+        .take(fetch.limit as usize)
+        .collect())
 }
 
 /// Handles `GET /api/ips`: lists memberships, scoped to groups the caller may read.
@@ -678,19 +803,26 @@ pub async fn list_ips(
     let mut group_constraints: Vec<std::collections::HashSet<Uuid>> = Vec::new();
 
     if !key.is_master {
-        let accessible_groups: std::collections::HashSet<Uuid> = api_key_group_permission::Entity::find()
-            .filter(
-                Condition::all()
-                    .add(api_key_group_permission::Column::ApiKeyId.eq(key.id))
-                    .add(api_key_group_permission::Column::CanRead.eq(true))
-            )
-            .all(&state.db)
-            .await?
-            .into_iter()
-            .map(|p| p.group_id)
-            .collect();
+        let accessible_groups: std::collections::HashSet<Uuid> =
+            api_key_group_permission::Entity::find()
+                .filter(
+                    Condition::all()
+                        .add(api_key_group_permission::Column::ApiKeyId.eq(key.id))
+                        .add(api_key_group_permission::Column::CanRead.eq(true)),
+                )
+                .all(&state.db)
+                .await?
+                .into_iter()
+                .map(|p| p.group_id)
+                .collect();
         if accessible_groups.is_empty() {
-            return Ok(empty_ips_response(format_iplist, include_total, cursor_mode, limit, offset));
+            return Ok(empty_ips_response(
+                format_iplist,
+                include_total,
+                cursor_mode,
+                limit,
+                offset,
+            ));
         }
         group_constraints.push(accessible_groups);
     }
@@ -699,7 +831,12 @@ pub async fn list_ips(
     if let Some(groups) = &filters.groups
         && !groups.is_empty()
     {
-        group_names.extend(groups.split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()));
+        group_names.extend(
+            groups
+                .split(',')
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty()),
+        );
     }
     if let Some(name) = &filters.group_name {
         let trimmed = name.trim();
@@ -734,7 +871,11 @@ pub async fn list_ips(
         let group_type = match status.as_str() {
             "ban" | "banlist" => "banlist",
             "white" | "whitelist" => "whitelist",
-            other => return Err(AppError::InvalidInput(format!("Invalid status filter: {other}"))),
+            other => {
+                return Err(AppError::InvalidInput(format!(
+                    "Invalid status filter: {other}"
+                )));
+            }
         };
         let typed: std::collections::HashSet<Uuid> = ip_group::Entity::find()
             .filter(ip_group::Column::GroupType.eq(group_type))
@@ -753,24 +894,30 @@ pub async fn list_ips(
     // confirmed against this schema as the cause of the reported 56–91s multi-group query.
     // In cursor mode `offset` is always 0, so each group reads only `limit` rows after the cursor
     // and the `MERGE_MAX_FETCH` offset ceiling does not apply.
-    let mut merge_group_ids: Option<Vec<Uuid>> = None;
+    let mut group_scope = GroupScope::Unfiltered;
     if let Some(mut intersected) = group_constraints.pop() {
         for set in &group_constraints {
             intersected.retain(|g| set.contains(g));
         }
         if intersected.is_empty() {
-            return Ok(empty_ips_response(format_iplist, include_total, cursor_mode, limit, offset));
+            return Ok(empty_ips_response(
+                format_iplist,
+                include_total,
+                cursor_mode,
+                limit,
+                offset,
+            ));
         }
         if intersected.len() == 1 {
             if let Some(only_id) = intersected.into_iter().next() {
-                condition = condition.add(ip_record_group_membership::Column::GroupId.eq(only_id));
+                group_scope = GroupScope::Single(only_id);
             }
         } else if intersected.len() <= MERGE_MAX_GROUPS
             && (cursor_mode || offset.saturating_add(limit) <= MERGE_MAX_FETCH)
         {
-            merge_group_ids = Some(intersected.into_iter().collect());
+            group_scope = GroupScope::Merge(intersected.into_iter().collect());
         } else {
-            condition = condition.add(ip_record_group_membership::Column::GroupId.is_in(intersected));
+            group_scope = GroupScope::In(intersected.into_iter().collect());
         }
     }
 
@@ -778,7 +925,8 @@ pub async fn list_ips(
     if let Some(ip) = &filters.ip
         && !ip.is_empty()
     {
-        condition = condition.add(ip_record::Column::TargetAddress.contains(normalize_ip_or_cidr(ip.trim())));
+        condition = condition
+            .add(ip_record::Column::TargetAddress.contains(normalize_ip_or_cidr(ip.trim())));
     }
 
     // A cause lives in the history table, so a cause filter selects memberships through a subquery
@@ -787,13 +935,19 @@ pub async fn list_ips(
         && !cause.is_empty()
     {
         let matching = Query::select()
-            .column((ip_record_cause::Entity, ip_record_cause::Column::MembershipId))
+            .column((
+                ip_record_cause::Entity,
+                ip_record_cause::Column::MembershipId,
+            ))
             .from(ip_record_cause::Entity)
             .and_where(ip_record_cause::Column::Cause.contains(cause.trim()))
             .to_owned();
         condition = condition.add(
-            Expr::col((ip_record_group_membership::Entity, ip_record_group_membership::Column::Id))
-                .in_subquery(matching),
+            Expr::col((
+                ip_record_group_membership::Entity,
+                ip_record_group_membership::Column::Id,
+            ))
+            .in_subquery(matching),
         );
     }
 
@@ -802,32 +956,36 @@ pub async fn list_ips(
         condition = condition.add(ip_record_group_membership::Column::LastSeenAt.gte(threshold));
     }
 
-    if let Some(since) = filters.since {
-        let threshold = chrono::DateTime::from_timestamp(since, 0)
-            .ok_or_else(|| AppError::InvalidInput("Invalid `since` timestamp".to_owned()))?
-            .naive_utc();
-        let mut window = Condition::any()
-            .add(ip_record_group_membership::Column::LastSeenAt.gte(threshold));
-        if include_deleted {
-            window = window.add(
-                Condition::all()
-                    .add(ip_record_group_membership::Column::IsDeleted.eq(true))
-                    .add(ip_record_group_membership::Column::DeletedAt.gte(threshold)),
-            );
+    let since_threshold = match filters.since {
+        Some(since) => Some(
+            chrono::DateTime::from_timestamp(since, 0)
+                .ok_or_else(|| AppError::InvalidInput("Invalid `since` timestamp".to_owned()))?
+                .naive_utc(),
+        ),
+        None => None,
+    };
+
+    let count_group_pred = match &group_scope {
+        GroupScope::Unfiltered => None,
+        GroupScope::Single(only_id) => {
+            Some(ip_record_group_membership::Column::GroupId.eq(*only_id))
         }
-        condition = condition.add(window);
-    }
+        GroupScope::Merge(ids) | GroupScope::In(ids) => {
+            Some(ip_record_group_membership::Column::GroupId.is_in(ids.iter().copied()))
+        }
+    };
 
     let total = if include_total {
-        Some(count_matching(&state.db, &condition, address_filter_present, merge_group_ids.as_deref()).await?)
+        let count_cond = apply_group_and_since_scope(
+            &condition,
+            count_group_pred.clone(),
+            since_threshold,
+            include_deleted,
+        );
+        Some(count_matching(&state.db, count_cond, address_filter_present).await?)
     } else {
         None
     };
-
-    let mut page_condition = condition;
-    if let Some(cursor) = parsed_cursor {
-        page_condition = page_condition.add(cursor.condition());
-    }
 
     // When `next_cursor` is needed, fetch `limit + 1` rows so an exact-multiple final page can
     // report `next_cursor: None` immediately without an extra empty round trip.
@@ -841,11 +999,37 @@ pub async fn list_ips(
     let mut page = if limit == 0 {
         Vec::new()
     } else {
-        match &merge_group_ids {
-            Some(ids) => fetch_merged_page(&state.db, &page_condition, ids, offset, fetch_limit).await?,
-            None => {
+        match &group_scope {
+            GroupScope::Merge(ids) => {
+                fetch_merged_page(
+                    &state.db,
+                    MergedPageFetch {
+                        base_condition: &condition,
+                        since_threshold,
+                        include_deleted,
+                        cursor: parsed_cursor,
+                        group_ids: ids,
+                        offset,
+                        limit: fetch_limit,
+                    },
+                )
+                .await?
+            }
+            GroupScope::Unfiltered | GroupScope::Single(_) | GroupScope::In(_) => {
+                let mut page_condition = apply_group_and_since_scope(
+                    &condition,
+                    count_group_pred,
+                    since_threshold,
+                    include_deleted,
+                );
+                if let Some(cursor) = parsed_cursor {
+                    page_condition = page_condition.add(cursor.condition());
+                }
                 ip_record_group_membership::Entity::find()
-                    .join(JoinType::InnerJoin, ip_record_group_membership::Relation::IpRecord.def())
+                    .join(
+                        JoinType::InnerJoin,
+                        ip_record_group_membership::Relation::IpRecord.def(),
+                    )
                     .select_also(ip_record::Entity)
                     .filter(page_condition)
                     .order_by_desc(ip_record_group_membership::Column::LastSeenAt)
@@ -863,7 +1047,8 @@ pub async fn list_ips(
         page.truncate(limit as usize);
     }
     let next_cursor = if has_more {
-        page.last().map(|(m, _)| KeysetCursor::encode(m.last_seen_at, m.id))
+        page.last()
+            .map(|(m, _)| KeysetCursor::encode(m.last_seen_at, m.id))
     } else {
         None
     };
@@ -926,7 +1111,8 @@ pub async fn list_ips(
             .collect()
     };
     let page_membership_ids: Vec<Uuid> = page.iter().map(|(m, _)| m.id).collect();
-    let mut latest_cause: std::collections::HashMap<Uuid, String> = std::collections::HashMap::new();
+    let mut latest_cause: std::collections::HashMap<Uuid, String> =
+        std::collections::HashMap::new();
     if !page_membership_ids.is_empty() {
         // Newest first, so the first row seen for a membership is its latest cause.
         for row in ip_record_cause::Entity::find()
@@ -942,7 +1128,9 @@ pub async fn list_ips(
     let mut items = Vec::with_capacity(page.len());
     for (mem, record) in page {
         let Some(record) = record else { continue };
-        let Some(group) = groups.get(&mem.group_id) else { continue };
+        let Some(group) = groups.get(&mem.group_id) else {
+            continue;
+        };
         items.push(IpRecordResponse {
             id: mem.id,
             ip_record_id: record.id,
@@ -1025,11 +1213,15 @@ pub struct DeleteIpQuery {
 }
 
 /// Parses a [`MembershipRef`] from the query string and/or a JSON body.
-fn membership_ref_from(query: MembershipRef, body: &axum::body::Bytes) -> Result<MembershipRef, AppError> {
+fn membership_ref_from(
+    query: MembershipRef,
+    body: &axum::body::Bytes,
+) -> Result<MembershipRef, AppError> {
     let from_body: MembershipRef = if body.is_empty() {
         MembershipRef::default()
     } else {
-        serde_json::from_slice(body).map_err(|e| AppError::InvalidInput(format!("Invalid JSON body: {e}")))?
+        serde_json::from_slice(body)
+            .map_err(|e| AppError::InvalidInput(format!("Invalid JSON body: {e}")))?
     };
     Ok(query.merge(from_body))
 }
@@ -1073,7 +1265,8 @@ pub async fn delete_ip(
     let body_ref: DeleteIpQuery = if body.is_empty() {
         DeleteIpQuery::default()
     } else {
-        serde_json::from_slice(&body).map_err(|e| AppError::InvalidInput(format!("Invalid JSON body: {e}")))?
+        serde_json::from_slice(&body)
+            .map_err(|e| AppError::InvalidInput(format!("Invalid JSON body: {e}")))?
     };
     let hard = hard || body_ref.hard.unwrap_or(false);
     let reference = MembershipRef {
@@ -1085,32 +1278,43 @@ pub async fn delete_ip(
     let target_address = reference
         .target_address
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| AppError::InvalidInput("target_address is required (query or JSON body)".to_owned()))?;
+        .ok_or_else(|| {
+            AppError::InvalidInput("target_address is required (query or JSON body)".to_owned())
+        })?;
     let target_address = normalize_ip_or_cidr(&target_address);
 
-    let group = resolve_group_ref(&state.db, reference.group_id, reference.group_name.as_deref())
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let group = resolve_group_ref(
+        &state.db,
+        reference.group_id,
+        reference.group_name.as_deref(),
+    )
+    .await?
+    .ok_or(AppError::NotFound)?;
 
     if !key.is_master {
         let perm = api_key_group_permission::Entity::find()
             .filter(
                 Condition::all()
                     .add(api_key_group_permission::Column::ApiKeyId.eq(key.id))
-                    .add(api_key_group_permission::Column::GroupId.eq(group.id))
+                    .add(api_key_group_permission::Column::GroupId.eq(group.id)),
             )
             .one(&state.db)
             .await?;
         match perm {
             Some(p) if !p.can_delete => {
-                return Err(AppError::Forbidden("Permission denied: You do not have delete permissions over this group".to_owned()));
+                return Err(AppError::Forbidden(
+                    "Permission denied: You do not have delete permissions over this group"
+                        .to_owned(),
+                ));
             }
             Some(_) => {}
             None => return Err(AppError::Forbidden("Permission denied".to_owned())),
         }
     }
     if hard && !key.is_master {
-        return Err(AppError::Forbidden("Only a master key can permanently delete an IP membership".to_owned()));
+        return Err(AppError::Forbidden(
+            "Only a master key can permanently delete an IP membership".to_owned(),
+        ));
     }
 
     let now = Utc::now().naive_utc();
@@ -1124,18 +1328,24 @@ pub async fn delete_ip(
 
     let (record, membership) = find_membership(&txn, &target_address, &group).await?;
     if membership.is_locked {
-        return Err(AppError::Forbidden("Protected records cannot be deleted".to_owned()));
+        return Err(AppError::Forbidden(
+            "Protected records cannot be deleted".to_owned(),
+        ));
     }
 
     if hard {
-        ip_record_group_membership::Entity::delete_by_id(membership.id).exec(&txn).await?;
+        ip_record_group_membership::Entity::delete_by_id(membership.id)
+            .exec(&txn)
+            .await?;
         // An address held by no group any more has nothing left to describe; remove it too.
         let remaining = ip_record_group_membership::Entity::find()
             .filter(ip_record_group_membership::Column::IpRecordId.eq(record.id))
             .count(&txn)
             .await?;
         if remaining == 0 {
-            ip_record::Entity::delete_by_id(record.id).exec(&txn).await?;
+            ip_record::Entity::delete_by_id(record.id)
+                .exec(&txn)
+                .await?;
         }
         create_audit_log(
             &txn,
@@ -1160,7 +1370,10 @@ pub async fn delete_ip(
             "IP_SOFT_DELETE",
             Some(target_address.clone()),
             Some(group.name.clone()),
-            Some(format!("Soft-deleted by key {}", format_key_reference(&key.name, key.id))),
+            Some(format!(
+                "Soft-deleted by key {}",
+                format_key_reference(&key.name, key.id)
+            )),
         )
         .await?;
     } else {
@@ -1195,17 +1408,25 @@ pub async fn restore_ip_record(
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master {
-        return Err(AppError::Forbidden("Only a master key can restore a deleted IP membership".to_owned()));
+        return Err(AppError::Forbidden(
+            "Only a master key can restore a deleted IP membership".to_owned(),
+        ));
     }
     let reference = membership_ref_from(query, &body)?;
     let target_address = reference
         .target_address
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| AppError::InvalidInput("target_address is required (query or JSON body)".to_owned()))?;
+        .ok_or_else(|| {
+            AppError::InvalidInput("target_address is required (query or JSON body)".to_owned())
+        })?;
     let target_address = normalize_ip_or_cidr(&target_address);
-    let group = resolve_group_ref(&state.db, reference.group_id, reference.group_name.as_deref())
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let group = resolve_group_ref(
+        &state.db,
+        reference.group_id,
+        reference.group_name.as_deref(),
+    )
+    .await?
+    .ok_or(AppError::NotFound)?;
 
     let txn = state
         .db
@@ -1216,7 +1437,9 @@ pub async fn restore_ip_record(
         .await?;
     let (_record, membership) = find_membership(&txn, &target_address, &group).await?;
     if !membership.is_deleted {
-        return Err(AppError::InvalidInput("This IP membership is not deleted; nothing to restore".to_owned()));
+        return Err(AppError::InvalidInput(
+            "This IP membership is not deleted; nothing to restore".to_owned(),
+        ));
     }
     let mut active: ip_record_group_membership::ActiveModel = membership.into();
     active.is_deleted = Set(false);
@@ -1262,12 +1485,15 @@ pub async fn purge_ip_records(
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master {
-        return Err(AppError::Forbidden("Only a master key can purge deleted IP memberships".to_owned()));
+        return Err(AppError::Forbidden(
+            "Only a master key can purge deleted IP memberships".to_owned(),
+        ));
     }
     let payload: PurgeIpsPayload = if body.is_empty() {
         PurgeIpsPayload::default()
     } else {
-        serde_json::from_slice(&body).map_err(|e| AppError::InvalidInput(format!("Invalid JSON body: {e}")))?
+        serde_json::from_slice(&body)
+            .map_err(|e| AppError::InvalidInput(format!("Invalid JSON body: {e}")))?
     };
     let retention_days = match payload.older_than_days {
         None => crate::retention::retention_days_from_env(),
@@ -1286,7 +1512,9 @@ pub async fn purge_ip_records(
         "IP_PURGE",
         None,
         None,
-        Some(format!("Purged {purged} membership(s) soft-deleted over {retention_days} days ago")),
+        Some(format!(
+            "Purged {purged} membership(s) soft-deleted over {retention_days} days ago"
+        )),
     )
     .await?;
     Ok(Json(serde_json::json!({
@@ -1389,11 +1617,15 @@ pub async fn batch_records(
     }
 
     // Validate everything before taking the write lock.
-    let mut normalized: Vec<(String, &BatchRecordInput)> = Vec::with_capacity(payload.records.len());
+    let mut normalized: Vec<(String, &BatchRecordInput)> =
+        Vec::with_capacity(payload.records.len());
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for record in &payload.records {
         let _network: IpNetwork = record.target_address.parse().map_err(|_| {
-            AppError::InvalidInput(format!("Invalid IP or CIDR format: {:?}", record.target_address))
+            AppError::InvalidInput(format!(
+                "Invalid IP or CIDR format: {:?}",
+                record.target_address
+            ))
         })?;
         let address = normalize_ip_or_cidr(&record.target_address);
         if !seen.insert(address.clone()) {
@@ -1420,10 +1652,15 @@ pub async fn batch_records(
                     .one(&state.db)
                     .await?
                     .ok_or_else(|| {
-                        AppError::Forbidden("Permission denied: You have no access strictly mapped to this group".to_owned())
+                        AppError::Forbidden(
+                            "Permission denied: You have no access strictly mapped to this group"
+                                .to_owned(),
+                        )
                     })?;
                 if !perm.can_write {
-                    return Err(AppError::Forbidden("Permission denied: You do not have write access to this group".to_owned()));
+                    return Err(AppError::Forbidden(
+                        "Permission denied: You do not have write access to this group".to_owned(),
+                    ));
                 }
                 if payload.mode == BatchMode::FullReplace && !perm.can_delete {
                     return Err(AppError::Forbidden(
@@ -1437,18 +1674,25 @@ pub async fn batch_records(
         None => {
             if !key.is_master && !key.can_create_groups {
                 return Err(AppError::Forbidden(
-                    "Permission denied: Target group does not exist and you cannot create groups".to_owned(),
+                    "Permission denied: Target group does not exist and you cannot create groups"
+                        .to_owned(),
                 ));
             }
-            get_or_create_group(&state.db, &payload.group_name, "banlist", resource_owner(&key)).await?
+            get_or_create_group(
+                &state.db,
+                &payload.group_name,
+                "banlist",
+                resource_owner(&key),
+            )
+            .await?
         }
     };
 
     if group.group_type != "whitelist" {
         for (address, _) in &normalized {
-            let network: IpNetwork = address
-                .parse()
-                .map_err(|_| AppError::InvalidInput(format!("Invalid IP or CIDR format: {address}")))?;
+            let network: IpNetwork = address.parse().map_err(|_| {
+                AppError::InvalidInput(format!("Invalid IP or CIDR format: {address}"))
+            })?;
             guard_bannable_address(&network)?;
         }
     }
@@ -1465,95 +1709,145 @@ pub async fn batch_records(
     let skip_webhooks = payload.skip_webhooks.unwrap_or(false);
     let mut webhook_events: Vec<WebhookEvent> = Vec::new();
 
-    for (address, input) in &normalized {
-        let (record, record_is_new) = find_or_insert_address(&txn, address, input.created_at.unwrap_or(now)).await?;
-        if record_is_new {
-            summary.created += 1;
-        }
+    for chunk in normalized.chunks(500) {
+        let chunk_addrs: Vec<String> = chunk.iter().map(|(addr, _)| addr.clone()).collect();
+        let prefetched_records: std::collections::HashMap<String, ip_record::Model> =
+            ip_record::Entity::find()
+                .filter(ip_record::Column::TargetAddress.is_in(chunk_addrs))
+                .all(&txn)
+                .await?
+                .into_iter()
+                .map(|r| (r.target_address.clone(), r))
+                .collect();
 
-        let existing = ip_record_group_membership::Entity::find()
-            .filter(ip_record_group_membership::Column::IpRecordId.eq(record.id))
-            .filter(ip_record_group_membership::Column::GroupId.eq(group.id))
-            .one(&txn)
-            .await?;
+        let mut prefetched_memberships: std::collections::HashMap<
+            Uuid,
+            ip_record_group_membership::Model,
+        > = if prefetched_records.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            let record_ids: Vec<Uuid> = prefetched_records.values().map(|r| r.id).collect();
+            ip_record_group_membership::Entity::find()
+                .filter(ip_record_group_membership::Column::GroupId.eq(group.id))
+                .filter(ip_record_group_membership::Column::IpRecordId.is_in(record_ids))
+                .all(&txn)
+                .await?
+                .into_iter()
+                .map(|m| (m.ip_record_id, m))
+                .collect()
+        };
 
-        let observed_at = input.last_seen_at.or(input.updated_at).unwrap_or(now);
-        let (membership_id, action) = match existing {
-            Some(m) if m.is_locked => {
-                summary.locked_skipped += 1;
-                continue;
-            }
-            Some(m) => {
-                let was_deleted = m.is_deleted;
-                let id = m.id;
-                let mut active: ip_record_group_membership::ActiveModel = m.into();
-                active.last_seen_at = Set(observed_at);
-                match input.is_deleted {
-                    Some(true) => {
-                        active.is_deleted = Set(true);
-                        active.deleted_at = Set(Some(input.deleted_at.unwrap_or(now)));
-                        active.deleted_by = Set(Some(key.id.to_string()));
-                    }
-                    _ if was_deleted => {
-                        active.is_deleted = Set(false);
-                        active.deleted_at = Set(None);
-                        active.deleted_by = Set(None);
-                        summary.restored += 1;
-                    }
-                    _ => {}
+        for (address, input) in chunk {
+            let (record, record_is_new) = match prefetched_records.get(address) {
+                Some(existing_rec) => (existing_rec.clone(), false),
+                None => {
+                    find_or_insert_address(&txn, address, input.created_at.unwrap_or(now)).await?
                 }
-                active.update(&txn).await?;
-                summary.updated += 1;
-                (id, "IP_UPDATE")
+            };
+            if record_is_new {
+                summary.created += 1;
             }
-            None => {
-                let id = Uuid::new_v4();
-                let deleted = input.is_deleted == Some(true);
-                ip_record_group_membership::ActiveModel {
-                    id: Set(id),
-                    ip_record_id: Set(record.id),
-                    group_id: Set(group.id),
-                    is_locked: Set(false),
-                    created_at: Set(input.created_at.unwrap_or(now)),
-                    last_seen_at: Set(observed_at),
-                    is_deleted: Set(deleted),
-                    deleted_at: Set(if deleted { Some(input.deleted_at.unwrap_or(now)) } else { None }),
-                    deleted_by: Set(if deleted { Some(key.id.to_string()) } else { None }),
+
+            let existing = if record_is_new {
+                None
+            } else {
+                prefetched_memberships.remove(&record.id)
+            };
+
+            let observed_at = input.last_seen_at.or(input.updated_at).unwrap_or(now);
+            let (membership_id, action) = match existing {
+                Some(m) if m.is_locked => {
+                    summary.locked_skipped += 1;
+                    continue;
+                }
+                Some(m) => {
+                    let was_deleted = m.is_deleted;
+                    let id = m.id;
+                    let mut active: ip_record_group_membership::ActiveModel = m.into();
+                    active.last_seen_at = Set(observed_at);
+                    match input.is_deleted {
+                        Some(true) => {
+                            active.is_deleted = Set(true);
+                            active.deleted_at = Set(Some(input.deleted_at.unwrap_or(now)));
+                            active.deleted_by = Set(Some(key.id.to_string()));
+                        }
+                        _ if was_deleted => {
+                            active.is_deleted = Set(false);
+                            active.deleted_at = Set(None);
+                            active.deleted_by = Set(None);
+                            summary.restored += 1;
+                        }
+                        _ => {}
+                    }
+                    active.update(&txn).await?;
+                    summary.updated += 1;
+                    (id, "IP_UPDATE")
+                }
+                None => {
+                    let id = Uuid::new_v4();
+                    let deleted = input.is_deleted == Some(true);
+                    ip_record_group_membership::ActiveModel {
+                        id: Set(id),
+                        ip_record_id: Set(record.id),
+                        group_id: Set(group.id),
+                        is_locked: Set(false),
+                        created_at: Set(input.created_at.unwrap_or(now)),
+                        last_seen_at: Set(observed_at),
+                        is_deleted: Set(deleted),
+                        deleted_at: Set(if deleted {
+                            Some(input.deleted_at.unwrap_or(now))
+                        } else {
+                            None
+                        }),
+                        deleted_by: Set(if deleted {
+                            Some(key.id.to_string())
+                        } else {
+                            None
+                        }),
+                    }
+                    .insert(&txn)
+                    .await?;
+                    summary.linked += 1;
+                    (id, "IP_ADD")
+                }
+            };
+
+            if let Some(text) = input
+                .cause
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+            {
+                ip_record_cause::ActiveModel {
+                    id: Set(Uuid::new_v4()),
+                    membership_id: Set(membership_id),
+                    cause: Set(text.to_owned()),
+                    created_at: Set(now),
                 }
                 .insert(&txn)
                 .await?;
-                summary.linked += 1;
-                (id, "IP_ADD")
             }
-        };
 
-        if let Some(text) = input.cause.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
-            ip_record_cause::ActiveModel {
-                id: Set(Uuid::new_v4()),
-                membership_id: Set(membership_id),
-                cause: Set(text.to_owned()),
-                created_at: Set(now),
+            if !skip_webhooks {
+                webhook_events.push(WebhookEvent {
+                    action: action.to_owned(),
+                    address: address.clone(),
+                    is_whitelist: group.group_type == "whitelist",
+                    group_id: Some(group.id),
+                    group_name: Some(group.name.clone()),
+                    cause: input.cause.clone(),
+                });
             }
-            .insert(&txn)
-            .await?;
-        }
-
-        if !skip_webhooks {
-            webhook_events.push(WebhookEvent {
-                action: action.to_owned(),
-                address: address.clone(),
-                is_whitelist: group.group_type == "whitelist",
-                group_id: Some(group.id),
-                group_name: Some(group.name.clone()),
-                cause: input.cause.clone(),
-            });
         }
     }
 
     // full_replace: soft-delete this group's live, unlocked memberships that the batch omits.
     if payload.mode == BatchMode::FullReplace {
         let candidates = ip_record_group_membership::Entity::find()
-            .join(JoinType::InnerJoin, ip_record_group_membership::Relation::IpRecord.def())
+            .join(
+                JoinType::InnerJoin,
+                ip_record_group_membership::Relation::IpRecord.def(),
+            )
             .select_also(ip_record::Entity)
             .filter(
                 Condition::all()

@@ -1792,12 +1792,23 @@ async fn the_delta_sync_columns_are_indexed() {
     let db = fresh_db(&tmp).await;
 
     // The delta columns now live on the membership, so that is where the indexes must be.
-    for index in ["idx_memberships_deleted_at", "idx_memberships_active_last_seen"] {
+    for index in [
+        "idx_memberships_deleted_at",
+        "idx_memberships_active_last_seen",
+        "idx_memberships_group_last_seen",
+        "idx_memberships_group_deleted_at",
+    ] {
         assert!(
             simply_ip_vault::db::has_index(&db, "ip_record_group_memberships", index).await.unwrap(),
             "{index} is missing — a delta query on that column scans the whole table"
         );
     }
+    assert!(
+        simply_ip_vault::db::has_index(&db, "audit_logs", "idx_audit_logs_action_timestamp")
+            .await
+            .unwrap(),
+        "idx_audit_logs_action_timestamp is missing — action-filtered audit queries sort via a temp b-tree"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────

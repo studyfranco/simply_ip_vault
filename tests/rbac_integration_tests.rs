@@ -3052,6 +3052,33 @@ async fn test_audit_log_query_returns_entries_after_mutations() {
     assert_eq!(items[0]["action"], "IP_ADD");
     assert_eq!(items[0]["target_address"], "88.1.1.1");
     assert_eq!(items[0]["group_names"], "audit-check-group");
+
+    // Filter by acting key name
+    let req = signed(inject_connect_info(Request::builder()
+        .uri("/api/audit-logs?api_key=Master")
+        .header("X-API-Key", &master_key)), "");
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(items.len(), 1);
+
+    // Filter by timestamp range
+    let req = signed(inject_connect_info(Request::builder()
+        .uri("/api/audit-logs?since=2000-01-01T00:00:00Z&until=2099-01-01T00:00:00Z")
+        .header("X-API-Key", &master_key)), "");
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(items.len(), 1);
+
+    // Out-of-bounds timestamp returns 0 items
+    let req = signed(inject_connect_info(Request::builder()
+        .uri("/api/audit-logs?since=2099-01-01T00:00:00Z")
+        .header("X-API-Key", &master_key)), "");
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(items.len(), 0);
 }
 
 // ─────────────────────────────────────────────────────────────

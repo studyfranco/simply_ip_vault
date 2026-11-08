@@ -19,13 +19,17 @@ Introduced by `m20261006_120000_refactor_membership_state`. Where a table sectio
 Indexes that matter for the read path:
 
 - `idx_memberships_ip_group` UNIQUE on `(ip_record_id, group_id)`: one membership per address per group.
-- `idx_memberships_active_last_seen`: partial, `(group_id, last_seen_at DESC) WHERE is_deleted = FALSE`.
-  This serves the default listing and its count without a temp B-tree. Measured at 100k rows in
+- `idx_memberships_active_last_seen`: partial covering, `(group_id, last_seen_at DESC, id, …) WHERE is_deleted = FALSE`.
+  This serves the default listing (offset and keyset cursor) and its count without a temp B-tree. Measured at 100k rows in
   `tests/benchmark_tests.rs`: group-scoped page about 1.2 ms, group-scoped count about 2.3 ms.
+- `idx_memberships_group_last_seen` `(group_id, last_seen_at DESC, id)` and `idx_memberships_group_deleted_at`
+  `(group_id, deleted_at DESC, id) WHERE is_deleted = TRUE` (`m20261010_120000`): serve group-scoped differential
+  sync (`since` + `include_deleted=true`) via SQLite's `MULTI-INDEX OR` as well as `include_deleted=true` listings
+  without a temp B-tree.
 - `idx_group_memberships_lookup` `(group_id, ip_record_id)`: foreign-key child index for `group_id`.
-- `idx_memberships_deleted_at`: retention purge.
+- `idx_memberships_deleted_at`: retention purge and global differential sync on tombstones.
 - `idx_causes_membership_created` `(membership_id, created_at DESC)`: foreign-key child index and latest-cause lookup.
-- `idx-audit_logs-api_key_id`, `idx-webhook_configs-group_id`: foreign-key child indexes added by `m20261005_120000`.
+- `idx-audit_logs-api_key_id`, `idx_audit_logs_action_timestamp`, `idx-webhook_configs-group_id`: foreign-key child and composite audit indexes.
 
 Pragmas, set per connection and checked at boot (`src/db.rs`): `journal_mode=WAL`, `synchronous=NORMAL`,
 `foreign_keys=ON`, `busy_timeout=10000`, `temp_store=MEMORY`, `mmap_size=256 MB`, `cache_size=-64000`,

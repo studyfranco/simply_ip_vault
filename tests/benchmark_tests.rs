@@ -397,3 +397,115 @@ async fn keyset_cursor_plan_uses_covering_index_with_no_temp_b_tree_and_stays_fa
     );
 }
 
+#[tokio::test]
+async fn differential_sync_with_include_deleted_uses_multi_index_or_and_meets_10ms_budget() {
+    let _guard = bench_lock().lock().await;
+    let db = fresh_db().await;
+
+    // 1. Verify the query plans of the exact two slow statements from production logs:
+    //    `GET /api/ips?groups=<group>&since=<ts>&include_deleted=true&include_total=true`
+    let count_plan = explain(
+        &db,
+        "SELECT COUNT(*) AS row_count FROM ip_record_group_memberships
+         WHERE (group_id = x'00000000000000000000000000000001' AND last_seen_at >= '2099-01-01 00:00:00')
+            OR (group_id = x'00000000000000000000000000000001' AND is_deleted = TRUE AND deleted_at >= '2099-01-01 00:00:00')",
+    )
+    .await;
+    println!("differential sync count plan: {count_plan}");
+    assert!(
+        count_plan.contains("MULTI-INDEX OR"),
+        "differential sync count must use MULTI-INDEX OR rather than scanning the group: {count_plan}"
+    );
+    assert!(
+        count_plan.contains("idx_memberships_group_last_seen"),
+        "differential sync count must seek on idx_memberships_group_last_seen: {count_plan}"
+    );
+    assert!(
+        count_plan.contains("idx_memberships_group_deleted_at"),
+        "differential sync count must seek on idx_memberships_group_deleted_at: {count_plan}"
+    );
+
+    let select_plan = explain(
+        &db,
+        "SELECT m.id, r.target_address FROM ip_record_group_memberships m
+         INNER JOIN ip_records r ON m.ip_record_id = r.id
+         WHERE (m.group_id = x'00000000000000000000000000000001' AND m.last_seen_at >= '2099-01-01 00:00:00')
+            OR (m.group_id = x'00000000000000000000000000000001' AND m.is_deleted = TRUE AND m.deleted_at >= '2099-01-01 00:00:00')
+         ORDER BY m.last_seen_at DESC, m.id ASC
+         LIMIT 1000 OFFSET 0",
+    )
+    .await;
+    println!("differential sync select plan: {select_plan}");
+    assert!(
+        select_plan.contains("MULTI-INDEX OR"),
+        "differential sync select must use MULTI-INDEX OR rather than scanning the group: {select_plan}"
+    );
+    assert!(
+        select_plan.contains("idx_memberships_group_last_seen"),
+        "differential sync select must seek on idx_memberships_group_last_seen: {select_plan}"
+    );
+    assert!(
+        select_plan.contains("idx_memberships_group_deleted_at"),
+        "differential sync select must seek on idx_memberships_group_deleted_at: {select_plan}"
+    );
+
+    // 2. Measure the real SeaORM query execution time at 100k rows using `apply_group_and_since_scope`.
+    let g = bench_group_id(1);
+    let threshold = (chrono::Utc::now() + chrono::Duration::seconds(60)).naive_utc();
+    let cond = simply_ip_vault::api::apply_group_and_since_scope(
+        &sea_orm::Condition::all(),
+        Some(ip_record_group_membership::Column::GroupId.eq(g)),
+        Some(threshold),
+        true,
+    );
+
+    let diff_count = median(|| {
+        let cond = cond.clone();
+        let db = &db;
+        async move {
+            let n: Option<i64> = ip_record_group_membership::Entity::find()
+                .filter(cond)
+                .select_only()
+                .expr_as(Func::count(Expr::col(sea_orm::sea_query::Asterisk)), "row_count")
+                .into_tuple::<i64>()
+                .one(db)
+                .await
+                .unwrap();
+            n.unwrap_or(0)
+        }
+    })
+    .await;
+
+    let diff_page = median(|| {
+        let cond = cond.clone();
+        let db = &db;
+        async move {
+            ip_record_group_membership::Entity::find()
+                .join(JoinType::InnerJoin, ip_record_group_membership::Relation::IpRecord.def())
+                .select_also(ip_record::Entity)
+                .filter(cond)
+                .order_by_desc(ip_record_group_membership::Column::LastSeenAt)
+                .order_by_asc(ip_record_group_membership::Column::Id)
+                .limit(1000)
+                .offset(0)
+                .all(db)
+                .await
+                .unwrap()
+                .len()
+        }
+    })
+    .await;
+
+    println!(
+        "100k rows: differential sync (since + include_deleted=true) page median = {diff_page:?}, count median = {diff_count:?}"
+    );
+    assert!(
+        diff_page < BUDGET,
+        "differential sync page query took {diff_page:?}, budget is {BUDGET:?}"
+    );
+    assert!(
+        diff_count < BUDGET,
+        "differential sync count query took {diff_count:?}, budget is {BUDGET:?}"
+    );
+}
+
