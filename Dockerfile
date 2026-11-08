@@ -18,22 +18,17 @@ RUN set -x \
 RUN cargo build --release
 
 # Runtime stage
-FROM ghcr.io/studyfranco/docker-baseimages-debian:testing
+ARG BASE_IMAGE=debian:testing-slim
+FROM ${BASE_IMAGE}
 
 RUN set -x \
     && apt update \
     && apt dist-upgrade -y \
+    && DEBIAN_FRONTEND=noninteractive apt install -y ca-certificates libsqlite3-0 curl --no-install-recommends \
     && apt autopurge -yy \
     && apt clean autoclean -y \
-    && rm -rf /var/cache/* /var/lib/apt/lists/* /var/log/* /var/tmp/* /tmp/*
-
-# Install required certificates for TLS
-RUN set -x \
-    && apt update \
-    && DEBIAN_FRONTEND=noninteractive apt install -y ca-certificates libsqlite3-0 curl --no-install-recommends \
-    && apt clean autoclean -y \
-    && rm -rf /var/cache/* /var/lib/apt/lists/* /var/log/* /var/tmp/* /tmp/* \ 
-    && mkdir /app
+    && rm -rf /var/cache/* /var/lib/apt/lists/* /var/log/* /var/tmp/* /tmp/* \
+    && mkdir -p /app
 
 WORKDIR /app
 
