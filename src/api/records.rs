@@ -1922,3 +1922,35 @@ pub async fn batch_records(
 
     Ok(Json(summary))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guard_bannable_address_rejects_loopback_and_unspecified() {
+        assert!(guard_bannable_address(&"127.0.0.1/32".parse().unwrap()).is_err());
+        assert!(guard_bannable_address(&"127.0.0.0/8".parse().unwrap()).is_err());
+        assert!(guard_bannable_address(&"::1/128".parse().unwrap()).is_err());
+        assert!(guard_bannable_address(&"0.0.0.0/32".parse().unwrap()).is_err());
+        assert!(guard_bannable_address(&"::/128".parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn guard_bannable_address_rejects_rfc1918_and_link_local() {
+        assert!(guard_bannable_address(&"10.0.0.1/32".parse().unwrap()).is_err());
+        assert!(guard_bannable_address(&"172.16.5.0/24".parse().unwrap()).is_err());
+        assert!(guard_bannable_address(&"192.168.1.0/24".parse().unwrap()).is_err());
+        assert!(guard_bannable_address(&"169.254.10.1/32".parse().unwrap()).is_err());
+        assert!(guard_bannable_address(&"fe80::1/64".parse().unwrap()).is_err());
+        assert!(guard_bannable_address(&"fc00::1/64".parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn guard_bannable_address_accepts_public_routable_ips() {
+        assert!(guard_bannable_address(&"8.8.8.8/32".parse().unwrap()).is_ok());
+        assert!(guard_bannable_address(&"1.1.1.0/24".parse().unwrap()).is_ok());
+        assert!(guard_bannable_address(&"2606:4700:4700::1111/128".parse().unwrap()).is_ok());
+        assert!(guard_bannable_address(&"2001:4860:4860::8888/32".parse().unwrap()).is_ok());
+    }
+}

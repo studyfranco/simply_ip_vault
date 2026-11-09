@@ -341,3 +341,48 @@ pub struct ReassignOwnerPayload {
     /// The key to make the new owner, or `null` to leave the resource unowned.
     pub owner_key_id: Option<Uuid>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_cidr_or_ip_accepts_cidrs_and_bare_ips() {
+        assert_eq!(
+            parse_cidr_or_ip("192.168.1.0/24").unwrap(),
+            "192.168.1.0/24".parse::<IpNet>().unwrap()
+        );
+        assert_eq!(
+            parse_cidr_or_ip("10.0.0.1").unwrap(),
+            "10.0.0.1/32".parse::<IpNet>().unwrap()
+        );
+        assert_eq!(
+            parse_cidr_or_ip("2001:db8::/32").unwrap(),
+            "2001:db8::/32".parse::<IpNet>().unwrap()
+        );
+        assert_eq!(
+            parse_cidr_or_ip("::1").unwrap(),
+            "::1/128".parse::<IpNet>().unwrap()
+        );
+        assert!(parse_cidr_or_ip("invalid-cidr").is_err());
+    }
+
+    #[test]
+    fn normalize_ip_or_cidr_masks_host_bits_and_strips_single_host_prefix() {
+        // Masking unaligned host bits
+        assert_eq!(normalize_ip_or_cidr("192.168.1.55/24"), "192.168.1.0/24");
+        assert_eq!(normalize_ip_or_cidr("10.1.2.3/8"), "10.0.0.0/8");
+        assert_eq!(normalize_ip_or_cidr("2001:db8::cafe/64"), "2001:db8::/64");
+
+        // Single host stripped
+        assert_eq!(normalize_ip_or_cidr("192.168.1.1/32"), "192.168.1.1");
+        assert_eq!(normalize_ip_or_cidr("::1/128"), "::1");
+
+        // Bare IPs preserved
+        assert_eq!(normalize_ip_or_cidr("1.1.1.1"), "1.1.1.1");
+        assert_eq!(normalize_ip_or_cidr("2001:db8::1"), "2001:db8::1");
+
+        // Invalid passthrough
+        assert_eq!(normalize_ip_or_cidr("partial.address"), "partial.address");
+    }
+}
