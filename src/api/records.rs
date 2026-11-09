@@ -12,7 +12,7 @@ use axum::{
     response::IntoResponse,
 };
 use chrono::Utc;
-use ipnetwork::IpNetwork;
+use ipnet::IpNet;
 use sea_orm::{
     ActiveModelTrait,
     ActiveValue::Set,
@@ -75,7 +75,7 @@ pub async fn handle_ban(
 /// of them is either meaningless or actively harmful: a rule covering `127.0.0.1` or `10.0.0.0/8`
 /// propagates through the webhook dispatchers to every downstream firewall and can cut a fleet off
 /// from itself. Shared by the single-record and batch paths so neither can bypass it.
-pub(crate) fn guard_bannable_address(network: &IpNetwork) -> Result<(), AppError> {
+pub(crate) fn guard_bannable_address(network: &IpNet) -> Result<(), AppError> {
     let ip = network.network();
     if ip.is_loopback() || ip.is_unspecified() {
         return Err(AppError::InvalidInput(
@@ -155,9 +155,7 @@ pub(crate) async fn handle_ip_upsert(
     payload: BanWhitePayload,
     is_whitelist: bool,
 ) -> Result<impl IntoResponse, AppError> {
-    let network: IpNetwork = payload
-        .target_address
-        .parse()
+    let network: IpNet = super::support::parse_cidr_or_ip(&payload.target_address)
         .map_err(|_| AppError::InvalidInput("Invalid IP or CIDR format".to_owned()))?;
     let normalized_address = normalize_ip_or_cidr(&payload.target_address);
 
@@ -1621,7 +1619,7 @@ pub async fn batch_records(
         Vec::with_capacity(payload.records.len());
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for record in &payload.records {
-        let _network: IpNetwork = record.target_address.parse().map_err(|_| {
+        let _network: IpNet = super::support::parse_cidr_or_ip(&record.target_address).map_err(|_| {
             AppError::InvalidInput(format!(
                 "Invalid IP or CIDR format: {:?}",
                 record.target_address
@@ -1690,7 +1688,7 @@ pub async fn batch_records(
 
     if group.group_type != "whitelist" {
         for (address, _) in &normalized {
-            let network: IpNetwork = address.parse().map_err(|_| {
+            let network: IpNet = super::support::parse_cidr_or_ip(address).map_err(|_| {
                 AppError::InvalidInput(format!("Invalid IP or CIDR format: {address}"))
             })?;
             guard_bannable_address(&network)?;

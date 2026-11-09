@@ -9,7 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ipnetwork::IpNetwork;
+use ipnet::IpNet;
 use tokio::sync::RwLock;
 
 /// Default listen address: every interface.
@@ -514,7 +514,7 @@ pub struct InvalidTrustedProxies {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProxyMatcher {
     /// A literal address or CIDR range, matched directly.
-    Network(IpNetwork),
+    Network(IpNet),
     /// A hostname (`traefik`, `proxy.internal`) resolved via DNS.
     ///
     /// Kept as a name rather than resolved once at startup because that is the entire point: in
@@ -536,7 +536,7 @@ impl std::fmt::Display for ProxyMatcher {
 #[derive(Clone)]
 struct HostnameState {
     /// What the name resolved to, empty when the lookup failed.
-    addresses: Vec<IpNetwork>,
+    addresses: Vec<IpNet>,
     /// When the attempt ran.
     attempted_at: Instant,
     /// Whether it produced at least one address.
@@ -555,7 +555,7 @@ impl HostnameState {
 #[derive(Default)]
 struct ResolutionCache {
     /// Literal networks merged with whatever the hostnames currently resolve to.
-    snapshot: Arc<Vec<IpNetwork>>,
+    snapshot: Arc<Vec<IpNet>>,
     /// Per-hostname attempt state, which is what makes negative caching per-name rather than
     /// all-or-nothing: one dead entry must not force the healthy ones to be re-resolved on its
     /// short retry interval.
@@ -575,7 +575,7 @@ pub struct TrustedProxies {
     matchers: Arc<Vec<ProxyMatcher>>,
     /// Literal entries, precomputed. Also the complete answer when no hostnames are configured —
     /// the common case, served for the cost of an `Arc` clone and no lock at all.
-    networks: Arc<Vec<IpNetwork>>,
+    networks: Arc<Vec<IpNet>>,
     /// Hostname entries awaiting resolution.
     hostnames: Arc<Vec<String>>,
     /// Reuse window for a successful lookup.
@@ -596,7 +596,7 @@ impl std::fmt::Debug for ResolutionCache {
 impl TrustedProxies {
     /// Builds from an already-parsed matcher list.
     pub fn new(matchers: Vec<ProxyMatcher>) -> Self {
-        let networks: Vec<IpNetwork> = matchers
+        let networks: Vec<IpNet> = matchers
             .iter()
             .filter_map(|m| match m {
                 ProxyMatcher::Network(net) => Some(*net),
@@ -684,7 +684,7 @@ impl TrustedProxies {
     /// that without a DNS lookup per header entry, and so ends up skipping only the literal hops —
     /// which silently reports the inner proxy as the client in precisely the containerized topology
     /// hostname support exists to serve.
-    pub async fn resolved(&self) -> Arc<Vec<IpNetwork>> {
+    pub async fn resolved(&self) -> Arc<Vec<IpNet>> {
         if self.hostnames.is_empty() {
             return Arc::clone(&self.networks);
         }
@@ -832,12 +832,12 @@ impl TrustedProxies {
 /// currently trusted", which is the safe direction to fail in. A DNS outage must never be able to
 /// *widen* what the daemon believes, and a container that is down should stop being trusted rather
 /// than keep a stale grant alive.
-async fn resolve_hostname(hostname: &str) -> Vec<IpNetwork> {
+async fn resolve_hostname(hostname: &str) -> Vec<IpNet> {
     // Port 0: `lookup_host` wants a socket address, but only the address half is used.
     match tokio::net::lookup_host((hostname, 0u16)).await {
         Ok(addrs) => {
-            let networks: Vec<IpNetwork> =
-                addrs.map(|addr| IpNetwork::from(normalize_ip(addr.ip()))).collect();
+            let networks: Vec<IpNet> =
+                addrs.map(|addr| IpNet::from(normalize_ip(addr.ip()))).collect();
             if networks.is_empty() {
                 tracing::warn!(
                     "TRUSTED_PROXIES hostname {hostname:?} resolved to no addresses; it is not \
@@ -846,7 +846,7 @@ async fn resolve_hostname(hostname: &str) -> Vec<IpNetwork> {
             } else {
                 tracing::debug!(
                     "TRUSTED_PROXIES hostname {hostname:?} resolved to {}",
-                    networks.iter().map(|n| n.ip().to_string()).collect::<Vec<_>>().join(", ")
+                    networks.iter().map(|n| n.addr().to_string()).collect::<Vec<_>>().join(", ")
                 );
             }
             networks
@@ -879,10 +879,10 @@ pub fn parse_trusted_proxies(raw: &str) -> Result<Vec<ProxyMatcher>, Vec<Invalid
     let mut invalid = Vec::new();
 
     for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
-        if let Ok(net) = entry.parse::<IpNetwork>() {
+        if let Ok(net) = entry.parse::<IpNet>() {
             matchers.push(ProxyMatcher::Network(net));
         } else if let Ok(addr) = entry.parse::<IpAddr>() {
-            matchers.push(ProxyMatcher::Network(IpNetwork::from(addr)));
+            matchers.push(ProxyMatcher::Network(IpNet::from(addr)));
         } else {
             match hostname_rejection(entry) {
                 None => matchers.push(ProxyMatcher::Hostname(entry.to_owned())),
@@ -962,8 +962,8 @@ pub fn normalize_ip(ip: IpAddr) -> IpAddr {
 }
 
 /// Reports whether `ip` falls inside any of the `trusted` networks.
-fn is_trusted(ip: IpAddr, trusted: &[IpNetwork]) -> bool {
-    trusted.iter().any(|net| net.contains(ip))
+fn is_trusted(ip: IpAddr, trusted: &[IpNet]) -> bool {
+    trusted.iter().any(|net| net.contains(&ip))
 }
 
 /// Determines the client address to authorize against `bound_ips`, and to record in the audit trail.
@@ -997,7 +997,7 @@ fn is_trusted(ip: IpAddr, trusted: &[IpNetwork]) -> bool {
 pub fn resolve_client_ip(
     peer: IpAddr,
     headers: &axum::http::HeaderMap,
-    trusted: &[IpNetwork],
+    trusted: &[IpNet],
 ) -> IpAddr {
     let peer = normalize_ip(peer);
 
@@ -1130,7 +1130,7 @@ mod tests {
     }
 
     /// The literal networks in a parsed configuration, for assertions about parsing itself.
-    fn only_networks(entries: &str) -> Vec<IpNetwork> {
+    fn only_networks(entries: &str) -> Vec<IpNet> {
         parse(entries)
             .into_iter()
             .filter_map(|m| match m {
@@ -1148,8 +1148,8 @@ mod tests {
     fn bare_addresses_and_cidrs_both_parse() {
         let networks = only_networks("10.0.0.0/8, 192.168.1.5 ,, ::1");
         assert_eq!(networks.len(), 3, "empty entries are skipped, not counted");
-        assert!(networks[1].contains(ip("192.168.1.5")), "a bare address becomes a /32");
-        assert!(!networks[1].contains(ip("192.168.1.6")), "...and covers only itself");
+        assert!(networks[1].contains(&ip("192.168.1.5")), "a bare address becomes a /32");
+        assert!(!networks[1].contains(&ip("192.168.1.6")), "...and covers only itself");
     }
 
     #[test]
@@ -1331,7 +1331,7 @@ mod tests {
         const NEGATIVE: Duration = Duration::from_secs(5);
 
         let fresh = HostnameState {
-            addresses: vec![IpNetwork::from(ip("127.0.0.1"))],
+            addresses: vec![IpNet::from(ip("127.0.0.1"))],
             attempted_at: Instant::now(),
             resolved: true,
         };

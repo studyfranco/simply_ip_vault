@@ -6,7 +6,7 @@
 
 use axum::{Extension, extract::{Json, State}, response::IntoResponse};
 use chrono::Utc;
-use ipnetwork::IpNetwork;
+use ipnet::IpNet;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryFilter,
     sea_query::OnConflict,
@@ -219,7 +219,7 @@ pub async fn create_api_key(
 
     if let Some(bips) = &payload.bound_ips {
         for cidr in bips.split(',') {
-            let _ : IpNetwork = cidr.trim().parse()
+            let _: IpNet = super::support::parse_cidr_or_ip(cidr)
                 .map_err(|_| AppError::InvalidInput(format!("Invalid CIDR: {}", cidr)))?;
         }
     }
@@ -1007,7 +1007,7 @@ pub async fn update_api_key(
 
     if let Some(bips) = &payload.bound_ips {
         for cidr in bips.split(',') {
-            let _: IpNetwork = cidr.trim().parse()
+            let _: IpNet = super::support::parse_cidr_or_ip(cidr)
                 .map_err(|_| AppError::InvalidInput(format!("Invalid CIDR: {cidr}")))?;
         }
     }

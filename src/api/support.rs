@@ -13,7 +13,7 @@
 //! shared", which is the monolith problem again one level down.
 
 use chrono::Utc;
-use ipnetwork::IpNetwork;
+use ipnet::IpNet;
 use rand::RngExt;
 use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, sea_query::OnConflict};
 use serde::Deserialize;
@@ -93,21 +93,35 @@ pub fn hash_key(key: &str) -> String {
 /// it does not validate — callers that must reject malformed input parse it themselves (see
 /// [`super::records::guard_bannable_address`] and the batch endpoint, which both do), and callers
 /// using it for a best-effort match need a bare fragment like `"74.128"` to pass through untouched.
+/// Parses a string as either a CIDR network or a bare IP address, promoting bare addresses
+/// to `/32` or `/128`.
+pub fn parse_cidr_or_ip(raw: &str) -> Result<IpNet, ()> {
+    let trimmed = raw.trim();
+    if let Ok(net) = trimmed.parse::<IpNet>() {
+        return Ok(net);
+    }
+    if let Ok(addr) = trimmed.parse::<std::net::IpAddr>() {
+        return Ok(IpNet::from(addr));
+    }
+    Err(())
+}
+
+/// Normalizes a bare IP address or CIDR subnet to a canonical string form (`/32`/`/128` singles
+/// stored without a prefix, everything else keeps its prefix length and masks host bits).
 pub fn normalize_ip_or_cidr(input: &str) -> String {
-    match input.parse::<IpNetwork>() {
-        Ok(net) => {
-            let is_single_host =
-                (net.is_ipv4() && net.prefix() == 32) || (net.is_ipv6() && net.prefix() == 128);
-            if is_single_host {
-                // `network()` would return the same value here, but `ip()` says what is meant: a
-                // single host, with the redundant prefix dropped.
-                net.ip().to_string()
-            } else {
-                // `network()` applies the prefix mask, including for non-byte-aligned lengths.
-                format!("{}/{}", net.network(), net.prefix())
-            }
+    let trimmed = input.trim();
+    if let Ok(net) = trimmed.parse::<IpNet>() {
+        let is_single_host = (net.addr().is_ipv4() && net.prefix_len() == 32)
+            || (net.addr().is_ipv6() && net.prefix_len() == 128);
+        if is_single_host {
+            net.addr().to_string()
+        } else {
+            format!("{}/{}", net.network(), net.prefix_len())
         }
-        Err(_) => input.to_owned(),
+    } else if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
+        ip.to_string()
+    } else {
+        input.to_owned()
     }
 }
 

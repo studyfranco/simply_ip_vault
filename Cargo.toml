@@ -11,7 +11,7 @@ tokio = { version = "1", features = ["full"] }
 # not dead weight, even though SQLite is the zero-config default this suite runs on.
 sea-orm = { version = "2", features = ["sqlx-postgres", "sqlx-mysql", "sqlx-sqlite", "runtime-tokio-rustls", "macros", "with-uuid", "with-chrono"] }
 sea-orm-migration = { version = "2", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
-ipnetwork = "0.21"
+ipnet = "2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -59,6 +59,6 @@ tempfile = "3"
 # left the whole test suite unable to compile — every gate failing before a single assertion ran.
 # A syntax checker that stops the build for reasons unrelated to syntax is worse than no checker, so
 # this one does not float.
-oxc_allocator = "=0.152.0"
-oxc_parser = "=0.152.0"
-oxc_span = "=0.152.0"
+oxc_allocator = "0.158"
+oxc_parser = "0.158"
+oxc_span = "0.158"

@@ -9,7 +9,7 @@ use axum::{
 };
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use sha2::{Digest, Sha256};
-use ipnetwork::IpNetwork;
+use ipnet::IpNet;
 
 use crate::crypto::{self, MAX_TIMESTAMP_SKEW_SECS};
 use crate::entities::prelude::ApiKey;
@@ -279,11 +279,16 @@ pub async fn auth_middleware(
 
     // Now that the caller has proven it holds the signing secret, authorize its source network.
     let bound_ips_str = key_record.bound_ips.as_deref().unwrap_or("");
-    let networks: Vec<IpNetwork> = bound_ips_str
+    let networks: Vec<IpNet> = bound_ips_str
         .split(',')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
-        .map(|s| s.parse())
+        .map(|s| {
+            s.parse::<IpNet>().or_else(|_| {
+                s.parse::<std::net::IpAddr>()
+                    .map(|ip| IpNet::from(crate::config::normalize_ip(ip)))
+            })
+        })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| {
             tracing::error!("Invalid CIDR in database: {:?}", key_record.bound_ips);
@@ -295,7 +300,7 @@ pub async fn auth_middleware(
     // powerful credential in the system the only one whose network restriction was decorative —
     // and it silently ignored a restriction an operator had explicitly configured, which is worse
     // than never offering the field.
-    let is_allowed = networks.is_empty() || networks.iter().any(|net| net.contains(client_ip));
+    let is_allowed = networks.is_empty() || networks.iter().any(|net| net.contains(&client_ip));
 
     if !is_allowed {
         tracing::warn!(
