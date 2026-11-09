@@ -21,7 +21,7 @@
 # is logged with a timestamp, method, full URL, color-coded status, and jq-formatted body.
 #
 # Usage: ./scripts/test_e2e.sh
-# Requires: curl, jq. Needs port 3000 free, or BASE_URL pointed at a free one (BIND_HOST/PORT
+# Requires: curl, jq, cargo, openssl, cargo-audit. Needs port 3000 free, or BASE_URL pointed at a free one (BIND_HOST/PORT
 # configure the listen address;
 # this suite uses the default and boots its throwaway instances on higher ports).
 # Optional: python3 (only for live webhook-delivery verification in §13; that one section degrades
@@ -40,6 +40,8 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+# Ensure local cargo-installed binaries (e.g. cargo-audit in ~/.cargo/bin) are on PATH
+export PATH="$HOME/.cargo/bin:$PATH"
 # 127.0.0.1 rather than "localhost": avoids any IPv6 (::1) resolution first-try delay against a
 # server that only ever binds the IPv4 wildcard address.
 BASE_URL="${BASE_URL:-http://127.0.0.1:3000}"
@@ -398,6 +400,15 @@ for bin in curl jq cargo openssl; do
     log "Found $bin: $(command -v "$bin")"
 done
 
+if ! command -v cargo-audit >/dev/null 2>&1 && ! cargo audit --version >/dev/null 2>&1; then
+    log "cargo-audit not found on PATH; attempting to install via 'cargo install cargo-audit'..."
+    if ! cargo install cargo-audit; then
+        err "cargo-audit is required for dependency security audits but is missing and could not be installed."
+        exit 1
+    fi
+fi
+log "Found cargo-audit: $(command -v cargo-audit 2>/dev/null || echo "cargo audit subcommand")"
+
 pick_port
 log "Main instance will listen on port $VAULT_PORT ($BASE_URL)"
 
@@ -410,6 +421,29 @@ if command -v python3 >/dev/null 2>&1; then
 else
     warn "python3 not found — live webhook-delivery verification (§13) will be skipped."
 fi
+
+# ── Dependencies & Security Audit ────────────────────────────────────────────
+
+log_section "Dependencies & Security Audit"
+
+log "Running cargo update in $PROJECT_ROOT ..."
+if ! (cd "$PROJECT_ROOT" && cargo update >"$WORK_DIR/cargo_update.log" 2>&1); then
+    err "cargo update failed:"
+    cat "$WORK_DIR/cargo_update.log" >&2
+    exit 1
+fi
+log "cargo update succeeded."
+
+log "Running cargo audit in $PROJECT_ROOT ..."
+# RUSTSEC-2026-0459: upstream unpatched SQLite CVE in libsqlite3-sys 0.37.0 transitively pinned by
+# sqlx-sqlite 0.9.0 (which restricts libsqlite3-sys <0.38.0). Ignored until sqlx publishes a patch release.
+AUDIT_ARGS=(${CARGO_AUDIT_ARGS:---ignore RUSTSEC-2026-0459})
+if ! (cd "$PROJECT_ROOT" && cargo audit "${AUDIT_ARGS[@]}" >"$WORK_DIR/cargo_audit.log" 2>&1); then
+    err "cargo audit detected vulnerabilities or failed:"
+    cat "$WORK_DIR/cargo_audit.log" >&2
+    exit 1
+fi
+log "cargo audit passed cleanly."
 
 # ── Build & start ────────────────────────────────────────────────────────────
 
