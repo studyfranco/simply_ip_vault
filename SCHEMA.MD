@@ -24,8 +24,9 @@ Indexes that matter for the read path:
   `tests/benchmark_tests.rs`: group-scoped page about 1.2 ms, group-scoped count about 2.3 ms.
 - `idx_memberships_global_active_last_seen`: partial covering, `(last_seen_at DESC, id ASC, group_id, …) WHERE is_deleted = FALSE`
   (`m20261011_120000`): serves global active listings (`GET /api/ips`) in exact sort order without a temp B-tree (< 1 ms).
-- `idx_memberships_is_deleted` on `(is_deleted)` (`m20261011_120000`): compact single-column index serving global active/trash
-  row count queries (`SELECT COUNT(*) FROM ip_record_group_memberships WHERE is_deleted = ?`) via index range search (< 2 ms).
+- `idx_memberships_is_deleted_last_seen` on `(is_deleted, last_seen_at DESC, id ASC)` (`m20261012_120000`):
+  serves global active/trash row count queries (`SELECT COUNT(*) FROM ip_record_group_memberships WHERE is_deleted = ?`)
+  via covering index range search (< 2 ms) and guarantees pre-sorted order for unfiltered master listings.
 - `idx_memberships_global_last_seen` `(last_seen_at DESC, id ASC)` and `idx_memberships_global_deleted_at`
   `(deleted_at DESC, id ASC) WHERE is_deleted = TRUE` (`m20261011_120000`): serve global differential sync and unfiltered listings
   under `include_deleted=true` without a temp B-tree.
@@ -41,9 +42,9 @@ Indexes that matter for the read path:
 Pragmas, set per connection and checked at boot (`src/db.rs`): `journal_mode=WAL`, `synchronous=NORMAL`,
 `foreign_keys=ON`, `busy_timeout=10000`, `temp_store=MEMORY`, `mmap_size=512 MB`, `cache_size=-131072`.
 Incremental auto-vacuum (`auto_vacuum=INCREMENTAL`) is handled once at boot during migration via `ensure_incremental_auto_vacuum`,
-preventing connection-time exclusive schema lock requests. `PRAGMA optimize(0x10002)` runs in the background after boot
-to ensure all tables and indexes receive up-to-date planner statistics. The maintenance worker
-(`src/maintenance.rs`) runs `incremental_vacuum(1000)` and `wal_checkpoint(TRUNCATE)` every 12 hours.
+preventing connection-time exclusive schema lock requests. Standard `PRAGMA optimize` runs safely in the background after boot
+and every 12 hours during maintenance. The maintenance worker (`src/maintenance.rs`) runs bounded `incremental_vacuum(250)` (< 1s),
+`wal_checkpoint(TRUNCATE)`, and `PRAGMA optimize` every 12 hours.
 
 The membership migration is not reversible. Membership state cannot be split back onto a shared address row
 without choosing which group's copy wins, so `down` returns an error.

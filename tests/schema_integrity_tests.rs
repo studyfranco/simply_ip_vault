@@ -1183,8 +1183,8 @@ async fn list_ips_query_plan_uses_indexes_not_a_temp_b_tree_or_table_scan() {
     assert!(
         unfiltered_plan
             .iter()
-            .any(|l| l.contains("idx-irgm-last_seen_at") || l.contains("idx_memberships_global_active_last_seen")),
-        "the unfiltered master listing must be ordered by idx-irgm-last_seen_at or idx_memberships_global_active_last_seen: {unfiltered_plan:?}"
+            .any(|l| l.contains("idx-irgm-last_seen_at") || l.contains("idx_memberships_global_active_last_seen") || l.contains("idx_memberships_is_deleted_last_seen")),
+        "the unfiltered master listing must be ordered by idx-irgm-last_seen_at or idx_memberships_is_deleted_last_seen: {unfiltered_plan:?}"
     );
 
     // The bare group-scoped lookup every RBAC accessible-groups filter (and the `full_replace`
@@ -1802,6 +1802,7 @@ async fn the_delta_sync_columns_are_indexed() {
         "idx_memberships_global_deleted_at",
         "idx_memberships_group_last_seen",
         "idx_memberships_group_deleted_at",
+        "idx_memberships_is_deleted_last_seen",
     ] {
         assert!(
             simply_ip_vault::db::has_index(&db, "ip_record_group_memberships", index).await.unwrap(),

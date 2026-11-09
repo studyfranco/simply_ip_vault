@@ -531,25 +531,19 @@ pub async fn apply_sqlite_pragmas(db: &DatabaseConnection) -> Result<(), DbErr> 
 }
 
 /// Runs `PRAGMA optimize`, which refreshes the planner's statistics for tables whose data has
-/// changed enough to matter — including giving a freshly-created index its first statistics,
-/// which is what keeps the partial-index plans in `schema_integrity_tests.rs` honest as the data
-/// grows. Usually cheap, but **not always**: right after a migration adds new indexes to a large
-/// table, it has to analyze all of them from scratch, which measured in the tens of seconds to
-/// over a minute on a multi-million-row table on spinning disk.
+/// changed enough to matter — including giving a freshly-created index its first statistics.
 ///
-/// Deliberately **not** part of [`apply_sqlite_pragmas`], and not awaited by [`main`] before it
-/// binds the HTTP listener or spawns the background workers: this runs in its own task, so a slow
-/// first-time analysis delays neither request handling nor a worker whose own queries would
-/// otherwise queue behind it and risk `SQLITE_BUSY`. Call it once per boot, after
-/// `apply_sqlite_pragmas` has returned.
+/// Plain `PRAGMA optimize;` (without forcing bit `0x10000`, which forces an unconditional,
+/// full-database re-analysis that blocks multi-million-row databases for 15+ minutes) is very fast
+/// (< 1ms when tables are already analyzed) and safe to run in the background.
 pub async fn optimize_in_background(db: DatabaseConnection) {
     if db.get_database_backend() != DatabaseBackend::Sqlite {
         return;
     }
     tracing::info!("SQLite planner statistics refresh (PRAGMA optimize) started in the background.");
     let started = std::time::Instant::now();
-    match db.execute_raw(Statement::from_string(DatabaseBackend::Sqlite, "PRAGMA optimize(0x10002);".to_owned())).await {
-        Ok(_) => tracing::info!("SQLite planner statistics refreshed (PRAGMA optimize) in {:?}.", started.elapsed()),
+    match run_sqlite_optimize(&db).await {
+        Ok(()) => tracing::info!("SQLite planner statistics refreshed (PRAGMA optimize) in {:?}.", started.elapsed()),
         Err(e) => tracing::warn!("Could not run PRAGMA optimize: {e}."),
     }
 }
@@ -614,6 +608,18 @@ pub async fn wal_checkpoint_truncate(db: &DatabaseConnection) -> Result<(), DbEr
         return Ok(());
     }
     db.execute_unprepared("PRAGMA wal_checkpoint(TRUNCATE);").await?;
+    Ok(())
+}
+
+/// Refreshes SQLite query planner statistics (`PRAGMA optimize`).
+///
+/// Plain `PRAGMA optimize;` runs fast (< 1ms) because it only analyzes tables whose content has
+/// significantly changed and which were queried, without forcing a whole-database lock.
+pub async fn run_sqlite_optimize(db: &DatabaseConnection) -> Result<(), DbErr> {
+    if db.get_database_backend() != DatabaseBackend::Sqlite {
+        return Ok(());
+    }
+    db.execute_unprepared("PRAGMA optimize;").await?;
     Ok(())
 }
 

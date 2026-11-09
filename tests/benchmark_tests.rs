@@ -535,6 +535,17 @@ async fn global_listing_and_count_have_no_temp_b_tree_and_meet_10ms_budget_at_10
         "global active select must use the covering index: {select_plan}"
     );
 
+    let count_plan = explain(
+        &db,
+        "SELECT COUNT(*) AS row_count FROM ip_record_group_memberships WHERE is_deleted = 0",
+    )
+    .await;
+    println!("global active count plan: {count_plan}");
+    assert!(
+        count_plan.contains("idx_memberships_is_deleted_last_seen"),
+        "global active count must search idx_memberships_is_deleted_last_seen: {count_plan}"
+    );
+
     // 2. Measure execution time across 100k rows.
     let global_page = median(|| {
         let db = &db;
