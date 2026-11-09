@@ -224,7 +224,8 @@ async fn full_replace_sweep_query_plans_without_a_table_scan_at_scale() {
         plan.contains("idx_memberships_active_locked")
             || plan.contains("idx_group_memberships_lookup")
             || plan.contains("idx-irgm-group_id")
-            || plan.contains("idx_memberships_active_last_seen"),
+            || plan.contains("idx_memberships_active_last_seen")
+            || plan.contains("idx_memberships_group_is_deleted_last_seen"),
         "must use one of the group_id-leading indexes: {plan}"
     );
 }
@@ -254,4 +255,33 @@ async fn group_name_resolution_and_scoped_listing_plan_cleanly() {
     let plan = explain(&db, "SELECT * FROM ip_groups WHERE name = 'audit-group-1'").await;
     println!("group name resolution plan: {plan}");
     assert!(!plan.contains("SCAN ip_groups"), "group name lookup must not scan the groups table: {plan}");
+
+    // Verify single-group count and listing use idx_memberships_group_is_deleted_last_seen
+    let count_plan = explain(
+        &db,
+        "SELECT COUNT(*) AS row_count FROM ip_record_group_memberships WHERE is_deleted = ? AND group_id = ?",
+    )
+    .await;
+    println!("single group count plan: {count_plan}");
+    assert!(
+        count_plan.contains("idx_memberships_group_is_deleted_last_seen"),
+        "single group count must use idx_memberships_group_is_deleted_last_seen: {count_plan}"
+    );
+
+    let list_plan = explain(
+        &db,
+        "SELECT m.id, m.ip_record_id, m.group_id, m.is_locked, m.created_at, m.last_seen_at, m.is_deleted, m.deleted_at, m.deleted_by, \
+         r.id, r.target_address, r.created_at \
+         FROM ip_record_group_memberships m \
+         INNER JOIN ip_records r ON m.ip_record_id = r.id \
+         WHERE m.is_deleted = ? AND m.group_id = ? \
+         ORDER BY m.last_seen_at DESC, m.id ASC LIMIT 50 OFFSET 0",
+    )
+    .await;
+    println!("single group list plan: {list_plan}");
+    assert!(
+        list_plan.contains("idx_memberships_group_is_deleted_last_seen"),
+        "single group list must use idx_memberships_group_is_deleted_last_seen: {list_plan}"
+    );
+    assert!(!list_plan.contains("TEMP B-TREE"), "single group list must not sort through a temp b-tree: {list_plan}");
 }

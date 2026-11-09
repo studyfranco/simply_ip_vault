@@ -221,7 +221,9 @@ fn build_sqlite_connect_options(db_url: &str) -> Result<SqliteConnectOptions, Db
         // `SQLITE_MMAP_SIZE_BYTES_ENV`'s doc comment for the default and how to override it.
         .pragma("mmap_size", sqlite_mmap_size_bytes().to_string())
         // Page cache per connection (negative = KiB). See `SQLITE_CACHE_SIZE_KIB_ENV`.
-        .pragma("cache_size", format!("-{}", sqlite_cache_size_kib())))
+        .pragma("cache_size", format!("-{}", sqlite_cache_size_kib()))
+        // Limits ANALYZE and PRAGMA optimize sampling so multi-million row databases do not block.
+        .pragma("analysis_limit", "1000"))
 }
 
 /// Runs every pending migration on a dedicated pool that opens with exactly one connection, applies
@@ -500,6 +502,7 @@ pub async fn apply_sqlite_pragmas(db: &DatabaseConnection) -> Result<(), DbErr> 
         ("synchronous mode", "PRAGMA synchronous=NORMAL;".to_owned()),
         ("busy timeout", format!("PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS};")),
         ("temp store", "PRAGMA temp_store=MEMORY;".to_owned()),
+        ("analysis limit", "PRAGMA analysis_limit=1000;".to_owned()),
     ] {
         if let Err(e) =
             db.execute_raw(Statement::from_string(DatabaseBackend::Sqlite, statement)).await
@@ -619,7 +622,7 @@ pub async fn run_sqlite_optimize(db: &DatabaseConnection) -> Result<(), DbErr> {
     if db.get_database_backend() != DatabaseBackend::Sqlite {
         return Ok(());
     }
-    db.execute_unprepared("PRAGMA optimize;").await?;
+    db.execute_unprepared("PRAGMA analysis_limit=1000; PRAGMA optimize;").await?;
     Ok(())
 }
 

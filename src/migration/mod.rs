@@ -26,6 +26,7 @@ mod m20261009_120000_make_listing_indexes_covering;
 mod m20261010_120000_add_differential_sync_indexes;
 mod m20261011_120000_optimize_global_listing_and_counts;
 mod m20261012_120000_add_memberships_is_deleted_index;
+mod m20261013_120000_add_group_is_deleted_last_seen_index;
 
 /// The ordered set of all schema migrations for `simply_ip_vault`.
 pub struct Migrator;
@@ -59,6 +60,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261010_120000_add_differential_sync_indexes::Migration),
             Box::new(m20261011_120000_optimize_global_listing_and_counts::Migration),
             Box::new(m20261012_120000_add_memberships_is_deleted_index::Migration),
+            Box::new(m20261013_120000_add_group_is_deleted_last_seen_index::Migration),
         ]
     }
 }

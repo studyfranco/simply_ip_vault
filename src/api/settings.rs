@@ -5,12 +5,30 @@ use axum::Extension;
 use axum::Json;
 use axum::extract::State;
 use axum::response::IntoResponse;
-use sea_orm::{EntityTrait, PaginatorTrait};
+use sea_orm::{
+    ConnectionTrait, EntityTrait, QuerySelect,
+    sea_query::{Asterisk, Expr, Func},
+};
 use serde::Serialize;
 
 use crate::entities::{api_key, audit_log, ip_group, ip_record, webhook_config, webhook_execution};
 use crate::error::AppError;
 use crate::state::AppState;
+
+/// Counts rows directly using `SELECT COUNT(*) FROM <table>` without allocating a subquery.
+async fn count_entity<E, C>(db: &C) -> Result<u64, AppError>
+where
+    E: EntityTrait,
+    C: ConnectionTrait,
+{
+    let count: Option<i64> = E::find()
+        .select_only()
+        .expr_as(Func::count(Expr::col(Asterisk)), "num_items")
+        .into_tuple::<i64>()
+        .one(db)
+        .await?;
+    Ok(std::cmp::max(count.unwrap_or(0), 0) as u64)
+}
 
 /// Runtime system configuration and entity counts shown on the System Settings tab.
 #[derive(Debug, Serialize)]
@@ -52,12 +70,12 @@ pub async fn get_settings(
         ));
     }
 
-    let ip_record_count = ip_record::Entity::find().count(&state.db).await?;
-    let ip_group_count = ip_group::Entity::find().count(&state.db).await?;
-    let api_key_count = api_key::Entity::find().count(&state.db).await?;
-    let webhook_count = webhook_config::Entity::find().count(&state.db).await?;
-    let execution_count = webhook_execution::Entity::find().count(&state.db).await?;
-    let audit_log_count = audit_log::Entity::find().count(&state.db).await?;
+    let ip_record_count = count_entity::<ip_record::Entity, _>(&state.db).await?;
+    let ip_group_count = count_entity::<ip_group::Entity, _>(&state.db).await?;
+    let api_key_count = count_entity::<api_key::Entity, _>(&state.db).await?;
+    let webhook_count = count_entity::<webhook_config::Entity, _>(&state.db).await?;
+    let execution_count = count_entity::<webhook_execution::Entity, _>(&state.db).await?;
+    let audit_log_count = count_entity::<audit_log::Entity, _>(&state.db).await?;
 
     Ok(Json(SettingsResponse {
         trusted_proxies: state.trusted_proxies.matchers().iter().map(ToString::to_string).collect(),

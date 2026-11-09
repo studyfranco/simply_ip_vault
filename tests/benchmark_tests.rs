@@ -206,7 +206,10 @@ async fn group_scoped_list_plan_has_no_temp_b_tree() {
     .await;
     println!("list plan: {plan}");
     assert!(!plan.contains("TEMP B-TREE"), "list query sorts through a temp b-tree: {plan}");
-    assert!(plan.contains("idx_memberships_active_last_seen"), "list query must use the partial index: {plan}");
+    assert!(
+        plan.contains("idx_memberships_active_last_seen") || plan.contains("idx_memberships_group_is_deleted_last_seen"),
+        "list query must use an active last seen index: {plan}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -340,8 +343,9 @@ async fn keyset_cursor_plan_uses_covering_index_with_no_temp_b_tree_and_stays_fa
         "cursor query must not sort through a temp b-tree: {plan}"
     );
     assert!(
-        plan.contains("USING COVERING INDEX idx_memberships_active_last_seen"),
-        "cursor query must use the covering partial index: {plan}"
+        plan.contains("USING COVERING INDEX idx_memberships_active_last_seen")
+            || plan.contains("USING COVERING INDEX idx_memberships_group_is_deleted_last_seen"),
+        "cursor query must use the covering index: {plan}"
     );
     assert!(
         plan.contains("last_seen_at<?"),

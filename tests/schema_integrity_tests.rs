@@ -1143,8 +1143,8 @@ async fn list_ips_query_plan_uses_indexes_not_a_temp_b_tree_or_table_scan() {
     )
     .await;
     assert!(
-        scoped_plan.iter().any(|l| l.contains("idx_memberships_active_last_seen")),
-        "a group-scoped listing must use the partial (group_id, last_seen_at) index: {scoped_plan:?}"
+        scoped_plan.iter().any(|l| l.contains("idx_memberships_active_last_seen") || l.contains("idx_memberships_group_is_deleted_last_seen")),
+        "a group-scoped listing must use the partial (group_id, last_seen_at) index or covering group is_deleted index: {scoped_plan:?}"
     );
     assert!(
         !scoped_plan.iter().any(|l| l.contains("TEMP B-TREE")),
@@ -1203,6 +1203,7 @@ async fn list_ips_query_plan_uses_indexes_not_a_temp_b_tree_or_table_scan() {
                 || l.contains("idx_memberships_active_last_seen")
                 || l.contains("idx_memberships_active_locked")
                 || l.contains("idx-irgm-group_id")
+                || l.contains("idx_memberships_group_is_deleted_last_seen")
         }),
         "the group_id lookup must use one of the group_id-leading indexes: {group_lookup_plan:?}"
     );
@@ -1803,6 +1804,7 @@ async fn the_delta_sync_columns_are_indexed() {
         "idx_memberships_group_last_seen",
         "idx_memberships_group_deleted_at",
         "idx_memberships_is_deleted_last_seen",
+        "idx_memberships_group_is_deleted_last_seen",
     ] {
         assert!(
             simply_ip_vault::db::has_index(&db, "ip_record_group_memberships", index).await.unwrap(),
