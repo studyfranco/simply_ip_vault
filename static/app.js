@@ -741,7 +741,16 @@ class FirewallClient {
         // avoid the anti-replay guard (see the class doc comment above).
         const method = (options.method || 'GET').toUpperCase();
         const rawBody = options.body ?? '';
-        const timestamp = Math.floor(Date.now() / 1000).toString();
+        let nowSec = Math.floor(Date.now() / 1000);
+        // Avoid sending the exact same timestamp on rapid repeated requests with the same URL & body,
+        // which produces identical HMAC signatures and triggers a 401 Replay rejection.
+        const reqSigKey = `${method} ${endpoint} ${rawBody}`;
+        if (this._lastSigKey === reqSigKey && typeof this._lastSigSec === 'number' && nowSec <= this._lastSigSec) {
+            nowSec = this._lastSigSec + 1;
+        }
+        this._lastSigKey = reqSigKey;
+        this._lastSigSec = nowSec;
+        const timestamp = nowSec.toString();
 
         const headers = {
             'Content-Type': 'application/json',
@@ -785,17 +794,23 @@ class FirewallClient {
         }
 
         const looksLikeGenuineApiError = data && typeof data === 'object' && typeof data.error === 'string';
+        const isReplayOrTimestampError = looksLikeGenuineApiError && (
+            data.error.includes('already been used') ||
+            data.error.includes('outside the permitted') ||
+            data.error.includes('X-Timestamp')
+        );
 
         // Genuine 401: the credential itself was rejected. Unrecoverable — log out.
-        if (res.status === 401 && looksLikeGenuineApiError) {
+        // A replay rejection or timestamp collision is a transient duplicate request, NOT an invalid key/secret.
+        if (res.status === 401 && looksLikeGenuineApiError && !isReplayOrTimestampError) {
             this.handleAuthFailure();
             throw new Error("Session expired or invalid API key — please log in again.");
         }
 
-        // A 401 that does not carry this server's own error shape, or any 5xx, is transient — a
+        // A replay rejection, timestamp skew, a 401 that does not carry this server's own error shape, or any 5xx, is transient — a
         // gateway/proxy artifact or a genuine server-side overload, neither of which says the
         // credential is bad.
-        if (res.status >= 500 || (res.status === 401 && !looksLikeGenuineApiError)) {
+        if (res.status >= 500 || (res.status === 401 && (!looksLikeGenuineApiError || isReplayOrTimestampError))) {
             const reason = looksLikeGenuineApiError ? data.error : `HTTP ${res.status}`;
             return this._retryTransientFailureOrGiveUp(endpoint, options, attempt, new Error(reason));
         }
@@ -1876,9 +1891,15 @@ class FirewallClient {
     // Shared by every pagination control: move, re-render, resync. Kept in one place so the five
     // buttons and the page input cannot drift into slightly different refresh behaviour.
     async gotoIpPage(mutate) {
-        await mutate(this.ipCache);
-        this.renderIpTable();
-        this.updatePaginationUI();
+        if (this._paginationBusy) return;
+        this._paginationBusy = true;
+        try {
+            await mutate(this.ipCache);
+            this.renderIpTable();
+            this.updatePaginationUI();
+        } finally {
+            this._paginationBusy = false;
+        }
     }
 
     // ───────────────────────────────────────────────────────
