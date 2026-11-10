@@ -1,0 +1,8 @@
+# cargo-audit configuration for simply_ip_vault
+# Documents known upstream transitive dependencies awaiting upstream crate patch releases.
+
+[advisories]
+ignore = [
+    # Upstream transitive dependency via sqlx-sqlite 0.9.0; awaiting sqlx release with libsqlite3-sys >= 0.39.0
+    "RUSTSEC-2026-0459",
+]

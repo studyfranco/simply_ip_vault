@@ -521,7 +521,12 @@ class FirewallClient {
             // for the new webhook once the secret has been copied, rather than stacking both modals
             // at once. `null` the rest of the time, including after key-rotation's own use of the
             // same reveal modal.
-            pendingCloneEditId: null
+            pendingCloneEditId: null,
+            analyticsData: null,
+            intersectionPage: 0,
+            intersectionLimit: 25,
+            intersectionTotal: 0,
+            intersectionSelectedGroups: []
         };
 
         // IP records and audit logs are both large, append-only lists — fetched from the server
@@ -983,6 +988,13 @@ class FirewallClient {
         const showAdminInfo = p.is_master || p.can_manage_keys || p.can_manage_webhooks;
         groupsTab.style.display = showAdminInfo ? 'inline-block' : 'none';
 
+        // Statistiques & Récidive tab
+        const analyticsTab = document.getElementById('analytics-tab-btn');
+        if (analyticsTab) {
+            const showAnalytics = p.is_master || (p.group_permissions && p.group_permissions.length > 0) || p.can_create_groups;
+            analyticsTab.style.display = showAnalytics ? 'inline-block' : 'none';
+        }
+
         // API Keys & Permissions tab
         keysTab.style.display = (p.is_master || p.can_manage_keys) ? 'inline-block' : 'none';
 
@@ -1175,6 +1187,7 @@ class FirewallClient {
             this.state.selectedGroupIds.clear();
             this.state.groups = await this.apiFetch('/groups');
             this.renderGroupsTable();
+            this.renderIntersectionGroupCheckboxes();
             // manage-rights-group and the IP filter both operate on group NAME (the API's
             // group_name field is flexible/name-based); the webhook target needs the real UUID,
             // since CreateWebhookPayload.group_id has no name-or-id flexible resolution.
@@ -1233,6 +1246,242 @@ class FirewallClient {
             item('Webhook executions retained', s.execution_count),
             item('Audit logs retained', s.audit_log_count),
         ].join('');
+    }
+
+    renderIntersectionGroupCheckboxes() {
+        const container = document.getElementById('intersection-checkbox-container');
+        if (!container) return;
+        const groups = this.state.groups || [];
+        if (groups.length === 0) {
+            container.innerHTML = '<span class="text-muted">No groups available.</span>';
+            return;
+        }
+        container.innerHTML = groups.map(g => `
+            <label class="group-checkbox-item">
+                <input type="checkbox" name="intersection-group" value="${escapeHtml(g.name)}" class="intersection-group-cb">
+                <span>${escapeHtml(g.name)}</span>
+            </label>
+        `).join('');
+    }
+
+    async loadAnalytics() {
+        try {
+            const data = await this.apiFetch('/stats/analytics');
+            this.state.analyticsData = data;
+            this.renderAnalytics(data);
+        } catch (e) {
+            console.error('Failed to load analytics', e);
+        }
+    }
+
+    renderAnalytics(data) {
+        if (!data) return;
+
+        // Metric overview cards
+        const totalEl = document.getElementById('stat-total-active-ips');
+        const recEl = document.getElementById('stat-recidivist-ips');
+        const rateEl = document.getElementById('stat-recidivism-rate');
+        const groupsCountEl = document.getElementById('stat-total-groups');
+
+        if (totalEl) totalEl.textContent = (data.total_active_ips || 0).toLocaleString();
+        if (recEl) recEl.textContent = (data.recidivist_ips_count || 0).toLocaleString();
+        if (rateEl) rateEl.textContent = `${(data.recidivism_rate_pct || 0).toFixed(1)} %`;
+        if (groupsCountEl) groupsCountEl.textContent = (data.groups ? data.groups.length : 0).toLocaleString();
+
+        // Groups distribution table
+        const groupsTbody = document.getElementById('analytics-groups-table-body');
+        if (groupsTbody) {
+            if (!data.groups || data.groups.length === 0) {
+                groupsTbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted">No active groups found.</td></tr>';
+            } else {
+                groupsTbody.innerHTML = data.groups.map(g => {
+                    const pct = g.active_count > 0 ? ((g.shared_count / g.active_count) * 100).toFixed(1) : '0.0';
+                    const typeBadge = g.group_type === 'whitelist'
+                        ? '<span class="badge badge-white">whitelist</span>'
+                        : '<span class="badge badge-ban">banlist</span>';
+                    return `
+                        <tr>
+                            <td class="font-bold">${escapeHtml(g.group_name)}</td>
+                            <td>${typeBadge}</td>
+                            <td>${g.active_count.toLocaleString()}</td>
+                            <td><span class="badge badge-warning">${g.shared_count.toLocaleString()}</span></td>
+                            <td>${pct} %</td>
+                        </tr>
+                    `;
+                }).join('');
+            }
+        }
+
+        // Top Causes table
+        const causesTbody = document.getElementById('analytics-causes-table-body');
+        if (causesTbody) {
+            if (!data.top_causes || data.top_causes.length === 0) {
+                causesTbody.innerHTML = '<tr><td colspan="3" class="text-center text-muted">No cause history recorded.</td></tr>';
+            } else {
+                const totalCauseOccurrences = data.top_causes.reduce((acc, c) => acc + c.count, 0);
+                causesTbody.innerHTML = data.top_causes.map(c => {
+                    const share = totalCauseOccurrences > 0 ? ((c.count / totalCauseOccurrences) * 100).toFixed(1) : '0.0';
+                    return `
+                        <tr>
+                            <td><span class="badge-cause">${escapeHtml(c.cause)}</span></td>
+                            <td class="font-mono">${c.count.toLocaleString()}</td>
+                            <td>${share} %</td>
+                        </tr>
+                    `;
+                }).join('');
+            }
+        }
+
+        // Top Recidivist IPs table
+        const recidivistsTbody = document.getElementById('recidivists-table-body');
+        if (recidivistsTbody) {
+            if (!data.top_recidivists || data.top_recidivists.length === 0) {
+                recidivistsTbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted">No multi-group recidivists detected.</td></tr>';
+            } else {
+                recidivistsTbody.innerHTML = data.top_recidivists.map(r => {
+                    const grpBadges = (r.group_names || []).map(name =>
+                        `<span class="badge-tag">${escapeHtml(name)}</span>`
+                    ).join('');
+                    const causeBadges = (r.latest_causes || []).map(cause =>
+                        `<span class="badge-cause">${escapeHtml(cause)}</span>`
+                    ).join('') || '<span class="text-muted">—</span>';
+                    const firstSeen = r.first_seen ? formatDateTime(r.first_seen) : '—';
+                    const lastSeen = r.last_seen ? formatDateTime(r.last_seen) : '—';
+                    return `
+                        <tr>
+                            <td class="font-mono font-bold">${escapeHtml(r.target_address)}</td>
+                            <td><span class="badge badge-conflict">${r.group_count} groups</span></td>
+                            <td>${grpBadges}</td>
+                            <td class="text-muted">${firstSeen}</td>
+                            <td class="text-muted">${lastSeen}</td>
+                            <td>${causeBadges}</td>
+                        </tr>
+                    `;
+                }).join('');
+            }
+        }
+    }
+
+    async loadIntersection(page = 0) {
+        const checked = Array.from(document.querySelectorAll('.intersection-group-cb:checked'))
+            .map(cb => cb.value.trim());
+
+        const badge = document.getElementById('intersection-result-badge');
+        const tbody = document.getElementById('intersection-table-body');
+        const thead = document.getElementById('intersection-table-header');
+        const pag = document.getElementById('intersection-pagination');
+
+        if (checked.length < 2) {
+            if (badge) {
+                badge.className = 'badge badge-warning';
+                badge.textContent = 'Please select at least 2 groups to intersect';
+                badge.classList.remove('hidden');
+            }
+            if (tbody) {
+                tbody.innerHTML = '<tr><td colspan="3" class="text-center text-warning">Please select at least 2 groups above to find their intersection.</td></tr>';
+            }
+            if (pag) pag.classList.add('hidden');
+            return;
+        }
+
+        this.state.intersectionPage = Math.max(0, page);
+        this.state.intersectionSelectedGroups = checked;
+
+        try {
+            const params = new URLSearchParams({
+                groups: checked.join(','),
+                limit: this.state.intersectionLimit,
+                offset: this.state.intersectionPage * this.state.intersectionLimit
+            });
+            const res = await this.apiFetch(`/stats/intersection?${params.toString()}`);
+            this.state.intersectionTotal = res.total_overlap || 0;
+            this.renderIntersectionTable(res);
+        } catch (e) {
+            console.error('Failed to load group intersection', e);
+            if (tbody) {
+                tbody.innerHTML = `<tr><td colspan="3" class="text-center text-danger">Error fetching intersection: ${escapeHtml(e.message || String(e))}</td></tr>`;
+            }
+        }
+    }
+
+    renderIntersectionTable(res) {
+        const badge = document.getElementById('intersection-result-badge');
+        const thead = document.getElementById('intersection-table-header');
+        const tbody = document.getElementById('intersection-table-body');
+
+        if (badge) {
+            badge.className = 'badge badge-info';
+            badge.textContent = `Found ${res.total_overlap} IP(s) present in all ${res.groups.length} groups`;
+            badge.classList.remove('hidden');
+        }
+
+        // Render dynamic header columns based on selected groups
+        if (thead) {
+            const groupCols = res.groups.map(g => `<th>Last Seen (${escapeHtml(g.name)})</th>`).join('');
+            thead.innerHTML = `
+                <th>IP Address</th>
+                ${groupCols}
+                <th>Quick Actions</th>
+            `;
+        }
+
+        if (tbody) {
+            if (!res.items || res.items.length === 0) {
+                const totalCols = (res.groups.length || 0) + 2;
+                tbody.innerHTML = `<tr><td colspan="${totalCols}" class="text-center text-muted">No overlapping IP addresses found across all selected groups.</td></tr>`;
+            } else {
+                tbody.innerHTML = res.items.map(item => {
+                    const dateCols = res.groups.map(g => {
+                        const ts = item.group_last_seen && item.group_last_seen[g.name];
+                        return `<td class="text-muted">${ts ? formatDateTime(ts) : '—'}</td>`;
+                    }).join('');
+
+                    return `
+                        <tr>
+                            <td class="font-mono font-bold">${escapeHtml(item.target_address)}</td>
+                            ${dateCols}
+                            <td>
+                                <button type="button" class="btn btn-secondary btn-sm" onclick="app.filterByIp('${escapeHtml(item.target_address)}')">View in Records</button>
+                            </td>
+                        </tr>
+                    `;
+                }).join('');
+            }
+        }
+
+        this.updateIntersectionPaginationUI();
+    }
+
+    filterByIp(targetAddress) {
+        const ipInput = document.getElementById('ip-filter');
+        if (ipInput) ipInput.value = targetAddress;
+        const firewallTabBtn = document.querySelector('.tab-btn[data-tab="firewall"]');
+        if (firewallTabBtn) firewallTabBtn.click();
+        this.triggerIpSearch();
+    }
+
+    updateIntersectionPaginationUI() {
+        const pag = document.getElementById('intersection-pagination');
+        if (!pag) return;
+
+        const total = this.state.intersectionTotal;
+        const limit = this.state.intersectionLimit;
+        const totalPages = Math.max(1, Math.ceil(total / limit));
+        const curPage = this.state.intersectionPage + 1;
+
+        if (total <= limit) {
+            pag.classList.add('hidden');
+            return;
+        }
+
+        pag.classList.remove('hidden');
+        const prevBtn = document.getElementById('intersection-btn-prev');
+        const nextBtn = document.getElementById('intersection-btn-next');
+        const indicator = document.getElementById('intersection-page-indicator');
+
+        if (prevBtn) prevBtn.disabled = this.state.intersectionPage <= 0;
+        if (nextBtn) nextBtn.disabled = curPage >= totalPages;
+        if (indicator) indicator.textContent = `Page ${curPage} of ${totalPages} (${total} total)`;
     }
 
     async fetchAuditLogsChunk(offset, limit) {
@@ -3072,7 +3321,11 @@ class FirewallClient {
                 const trg = e.target;
                 trg.classList.add('active');
                 trg.setAttribute('aria-selected', 'true');
-                document.getElementById(`tab-${trg.dataset.tab}`).classList.add('active');
+                const panel = document.getElementById(`tab-${trg.dataset.tab}`);
+                if (panel) panel.classList.add('active');
+                if (trg.dataset.tab === 'analytics') {
+                    this.loadAnalytics();
+                }
             });
         });
 
@@ -3376,6 +3629,18 @@ class FirewallClient {
             if (!document.getElementById('execution-detail-modal').classList.contains('hidden')) {
                 this.closeExecutionDetailModal();
             }
+        });
+
+        // Analytics & Recidivism
+        document.getElementById('refresh-analytics-btn')?.addEventListener('click', () => this.loadAnalytics());
+        document.getElementById('intersection-compare-btn')?.addEventListener('click', () => this.loadIntersection(0));
+        document.getElementById('intersection-btn-prev')?.addEventListener('click', () => {
+            if (this.state.intersectionPage > 0) {
+                this.loadIntersection(this.state.intersectionPage - 1);
+            }
+        });
+        document.getElementById('intersection-btn-next')?.addEventListener('click', () => {
+            this.loadIntersection(this.state.intersectionPage + 1);
         });
     }
 }

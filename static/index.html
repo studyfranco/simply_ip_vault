@@ -70,6 +70,7 @@
         <nav class="tab-nav" role="tablist">
             <button class="tab-btn active" data-tab="firewall" role="tab" aria-selected="true">IP Records</button>
             <button class="tab-btn" data-tab="groups" id="groups-tab-btn" role="tab" aria-selected="false">IP Groups</button>
+            <button class="tab-btn" data-tab="analytics" id="analytics-tab-btn" role="tab" aria-selected="false">Statistiques &amp; Récidive</button>
             <button class="tab-btn" data-tab="keys" id="keys-tab-btn" role="tab" aria-selected="false">API Keys &amp; Permissions</button>
             <button class="tab-btn" data-tab="webhooks" id="webhooks-tab-btn" role="tab" aria-selected="false">Webhooks</button>
             <button class="tab-btn" data-tab="executions" id="executions-tab-btn" role="tab" aria-selected="false">Executions</button>
@@ -218,6 +219,149 @@
                     </div>
                 </section>
             </div>
+        </main>
+
+        <!-- ═══════════════════════════════════════════════ -->
+        <!-- TAB: Statistiques & Récidive                     -->
+        <!-- ═══════════════════════════════════════════════ -->
+        <main id="tab-analytics" class="tab-panel">
+            <div class="stats-overview-grid">
+                <div class="card stat-card">
+                    <div class="stat-card-title">Total Active IPs</div>
+                    <div class="stat-card-value" id="stat-total-active-ips">-</div>
+                    <div class="stat-card-sub">Active in authorized groups</div>
+                </div>
+                <div class="card stat-card stat-card-warning">
+                    <div class="stat-card-title">Recidivist IPs (Multi-Group)</div>
+                    <div class="stat-card-value" id="stat-recidivist-ips">-</div>
+                    <div class="stat-card-sub">Present in 2 or more active groups</div>
+                </div>
+                <div class="card stat-card stat-card-danger">
+                    <div class="stat-card-title">Recidivism Rate</div>
+                    <div class="stat-card-value" id="stat-recidivism-rate">- %</div>
+                    <div class="stat-card-sub">Multi-group offenders share</div>
+                </div>
+                <div class="card stat-card">
+                    <div class="stat-card-title">Monitored Groups</div>
+                    <div class="stat-card-value" id="stat-total-groups">-</div>
+                    <div class="stat-card-sub">Distinct active groups</div>
+                </div>
+            </div>
+
+            <div class="analytics-two-col">
+                <!-- Group Distribution Card -->
+                <section class="card">
+                    <div class="card-header">
+                        <h2>Group Distribution &amp; Overlap</h2>
+                    </div>
+                    <div class="table-container table-scroll">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Group Name</th>
+                                    <th>Type</th>
+                                    <th>Active IPs</th>
+                                    <th>Multi-Group IPs</th>
+                                    <th>Overlap %</th>
+                                </tr>
+                            </thead>
+                            <tbody id="analytics-groups-table-body">
+                                <tr><td colspan="5" class="text-center text-muted">Loading group statistics...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+
+                <!-- Top Causes Card -->
+                <section class="card">
+                    <div class="card-header">
+                        <h2>Top Ban Causes</h2>
+                    </div>
+                    <div class="table-container table-scroll">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Cause / Reason</th>
+                                    <th>Occurrences</th>
+                                    <th>Share</th>
+                                </tr>
+                            </thead>
+                            <tbody id="analytics-causes-table-body">
+                                <tr><td colspan="3" class="text-center text-muted">Loading causes...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+            </div>
+
+            <!-- Multi-Group Intersection Explorer -->
+            <section class="card">
+                <div class="card-header">
+                    <div>
+                        <h2>Group Intersection Explorer (Croisement de groupes)</h2>
+                        <p class="subtitle">Select 2, 3, 4 or more groups to find IP addresses present across ALL of them simultaneously.</p>
+                    </div>
+                </div>
+                <div class="intersection-controls">
+                    <div class="intersection-group-selector">
+                        <span class="selector-label">Select groups to intersect:</span>
+                        <div id="intersection-checkbox-container" class="intersection-checkbox-container">
+                            <span class="text-muted">Loading groups...</span>
+                        </div>
+                    </div>
+                    <div class="intersection-action-row">
+                        <button type="button" id="intersection-compare-btn" class="btn btn-primary">Find Overlapping IPs</button>
+                        <span id="intersection-result-badge" class="badge badge-info hidden"></span>
+                    </div>
+                </div>
+                <div class="table-container table-scroll">
+                    <table class="data-table">
+                        <thead>
+                            <tr id="intersection-table-header">
+                                <th>IP Address</th>
+                                <th>Group Memberships &amp; Last Seen</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="intersection-table-body">
+                            <tr><td colspan="3" class="text-center text-muted">Select at least two groups above and click "Find Overlapping IPs".</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="pagination hidden" id="intersection-pagination">
+                    <button id="intersection-btn-prev" class="btn btn-icon" disabled>&laquo; Prev</button>
+                    <span id="intersection-page-indicator">Page 1</span>
+                    <button id="intersection-btn-next" class="btn btn-icon">Next &raquo;</button>
+                </div>
+            </section>
+
+            <!-- Top Recidivist IPs -->
+            <section class="card">
+                <div class="card-header">
+                    <div>
+                        <h2>Top Recidivist IPs (Récidivistes multi-groupes)</h2>
+                        <p class="subtitle">IP addresses flagged across the highest number of distinct groups.</p>
+                    </div>
+                    <button type="button" id="refresh-analytics-btn" class="btn btn-secondary btn-sm">Refresh Stats</button>
+                </div>
+                <div class="table-container table-scroll">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>IP Address</th>
+                                <th>Groups Count</th>
+                                <th>Active Groups</th>
+                                <th>First Seen</th>
+                                <th>Last Seen</th>
+                                <th>Recent Causes</th>
+                            </tr>
+                        </thead>
+                        <tbody id="recidivists-table-body">
+                            <tr><td colspan="6" class="text-center text-muted">Loading recidivist data...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
         </main>
 
         <!-- ═══════════════════════════════════════════════ -->
