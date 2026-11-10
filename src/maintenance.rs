@@ -13,9 +13,9 @@ use tokio::sync::mpsc;
 /// Seconds between maintenance passes. Twelve hours.
 pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
 
-/// Free pages reclaimed per pass. Bounded (250 pages = ~1 MB) so one pass completes in < 1 second
-/// and never holds the SQLite write lock long enough to trigger slow statement alerts.
-pub const VACUUM_PAGES_PER_PASS: u32 = 250;
+/// Free pages reclaimed per pass. Bounded (50 pages = ~200 KB) so one pass completes in < 0.5s
+/// and never holds the SQLite write lock long enough to trigger slow statement alerts (threshold 1s).
+pub const VACUUM_PAGES_PER_PASS: u32 = 50;
 
 /// Runs one maintenance pass: reclaim up to [`VACUUM_PAGES_PER_PASS`] free pages, truncate the
 /// WAL, and refresh query planner statistics. Failures are logged rather than returned, so one bad
