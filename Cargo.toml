@@ -62,3 +62,6 @@ tempfile = "3"
 oxc_allocator = "0.158"
 oxc_parser = "0.158"
 oxc_span = "0.158"
+
+[profile.test]
+opt-level = 1
