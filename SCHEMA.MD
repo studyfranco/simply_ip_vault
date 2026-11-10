@@ -37,7 +37,9 @@ Indexes that matter for the read path:
 - `idx_group_memberships_lookup` `(group_id, ip_record_id)`: foreign-key child index for `group_id`.
 - `idx_memberships_deleted_at`: retention purge and global differential sync on tombstones.
 - `idx_causes_membership_created` `(membership_id, created_at DESC)`: foreign-key child index and latest-cause lookup.
-- `idx-audit_logs-api_key_id`, `idx_audit_logs_action_timestamp`, `idx-webhook_configs-group_id`: foreign-key child and composite audit indexes.
+- `idx-audit_logs-api_key_id`, `idx_audit_logs_action_timestamp`, `idx_audit_logs_api_key_timestamp` (`m20261014_120000`), `idx-webhook_configs-group_id`: foreign-key child and composite audit indexes.
+- `idx_webhook_executions_success_created` `(is_success, created_at DESC)`, `idx_webhook_executions_status_code_created` `(status_code, created_at DESC)`, `idx_webhook_executions_event_type_created` `(event_type, created_at DESC)` (`m20261014_120000`): accelerates execution retention purge sweeps and status/event filters.
+- `idx-ip_groups-group_type` (`m20261014_120000`): accelerates `status=ban`/`white` group lookups on `GET /api/ips`.
 
 Pragmas, set per connection and checked at boot (`src/db.rs`): `journal_mode=WAL`, `synchronous=NORMAL`,
 `foreign_keys=ON`, `busy_timeout=10000`, `temp_store=MEMORY`, `mmap_size=512 MB`, `cache_size=-131072`.

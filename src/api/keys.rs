@@ -4,7 +4,11 @@
 //! delegate to other keys, so subtree walking, visibility scoping and permission grants are one
 //! subject. Splitting them would put a rule's mechanism in one file and its guard in another.
 
-use axum::{Extension, extract::{Json, State}, response::IntoResponse};
+use axum::{
+    Extension,
+    extract::{Json, State},
+    response::IntoResponse,
+};
 use chrono::Utc;
 use ipnet::IpNet;
 use sea_orm::{
@@ -50,7 +54,6 @@ pub struct MePermission {
     pub can_manage: bool,
 }
 
-
 /// Identity and permission payload returned to the client
 #[derive(Serialize)]
 pub struct MeResponse {
@@ -72,13 +75,11 @@ pub struct MeResponse {
     pub group_permissions: Vec<MePermission>,
 }
 
-
 /// Handles GET /api/v1/auth/me
 pub async fn get_me(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
 ) -> Result<impl IntoResponse, AppError> {
-
     let perms = api_key_group_permission::Entity::find()
         .filter(api_key_group_permission::Column::ApiKeyId.eq(key.id))
         .find_also_related(ip_group::Entity)
@@ -111,7 +112,6 @@ pub async fn get_me(
     }))
 }
 
-
 // ─────────────────────────────────────────────────────────────
 // Admin CRUD — API Keys
 // ─────────────────────────────────────────────────────────────
@@ -142,7 +142,6 @@ pub struct GroupPermInput {
     pub can_manage: bool,
 }
 
-
 /// Payload for creating an API Key.
 ///
 /// `deny_unknown_fields` is a §5 control, not tidiness: it is what makes the *absence* of `is_master`
@@ -171,7 +170,6 @@ pub struct CreateApiKeyPayload {
     pub can_create_groups: Option<bool>,
 }
 
-
 /// Response after creating API key
 #[derive(Serialize)]
 pub struct CreateApiKeyResponse {
@@ -188,7 +186,6 @@ pub struct CreateApiKeyResponse {
     /// Bound ips
     pub bound_ips: Option<String>,
 }
-
 
 /// Handles POST /api/v1/keys
 pub async fn create_api_key(
@@ -213,7 +210,11 @@ pub async fn create_api_key(
     // A brand-new key holds none of these, so `held` is all-false: every `true` here is a grant.
     guard_scope_elevation(
         &key,
-        [payload.can_manage_keys, payload.can_create_groups, payload.can_manage_webhooks],
+        [
+            payload.can_manage_keys,
+            payload.can_create_groups,
+            payload.can_manage_webhooks,
+        ],
         [false, false, false],
     )?;
 
@@ -255,8 +256,17 @@ pub async fn create_api_key(
     };
 
     api_key::Entity::insert(model).exec(&state.db).await?;
-    
-    create_audit_log(&state.db, &key, client_ip.0, "KEY_CREATE", None, None, Some(payload.name.clone())).await?;
+
+    create_audit_log(
+        &state.db,
+        &key,
+        client_ip.0,
+        "KEY_CREATE",
+        None,
+        None,
+        Some(payload.name.clone()),
+    )
+    .await?;
 
     Ok(Json(CreateApiKeyResponse {
         id,
@@ -266,7 +276,6 @@ pub async fn create_api_key(
         bound_ips: payload.bound_ips,
     }))
 }
-
 
 /// Public-safe summary of an API key, in one of the two shapes `RBAC_MODEL.md` §4 allows a
 /// non-master caller to see.
@@ -328,15 +337,12 @@ pub struct ApiKeySummary {
     pub group_permissions: Vec<MePermission>,
 }
 
-
 /// The `"full"` view: everything about a key except its secrets.
-pub(crate) async fn full_api_key_summary(
-    db: &sea_orm::DatabaseConnection,
+pub fn build_full_api_key_summary(
     k: api_key::Model,
-) -> Result<ApiKeySummary, AppError> {
-    let group_permissions = key_group_permissions(db, k.id, None).await?;
-
-    Ok(ApiKeySummary {
+    group_permissions: Vec<MePermission>,
+) -> ApiKeySummary {
+    ApiKeySummary {
         id: k.id,
         name: k.name,
         view: "full",
@@ -349,19 +355,15 @@ pub(crate) async fn full_api_key_summary(
         parent_key_id: k.parent_key_id,
         created_at: Some(k.created_at),
         group_permissions,
-    })
+    }
 }
 
-
 /// The `"minimal"` view: id, name, and this key's rights on `visible_groups` and nothing else.
-pub(crate) async fn minimal_api_key_summary(
-    db: &sea_orm::DatabaseConnection,
+pub(crate) fn build_minimal_api_key_summary(
     k: api_key::Model,
-    visible_groups: &[Uuid],
-) -> Result<ApiKeySummary, AppError> {
-    let group_permissions = key_group_permissions(db, k.id, Some(visible_groups)).await?;
-
-    Ok(ApiKeySummary {
+    group_permissions: Vec<MePermission>,
+) -> ApiKeySummary {
+    ApiKeySummary {
         id: k.id,
         name: k.name,
         view: "minimal",
@@ -374,21 +376,54 @@ pub(crate) async fn minimal_api_key_summary(
         parent_key_id: None,
         created_at: None,
         group_permissions,
-    })
+    }
 }
 
+/// The `"full"` view: everything about a key except its secrets.
+pub(crate) async fn full_api_key_summary(
+    db: &sea_orm::DatabaseConnection,
+    k: api_key::Model,
+) -> Result<ApiKeySummary, AppError> {
+    let group_permissions = key_group_permissions(db, k.id, None).await?;
+    Ok(build_full_api_key_summary(k, group_permissions))
+}
+
+/// The `"minimal"` view: id, name, and this key's rights on `visible_groups` and nothing else.
+#[allow(dead_code)]
+pub(crate) async fn minimal_api_key_summary(
+    db: &sea_orm::DatabaseConnection,
+    k: api_key::Model,
+    visible_groups: &[Uuid],
+) -> Result<ApiKeySummary, AppError> {
+    let group_permissions = key_group_permissions(db, k.id, Some(visible_groups)).await?;
+    Ok(build_minimal_api_key_summary(k, group_permissions))
+}
 
 /// One key's permission rows, optionally narrowed to a set of groups.
 ///
 /// `Some(&[])` is a meaningful argument and returns nothing — a caller that manages no groups sees no
 /// shared rows, which is different from `None` ("no filter, return everything").
-pub(crate) async fn key_group_permissions(
+pub async fn key_group_permissions(
     db: &sea_orm::DatabaseConnection,
     key_id: Uuid,
     only_groups: Option<&[Uuid]>,
 ) -> Result<Vec<MePermission>, AppError> {
+    let mut map = batch_key_group_permissions(db, &[key_id], only_groups).await?;
+    Ok(map.remove(&key_id).unwrap_or_default())
+}
+
+/// Batch-fetches permission rows for multiple keys, eliminating N+1 queries.
+pub async fn batch_key_group_permissions(
+    db: &sea_orm::DatabaseConnection,
+    key_ids: &[Uuid],
+    only_groups: Option<&[Uuid]>,
+) -> Result<std::collections::HashMap<Uuid, Vec<MePermission>>, AppError> {
+    if key_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
     let mut condition =
-        Condition::all().add(api_key_group_permission::Column::ApiKeyId.eq(key_id));
+        Condition::all().add(api_key_group_permission::Column::ApiKeyId.is_in(key_ids.to_vec()));
     if let Some(groups) = only_groups {
         condition = condition.add(api_key_group_permission::Column::GroupId.is_in(groups.to_vec()));
     }
@@ -399,21 +434,23 @@ pub(crate) async fn key_group_permissions(
         .all(db)
         .await?;
 
-    Ok(perms
-        .into_iter()
-        .filter_map(|(p, g)| {
-            g.map(|group| MePermission {
+    let mut map: std::collections::HashMap<Uuid, Vec<MePermission>> =
+        std::collections::HashMap::new();
+    for (p, g) in perms {
+        if let Some(group) = g {
+            map.entry(p.api_key_id).or_default().push(MePermission {
                 group_id: p.group_id,
                 group_name: group.name,
                 can_read: p.can_read,
                 can_write: p.can_write,
                 can_delete: p.can_delete,
                 can_manage: p.can_manage,
-            })
-        })
-        .collect())
-}
+            });
+        }
+    }
 
+    Ok(map)
+}
 
 /// Every key at or below `root` in the `parent_key_id` tree, `root` included.
 ///
@@ -441,12 +478,14 @@ pub(crate) async fn collect_key_subtree(
             .map(|k| k.id)
             .collect();
 
-        frontier = children.into_iter().filter(|id| visited.insert(*id)).collect();
+        frontier = children
+            .into_iter()
+            .filter(|id| visited.insert(*id))
+            .collect();
     }
 
     Ok(visited)
 }
-
 
 /// The groups a caller *manages* in R2's sense — the ones whose shared keys it may see in minimal
 /// form.
@@ -475,7 +514,6 @@ pub(crate) async fn groups_the_caller_manages(
         .collect())
 }
 
-
 /// Whether `target` is inside the caller's **own subtree** — the scope §4 grants full visibility over,
 /// and the scope every credential-level operation on another key is bounded by.
 ///
@@ -493,7 +531,6 @@ pub(crate) async fn caller_can_administer_key(
     }
     Ok(collect_key_subtree(db, caller.id).await?.contains(&target))
 }
-
 
 /// Resolves a key-targeted request to its row, or to the `404` §4's oracle discipline requires.
 ///
@@ -516,7 +553,10 @@ pub(crate) async fn find_administrable_key(
     caller: &api_key::Model,
     target: Uuid,
 ) -> Result<api_key::Model, AppError> {
-    let key = ApiKey::find_by_id(target).one(db).await?.ok_or(AppError::NotFound)?;
+    let key = ApiKey::find_by_id(target)
+        .one(db)
+        .await?
+        .ok_or(AppError::NotFound)?;
 
     if !caller_can_administer_key(db, caller, target).await? {
         return Err(AppError::NotFound);
@@ -524,7 +564,6 @@ pub(crate) async fn find_administrable_key(
 
     Ok(key)
 }
-
 
 /// Handles GET /api/v1/keys — **§4's three visibility scopes, in one listing.**
 ///
@@ -551,10 +590,15 @@ pub async fn list_api_keys(
 
     if key.is_master {
         let keys = ApiKey::find().all(&state.db).await?;
-        let mut summaries = Vec::with_capacity(keys.len());
-        for k in keys {
-            summaries.push(full_api_key_summary(&state.db, k).await?);
-        }
+        let key_ids: Vec<Uuid> = keys.iter().map(|k| k.id).collect();
+        let mut perm_map = batch_key_group_permissions(&state.db, &key_ids, None).await?;
+        let summaries: Vec<ApiKeySummary> = keys
+            .into_iter()
+            .map(|k| {
+                let perms = perm_map.remove(&k.id).unwrap_or_default();
+                build_full_api_key_summary(k, perms)
+            })
+            .collect();
         return Ok(Json(summaries));
     }
 
@@ -577,27 +621,56 @@ pub async fn list_api_keys(
             .collect()
     };
 
+    // Batch fetch subtree keys and their permissions in 2 queries instead of 2*N queries
+    let subtree_keys: Vec<api_key::Model> = if subtree.is_empty() {
+        Vec::new()
+    } else {
+        ApiKey::find()
+            .filter(api_key::Column::Id.is_in(subtree.clone()))
+            .all(&state.db)
+            .await?
+    };
+    let mut subtree_map: std::collections::HashMap<Uuid, api_key::Model> =
+        subtree_keys.into_iter().map(|k| (k.id, k)).collect();
+    let subtree_ids: Vec<Uuid> = subtree
+        .iter()
+        .filter(|id| subtree_map.contains_key(id))
+        .copied()
+        .collect();
+    let mut subtree_perm_map = batch_key_group_permissions(&state.db, &subtree_ids, None).await?;
+
     let mut summaries = Vec::new();
     for id in subtree {
         // A subtree member could have been deleted between the walk and here; skipping is correct
         // rather than erroring, and the caller sees the same list it would have a moment later.
-        if let Some(k) = ApiKey::find_by_id(id).one(&state.db).await? {
-            summaries.push(full_api_key_summary(&state.db, k).await?);
+        if let Some(k) = subtree_map.remove(&id) {
+            let perms = subtree_perm_map.remove(&id).unwrap_or_default();
+            summaries.push(build_full_api_key_summary(k, perms));
         }
     }
+
     let mut seen: std::collections::HashSet<Uuid> = summaries.iter().map(|s| s.id).collect();
-    for id in shared {
-        if !seen.insert(id) {
-            continue;
-        }
-        if let Some(k) = ApiKey::find_by_id(id).one(&state.db).await? {
-            summaries.push(minimal_api_key_summary(&state.db, k, &managed_groups).await?);
+    let shared_to_fetch: Vec<Uuid> = shared.into_iter().filter(|id| seen.insert(*id)).collect();
+
+    if !shared_to_fetch.is_empty() {
+        let shared_keys: Vec<api_key::Model> = ApiKey::find()
+            .filter(api_key::Column::Id.is_in(shared_to_fetch.clone()))
+            .all(&state.db)
+            .await?;
+        let mut shared_perm_map =
+            batch_key_group_permissions(&state.db, &shared_to_fetch, Some(&managed_groups)).await?;
+        let mut shared_map: std::collections::HashMap<Uuid, api_key::Model> =
+            shared_keys.into_iter().map(|k| (k.id, k)).collect();
+        for id in shared_to_fetch {
+            if let Some(k) = shared_map.remove(&id) {
+                let perms = shared_perm_map.remove(&id).unwrap_or_default();
+                summaries.push(build_minimal_api_key_summary(k, perms));
+            }
         }
     }
 
     Ok(Json(summaries))
 }
-
 
 /// One entity owned by a key inside the subtree being deleted, as it appears in §6's pre-flight
 /// inventory.
@@ -619,7 +692,6 @@ pub struct OwnedEntity {
     pub owner_name: String,
 }
 
-
 /// What to do with one inventoried entity.
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -633,7 +705,6 @@ pub enum Resolution {
         owner_key_id: Uuid,
     },
 }
-
 
 /// One entry in the resolution map.
 ///
@@ -654,7 +725,6 @@ pub struct ResolutionEntry {
     pub resolution: Resolution,
 }
 
-
 /// Optional body for `DELETE /api/v1/keys/:id`.
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -663,7 +733,6 @@ pub struct DeleteKeyPayload {
     #[serde(default)]
     pub resolutions: Vec<ResolutionEntry>,
 }
-
 
 /// Every group and webhook owned by any key in `subtree`, with its owner's name resolved.
 ///
@@ -682,7 +751,12 @@ pub(crate) async fn inventory_owned_entities(
         .into_iter()
         .map(|k| (k.id, k.name))
         .collect();
-    let owner_name = |id: Uuid| owners.get(&id).cloned().unwrap_or_else(|| "<deleted>".to_owned());
+    let owner_name = |id: Uuid| {
+        owners
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| "<deleted>".to_owned())
+    };
 
     let mut inventory = Vec::new();
 
@@ -720,7 +794,6 @@ pub(crate) async fn inventory_owned_entities(
 
     Ok(inventory)
 }
-
 
 /// Handles DELETE /api/v1/keys/:id — **§6's cascade, gated on the pre-flight inventory.**
 ///
@@ -776,7 +849,10 @@ pub async fn delete_api_key(
     guard_master_immutable(&target, "deleted")?;
     let target_ref = format_key_reference(&target.name, id);
 
-    let subtree: Vec<Uuid> = collect_key_subtree(&state.db, id).await?.into_iter().collect();
+    let subtree: Vec<Uuid> = collect_key_subtree(&state.db, id)
+        .await?
+        .into_iter()
+        .collect();
     // A cycle in `parent_key_id` (only reachable through direct database edits — the API always sets
     // the parent to a key that already exists) could otherwise put the caller inside the subtree of a
     // key it is deleting, and take its own credential with it.
@@ -828,14 +904,20 @@ pub async fn delete_api_key(
             message: format!(
                 "Refusing to delete {target_ref}: the resolution map is incomplete — {} entit{}                  unresolved. Partial maps are not applied.",
                 missing.len(),
-                if missing.len() == 1 { "y is" } else { "ies are" }
+                if missing.len() == 1 {
+                    "y is"
+                } else {
+                    "ies are"
+                }
             ),
             details: serde_json::json!({ "unresolved": missing }),
         });
     }
 
-    let inventoried: std::collections::HashSet<(String, Uuid)> =
-        inventory.iter().map(|e| (e.entity_type.to_owned(), e.id)).collect();
+    let inventoried: std::collections::HashSet<(String, Uuid)> = inventory
+        .iter()
+        .map(|e| (e.entity_type.to_owned(), e.id))
+        .collect();
     if let Some(extra) = resolutions.keys().find(|k| !inventoried.contains(*k)) {
         return Err(AppError::InvalidInput(format!(
             "Resolution names {} {}, which is not owned by any key in this subtree",
@@ -868,7 +950,9 @@ pub async fn delete_api_key(
                 deleted_entities += 1;
             }
             ("webhook", Resolution::Delete) => {
-                WebhookConfig::delete_by_id(entity.id).exec(&state.db).await?;
+                WebhookConfig::delete_by_id(entity.id)
+                    .exec(&state.db)
+                    .await?;
                 deleted_entities += 1;
             }
             ("group", Resolution::Reassign { owner_key_id }) => {
@@ -929,7 +1013,6 @@ pub async fn delete_api_key(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
-
 /// Payload for updating an existing API key's name, `bound_ips`, and global scope flags.
 ///
 /// Carries no `is_master`, and denies unknown fields so that saying so is enforceable — the same §5
@@ -950,7 +1033,6 @@ pub struct UpdateApiKeyPayload {
     /// New value for the "create groups" global scope, if changing it
     pub can_create_groups: Option<bool>,
 }
-
 
 /// Handles PUT /api/v1/keys/:id — updates name, `bound_ips`, and global scope flags in place.
 pub async fn update_api_key(
@@ -995,8 +1077,16 @@ pub async fn update_api_key(
     // is a no-op rather than a rejection.
     guard_scope_elevation(
         &key,
-        [payload.can_manage_keys, payload.can_create_groups, payload.can_manage_webhooks],
-        [target.can_manage_keys, target.can_create_groups, target.can_manage_webhooks],
+        [
+            payload.can_manage_keys,
+            payload.can_create_groups,
+            payload.can_manage_webhooks,
+        ],
+        [
+            target.can_manage_keys,
+            target.can_create_groups,
+            target.can_manage_webhooks,
+        ],
     )?;
 
     // A dedicated self-escalation check for `can_manage_webhooks` stood here. It is now subsumed
@@ -1034,11 +1124,19 @@ pub async fn update_api_key(
     // resulting name is what a reader will actually recognize it by later.
     let target_ref = format_key_reference(&updated.name, id);
 
-    create_audit_log(&state.db, &key, client_ip.0, "KEY_UPDATE", None, None, Some(format!("Updated key {target_ref}"))).await?;
+    create_audit_log(
+        &state.db,
+        &key,
+        client_ip.0,
+        "KEY_UPDATE",
+        None,
+        None,
+        Some(format!("Updated key {target_ref}")),
+    )
+    .await?;
 
     Ok(Json(full_api_key_summary(&state.db, updated).await?))
 }
-
 
 /// Response after rotating an API key's secret
 #[derive(Serialize)]
@@ -1050,7 +1148,6 @@ pub struct RotateKeyResponse {
     /// The new HMAC signing secret. Shown only once, like [`Self::plaintext_key`].
     pub signing_secret: String,
 }
-
 
 /// Handles POST /api/v1/keys/:id/rotate — generates a new secret for an existing key, returning
 /// the plaintext once while immediately invalidating the previous secret (the old `key_hash` is
@@ -1088,11 +1185,23 @@ pub async fn rotate_api_key(
     active.updated_at = Set(Utc::now().naive_utc());
     active.update(&state.db).await?;
 
-    create_audit_log(&state.db, &key, client_ip.0, "KEY_ROTATE", None, None, Some(format!("Rotated secret for key {target_ref}"))).await?;
+    create_audit_log(
+        &state.db,
+        &key,
+        client_ip.0,
+        "KEY_ROTATE",
+        None,
+        None,
+        Some(format!("Rotated secret for key {target_ref}")),
+    )
+    .await?;
 
-    Ok(Json(RotateKeyResponse { id, plaintext_key, signing_secret }))
+    Ok(Json(RotateKeyResponse {
+        id,
+        plaintext_key,
+        signing_secret,
+    }))
 }
-
 
 /// Response after rotating only an API key's HMAC signing secret.
 #[derive(Serialize)]
@@ -1106,7 +1215,6 @@ pub struct RotateSigningSecretResponse {
     /// rest when `VAULT_ENCRYPTION_KEY` is set, and no read endpoint ever echoes it.
     pub signing_secret: String,
 }
-
 
 /// Handles `POST /api/keys/{id}/rotate-secret` — replaces a key's HMAC signing secret in place.
 ///
@@ -1158,9 +1266,12 @@ pub async fn rotate_signing_secret(
     )
     .await?;
 
-    Ok(Json(RotateSigningSecretResponse { id, name: target_name, signing_secret }))
+    Ok(Json(RotateSigningSecretResponse {
+        id,
+        name: target_name,
+        signing_secret,
+    }))
 }
-
 
 /// Handles POST /api/v1/keys/:id/groups
 pub async fn update_key_group_permissions(
@@ -1170,16 +1281,20 @@ pub async fn update_key_group_permissions(
     StrictPath(id): StrictPath<Uuid>,
     StrictJson(payload): StrictJson<GroupPermInput>,
 ) -> Result<impl IntoResponse, AppError> {
-
     // R2 in its group-independent form, run before any lookup so a caller with no administrative
     // standing anywhere cannot probe what exists. The precise per-group test runs below, once the
     // group is resolved.
     guard_may_administer_any_group(&state.db, &key).await?;
 
-    let target_key = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let target_key = ApiKey::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
 
     if target_key.is_master {
-        return Err(AppError::InvalidInput("Cannot configure M:N permissions on a master key".to_owned()));
+        return Err(AppError::InvalidInput(
+            "Cannot configure M:N permissions on a master key".to_owned(),
+        ));
     }
 
     // Self-targeting is permitted, and is bounded rather than blocked. `guard_delegated_group_grant`
@@ -1201,17 +1316,26 @@ pub async fn update_key_group_permissions(
 
     let target_group_id: Uuid;
     let resolved_group_name: String;
-    let existing_group = resolve_group_ref_flexible(&state.db, payload.group_id.as_deref(), payload.group_name.as_deref()).await?;
+    let existing_group = resolve_group_ref_flexible(
+        &state.db,
+        payload.group_id.as_deref(),
+        payload.group_name.as_deref(),
+    )
+    .await?;
 
     if let Some(g) = existing_group {
         target_group_id = g.id;
         resolved_group_name = g.name;
     } else if let Some(group_name) = &payload.group_name {
         if !key.is_master && !key.can_create_groups {
-            return Err(AppError::Forbidden("Permission denied: Target group does not exist and you cannot create groups".to_owned()));
+            return Err(AppError::Forbidden(
+                "Permission denied: Target group does not exist and you cannot create groups"
+                    .to_owned(),
+            ));
         }
 
-        let group = get_or_create_group(&state.db, group_name, "banlist", resource_owner(&key)).await?;
+        let group =
+            get_or_create_group(&state.db, group_name, "banlist", resource_owner(&key)).await?;
         target_group_id = group.id;
         resolved_group_name = group.name;
     } else {
@@ -1240,7 +1364,13 @@ pub async fn update_key_group_permissions(
     // and self-targeting permitted. Splitting on the request rather than the route is what keeps
     // "revoke the row" and "update the row to a lower value" from drifting apart.
     if widens_permissions(&payload, target_perm.as_ref()) {
-        guard_delegated_group_grant(&key, caller_perm.as_ref(), &resolved_group_name, "grant", &payload)?;
+        guard_delegated_group_grant(
+            &key,
+            caller_perm.as_ref(),
+            &resolved_group_name,
+            "grant",
+            &payload,
+        )?;
     } else {
         guard_group_manage(&key, caller_perm.as_ref(), &resolved_group_name, "revoke")?;
     }
@@ -1259,14 +1389,17 @@ pub async fn update_key_group_permissions(
 
     api_key_group_permission::Entity::insert(perm_model)
         .on_conflict(
-            OnConflict::columns([api_key_group_permission::Column::ApiKeyId, api_key_group_permission::Column::GroupId])
-                .update_columns([
-                    api_key_group_permission::Column::CanRead,
-                    api_key_group_permission::Column::CanWrite,
-                    api_key_group_permission::Column::CanDelete,
-                    api_key_group_permission::Column::CanManage,
-                ])
-                .to_owned()
+            OnConflict::columns([
+                api_key_group_permission::Column::ApiKeyId,
+                api_key_group_permission::Column::GroupId,
+            ])
+            .update_columns([
+                api_key_group_permission::Column::CanRead,
+                api_key_group_permission::Column::CanWrite,
+                api_key_group_permission::Column::CanDelete,
+                api_key_group_permission::Column::CanManage,
+            ])
+            .to_owned(),
         )
         .exec(&state.db)
         .await?;
@@ -1278,12 +1411,15 @@ pub async fn update_key_group_permissions(
         "KEY_PERM_UPDATE",
         None,
         Some(resolved_group_name),
-        Some(format!("Updated permissions for key {}", format_key_reference(&target_key.name, id)))
-    ).await?;
+        Some(format!(
+            "Updated permissions for key {}",
+            format_key_reference(&target_key.name, id)
+        )),
+    )
+    .await?;
 
     Ok(axum::http::StatusCode::OK)
 }
-
 
 /// Handles DELETE /api/v1/keys/:id/permissions/:group_identifier — removes a key's permission
 /// mapping for a specific group. `group_identifier` may be either the group's UUID or its name.
@@ -1339,7 +1475,10 @@ pub async fn revoke_key_group_permission(
     // the authority check below so a caller learns "no such grant" before it learns anything about
     // its own standing — and so a nonexistent grant cannot become a `403` that confirms the group
     // exists to someone with no access to it.
-    if caller_group_permission(&state.db, id, group.id).await?.is_none() {
+    if caller_group_permission(&state.db, id, group.id)
+        .await?
+        .is_none()
+    {
         return Err(AppError::NotFound);
     }
 
@@ -1350,7 +1489,7 @@ pub async fn revoke_key_group_permission(
         .filter(
             Condition::all()
                 .add(api_key_group_permission::Column::ApiKeyId.eq(id))
-                .add(api_key_group_permission::Column::GroupId.eq(group.id))
+                .add(api_key_group_permission::Column::GroupId.eq(group.id)),
         )
         .exec(&state.db)
         .await?;
@@ -1359,7 +1498,10 @@ pub async fn revoke_key_group_permission(
         return Err(AppError::NotFound);
     }
 
-    let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let target = ApiKey::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     create_audit_log(
         &state.db,
         &key,
@@ -1367,8 +1509,12 @@ pub async fn revoke_key_group_permission(
         "KEY_PERM_REVOKE",
         None,
         Some(group.name),
-        Some(format!("Revoked permissions for key {}", format_key_reference(&target.name, id)))
-    ).await?;
+        Some(format!(
+            "Revoked permissions for key {}",
+            format_key_reference(&target.name, id)
+        )),
+    )
+    .await?;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

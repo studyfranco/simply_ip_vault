@@ -2050,6 +2050,27 @@ async fn every_foreign_key_child_column_also_has_a_plain_single_column_index() {
     }
 }
 
+/// `m20261014_120000_add_query_optimization_indexes`: indexes added for retention sweeps,
+/// status filtering, and temporal query paths.
+#[tokio::test]
+async fn query_optimization_indexes_exist() {
+    let tmp = TempDb::new();
+    let db = fresh_db(&tmp).await;
+
+    for (table, index) in [
+        ("webhook_executions", "idx_webhook_executions_success_created"),
+        ("webhook_executions", "idx_webhook_executions_status_code_created"),
+        ("webhook_executions", "idx_webhook_executions_event_type_created"),
+        ("ip_groups", "idx-ip_groups-group_type"),
+        ("audit_logs", "idx_audit_logs_api_key_timestamp"),
+    ] {
+        assert!(
+            simply_ip_vault::db::has_index(&db, table, index).await.unwrap(),
+            "table {table} must have optimization index {index}"
+        );
+    }
+}
+
 // ─────────────────────────────────────────────────────────────
 // The membership model: columns, partial index, causes, independence
 // ─────────────────────────────────────────────────────────────
