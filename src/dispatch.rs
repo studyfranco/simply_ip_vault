@@ -48,10 +48,7 @@ const RESPONSE_SNIPPET_MAX_BYTES: usize = 500;
 /// already normalizes inbound addresses the same way; this keeps the two directions consistent.
 fn is_blocked_address(ip: IpAddr) -> bool {
     // Unwrap `::ffff:a.b.c.d` to `a.b.c.d` so the IPv4 rules below actually apply to it.
-    let ip = match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
-        v4 => v4,
-    };
+    let ip = ip.to_canonical();
 
     match ip {
         IpAddr::V4(v4) => {

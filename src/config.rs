@@ -955,10 +955,7 @@ fn hostname_rejection(entry: &str) -> Option<&'static str> {
 /// first causing a spurious `403`, the second silently downgrading a trusted proxy to an untrusted
 /// one.
 pub fn normalize_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
-        v4 => v4,
-    }
+    ip.to_canonical()
 }
 
 /// Reports whether `ip` falls inside any of the `trusted` networks.
