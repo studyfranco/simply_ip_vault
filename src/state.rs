@@ -100,6 +100,9 @@ pub struct AppState {
     /// would let each handler resolve its own, which is the bug the type exists to prevent,
     /// reintroduced one `#[derive(Clone)]` at a time.
     pub master_pin: Arc<MasterPin>,
+    /// In-memory short-lived cache for analytical statistics (`GET /api/stats/analytics`), TTL ~30s.
+    /// Prevents repeated expensive full-table queries when multiple dashboard tabs or users refresh.
+    pub analytics_cache: Arc<tokio::sync::RwLock<Option<(std::time::Instant, serde_json::Value)>>>,
 }
 
 impl AppState {
@@ -125,6 +128,7 @@ impl AppState {
             cipher: Arc::new(SecretCipher::from_env()?),
             replay: Arc::new(ReplayGuard::default()),
             master_pin: Arc::new(MasterPin::new()),
+            analytics_cache: Arc::new(tokio::sync::RwLock::new(None)),
         })
     }
 
@@ -146,6 +150,7 @@ impl AppState {
             cipher: Arc::new(cipher),
             replay: Arc::new(ReplayGuard::default()),
             master_pin: Arc::new(MasterPin::new()),
+            analytics_cache: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 

@@ -298,8 +298,17 @@ pub async fn get_analytics(
                     active_added_or_seen: 0,
                     soft_deleted: 0,
                 },
-            }));
+            }).into_response());
+    }
+
+    if caller.is_master {
+        let cache_read = state.analytics_cache.read().await;
+        if let Some((ts, ref payload)) = *cache_read
+            && ts.elapsed() < std::time::Duration::from_secs(30)
+        {
+            return Ok(Json(payload.clone()).into_response());
         }
+    }
 
     // 1. Total unique active IPs
     let mut total_q = ip_record_group_membership::Entity::find()
@@ -360,58 +369,83 @@ pub async fn get_analytics(
         0.0
     };
 
-    // 3. Groups breakdown with shared counts computed via push-down subqueries
+    // 3. Groups breakdown with active and shared counts computed in 2 batch queries
     let mut groups_query = ip_group::Entity::find();
     if let Some(ref allowed) = authorized_groups {
         groups_query =
             groups_query.filter(ip_group::Column::Id.is_in(allowed.iter().copied()));
     }
     let all_groups = groups_query.all(&state.db).await?;
+
+    // Batch 1: active counts by group
+    let mut active_counts_q = ip_record_group_membership::Entity::find()
+        .filter(ip_record_group_membership::Column::IsDeleted.eq(false));
+    if let Some(ref allowed) = authorized_groups {
+        active_counts_q = active_counts_q.filter(
+            ip_record_group_membership::Column::GroupId.is_in(allowed.iter().copied()),
+        );
+    }
+    let active_counts: Vec<(Uuid, i64)> = active_counts_q
+        .select_only()
+        .column(ip_record_group_membership::Column::GroupId)
+        .expr_as(Func::count(Expr::col(sea_orm::sea_query::Asterisk)), "cnt")
+        .group_by(ip_record_group_membership::Column::GroupId)
+        .into_tuple::<(Uuid, i64)>()
+        .all(&state.db)
+        .await?;
+    let active_counts_map: std::collections::HashMap<Uuid, u64> = active_counts
+        .into_iter()
+        .map(|(gid, cnt)| (gid, std::cmp::max(cnt, 0) as u64))
+        .collect();
+
+    // Batch 2: shared counts by group using a single group-presence query
+    let mut shared_sub = ip_record_group_membership::Entity::find()
+        .filter(ip_record_group_membership::Column::IsDeleted.eq(false));
+    if let Some(ref allowed) = authorized_groups {
+        shared_sub = shared_sub.filter(
+            ip_record_group_membership::Column::GroupId.is_in(allowed.iter().copied()),
+        );
+    }
+    let shared_sub_query = shared_sub
+        .select_only()
+        .column(ip_record_group_membership::Column::IpRecordId)
+        .group_by(ip_record_group_membership::Column::IpRecordId)
+        .having(
+            Expr::expr(Func::count_distinct(Expr::col(
+                ip_record_group_membership::Column::GroupId,
+            )))
+            .gt(1),
+        )
+        .into_query();
+
+    let mut shared_counts_q = ip_record_group_membership::Entity::find()
+        .filter(ip_record_group_membership::Column::IsDeleted.eq(false))
+        .filter(
+            Expr::col(ip_record_group_membership::Column::IpRecordId)
+                .in_subquery(shared_sub_query),
+        );
+    if let Some(ref allowed) = authorized_groups {
+        shared_counts_q = shared_counts_q.filter(
+            ip_record_group_membership::Column::GroupId.is_in(allowed.iter().copied()),
+        );
+    }
+    let shared_counts: Vec<(Uuid, i64)> = shared_counts_q
+        .select_only()
+        .column(ip_record_group_membership::Column::GroupId)
+        .expr_as(Func::count(Expr::col(sea_orm::sea_query::Asterisk)), "cnt")
+        .group_by(ip_record_group_membership::Column::GroupId)
+        .into_tuple::<(Uuid, i64)>()
+        .all(&state.db)
+        .await?;
+    let shared_counts_map: std::collections::HashMap<Uuid, u64> = shared_counts
+        .into_iter()
+        .map(|(gid, cnt)| (gid, std::cmp::max(cnt, 0) as u64))
+        .collect();
+
     let mut groups = Vec::with_capacity(all_groups.len());
     for g in all_groups {
-        let active_count = ip_record_group_membership::Entity::find()
-            .filter(ip_record_group_membership::Column::GroupId.eq(g.id))
-            .filter(ip_record_group_membership::Column::IsDeleted.eq(false))
-            .count(&state.db)
-            .await?;
-
-        let shared_count = if active_count == 0 {
-            0
-        } else {
-            let mut other_subquery = SqQuery::select()
-                .column(ip_record_group_membership::Column::IpRecordId)
-                .from(ip_record_group_membership::Entity)
-                .and_where(Expr::col(ip_record_group_membership::Column::GroupId).ne(g.id))
-                .and_where(Expr::col(ip_record_group_membership::Column::IsDeleted).eq(false))
-                .to_owned();
-            if let Some(ref allowed) = authorized_groups {
-                other_subquery.and_where(
-                    Expr::col(ip_record_group_membership::Column::GroupId)
-                        .is_in(allowed.iter().copied()),
-                );
-            }
-
-            let shared_cnt_res: i64 = ip_record_group_membership::Entity::find()
-                .filter(ip_record_group_membership::Column::GroupId.eq(g.id))
-                .filter(ip_record_group_membership::Column::IsDeleted.eq(false))
-                .filter(
-                    Expr::col(ip_record_group_membership::Column::IpRecordId)
-                        .in_subquery(other_subquery),
-                )
-                .select_only()
-                .expr_as(
-                    Func::count_distinct(Expr::col(
-                        ip_record_group_membership::Column::IpRecordId,
-                    )),
-                    "cnt",
-                )
-                .into_tuple::<i64>()
-                .one(&state.db)
-                .await?
-                .unwrap_or(0);
-            std::cmp::max(shared_cnt_res, 0) as u64
-        };
-
+        let active_count = active_counts_map.get(&g.id).copied().unwrap_or(0);
+        let shared_count = shared_counts_map.get(&g.id).copied().unwrap_or(0);
         groups.push(GroupStat {
             group_id: g.id,
             group_name: g.name,
@@ -615,6 +649,7 @@ pub async fn get_analytics(
         .select_only()
         .column(ip_record::Column::TargetAddress)
         .distinct()
+        .limit(25000)
         .into_tuple::<String>()
         .all(&state.db)
         .await?;
@@ -682,7 +717,7 @@ pub async fn get_analytics(
         compute_velocity(&state.db, authorized_groups.as_ref(), threshold_24h).await?;
     let velocity_7d = compute_velocity(&state.db, authorized_groups.as_ref(), threshold_7d).await?;
 
-    Ok(Json(AnalyticsResponse {
+    let response = AnalyticsResponse {
         total_active_ips,
         recidivist_ips_count,
         recidivism_rate_pct,
@@ -693,7 +728,16 @@ pub async fn get_analytics(
         locked_breakdown,
         velocity_24h,
         velocity_7d,
-    }))
+    };
+
+    if caller.is_master
+        && let Ok(val) = serde_json::to_value(&response)
+    {
+        let mut cache_write = state.analytics_cache.write().await;
+        *cache_write = Some((std::time::Instant::now(), val));
+    }
+
+    Ok(Json(response).into_response())
 }
 
 /// Handles `GET /api/stats/intersection`.

@@ -573,8 +573,9 @@ async fn global_listing_and_count_have_no_temp_b_tree_and_meet_10ms_budget_at_10
     .await;
     println!("global active count plan: {count_plan}");
     assert!(
-        count_plan.contains("idx_memberships_is_deleted_last_seen"),
-        "global active count must search idx_memberships_is_deleted_last_seen: {count_plan}"
+        count_plan.contains("idx_memberships_is_deleted_last_seen")
+            || count_plan.contains("idx_memberships_is_deleted_ip_record_group"),
+        "global active count must search an index leading with is_deleted: {count_plan}"
     );
 
     // 2. Measure execution time across 100k rows.

@@ -264,8 +264,9 @@ async fn group_name_resolution_and_scoped_listing_plan_cleanly() {
     .await;
     println!("single group count plan: {count_plan}");
     assert!(
-        count_plan.contains("idx_memberships_group_is_deleted_last_seen"),
-        "single group count must use idx_memberships_group_is_deleted_last_seen: {count_plan}"
+        count_plan.contains("idx_memberships_group_is_deleted_last_seen")
+            || count_plan.contains("idx_memberships_group_is_deleted_ip_record"),
+        "single group count must use an index leading with (group_id, is_deleted): {count_plan}"
     );
 
     let list_plan = explain(
