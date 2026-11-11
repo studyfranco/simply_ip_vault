@@ -31,11 +31,14 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Ensure Cargo.lock exists
+        run: if [ ! -f Cargo.lock ]; then cargo generate-lockfile; fi
+
       - name: Security audit
         uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          args: --ignore RUSTSEC-2026-0459
+          ignore: RUSTSEC-2026-0459
 
       - name: Run workspace tests
         run: cargo test --workspace --verbose
