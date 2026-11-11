@@ -285,4 +285,42 @@ async fn group_name_resolution_and_scoped_listing_plan_cleanly() {
         "single group list must use idx_memberships_group_is_deleted_last_seen: {list_plan}"
     );
     assert!(!list_plan.contains("TEMP B-TREE"), "single group list must not sort through a temp b-tree: {list_plan}");
+
+    // Verify plans survive ANALYZE and table statistics without regressing to temp b-tree sorts.
+    db.execute_unprepared("ANALYZE").await.unwrap();
+
+    let list_plan_analyzed = explain(
+        &db,
+        "SELECT m.id, m.ip_record_id, m.group_id, m.is_locked, m.created_at, m.last_seen_at, m.is_deleted, m.deleted_at, m.deleted_by, \
+         r.id, r.target_address, r.created_at \
+         FROM ip_record_group_memberships m \
+         INNER JOIN ip_records r ON m.ip_record_id = r.id \
+         WHERE m.is_deleted = ? AND m.group_id = ? \
+         ORDER BY m.last_seen_at DESC, m.id ASC LIMIT 50 OFFSET 0",
+    )
+    .await;
+    println!("single group list plan after ANALYZE: {list_plan_analyzed}");
+    assert!(
+        list_plan_analyzed.contains("idx_memberships_group_is_deleted_last_seen"),
+        "post-ANALYZE group list must use idx_memberships_group_is_deleted_last_seen: {list_plan_analyzed}"
+    );
+    assert!(!list_plan_analyzed.contains("TEMP B-TREE"), "post-ANALYZE group list must not sort through temp b-tree: {list_plan_analyzed}");
+
+    let global_plan_analyzed = explain(
+        &db,
+        "SELECT m.id, m.ip_record_id, m.group_id, m.is_locked, m.created_at, m.last_seen_at, m.is_deleted, m.deleted_at, m.deleted_by, \
+         r.id, r.target_address, r.created_at \
+         FROM ip_record_group_memberships m \
+         INNER JOIN ip_records r ON m.ip_record_id = r.id \
+         WHERE m.is_deleted = ? \
+         ORDER BY m.last_seen_at DESC, m.id ASC LIMIT 50 OFFSET 0",
+    )
+    .await;
+    println!("global list plan after ANALYZE: {global_plan_analyzed}");
+    assert!(
+        global_plan_analyzed.contains("idx_memberships_is_deleted_last_seen")
+            || global_plan_analyzed.contains("idx_memberships_global_active_last_seen"),
+        "post-ANALYZE global list must use covering index: {global_plan_analyzed}"
+    );
+    assert!(!global_plan_analyzed.contains("TEMP B-TREE"), "post-ANALYZE global list must not sort through temp b-tree: {global_plan_analyzed}");
 }

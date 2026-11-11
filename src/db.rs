@@ -106,7 +106,7 @@ use sea_orm_migration::MigratorTrait;
 /// latency instead of a failed request. See also the write-batching in `api::records`/`api::support`
 /// that reduces *how many* separate write-lock acquisitions one logical request makes in the first
 /// place, which addresses the contention itself rather than just how long a caller tolerates it.
-pub const SQLITE_BUSY_TIMEOUT_MS: u32 = 10_000;
+pub const SQLITE_BUSY_TIMEOUT_MS: u32 = 30_000;
 
 /// Overrides the memory-mapped I/O window, in bytes. Env `SQLITE_MMAP_SIZE_BYTES`.
 pub const SQLITE_MMAP_SIZE_BYTES_ENV: &str = "SQLITE_MMAP_SIZE_BYTES";
@@ -208,7 +208,7 @@ fn build_sqlite_connect_options(db_url: &str) -> Result<SqliteConnectOptions, Db
         // companion to WAL: it keeps full durability against process crashes and gives up only the
         // last transactions in a power loss, in exchange for not fsyncing on every commit.
         .synchronous(SqliteSynchronous::Normal)
-        .busy_timeout(std::time::Duration::from_millis(u64::from(SQLITE_BUSY_TIMEOUT_MS)))
+        .busy_timeout(crate::config::sqlite_busy_timeout())
         // TEMP tables and indexes (the sort in `ORDER BY ... USE TEMP B-TREE`, a `GROUP BY`'s
         // aggregation buffer) default to a disk-backed file. `MEMORY` keeps them in the process's
         // own heap instead — a real win for the query shapes this service actually runs, all of
@@ -497,10 +497,11 @@ pub async fn apply_sqlite_pragmas(db: &DatabaseConnection) -> Result<(), DbErr> 
     // The remaining four are set-and-log. Each is per-connection, so on a pool this reaches
     // whichever connection serves it — which is precisely why `connect` sets them at open time and
     // why these calls are confirmation rather than mechanism.
+    let busy_ms = crate::config::sqlite_busy_timeout().as_millis();
     for (label, statement) in [
         ("foreign key enforcement", "PRAGMA foreign_keys=ON;".to_owned()),
         ("synchronous mode", "PRAGMA synchronous=NORMAL;".to_owned()),
-        ("busy timeout", format!("PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS};")),
+        ("busy timeout", format!("PRAGMA busy_timeout={busy_ms};")),
         ("temp store", "PRAGMA temp_store=MEMORY;".to_owned()),
         ("analysis limit", "PRAGMA analysis_limit=400;".to_owned()),
     ] {
@@ -524,7 +525,7 @@ pub async fn apply_sqlite_pragmas(db: &DatabaseConnection) -> Result<(), DbErr> 
     }
     tracing::info!(
         "SQLite session pragmas applied: foreign_keys=ON, synchronous=NORMAL, \
-         busy_timeout={SQLITE_BUSY_TIMEOUT_MS}ms, temp_store=MEMORY, \
+         busy_timeout={busy_ms}ms, temp_store=MEMORY, \
          mmap_size={}MiB, cache_size={}MiB.",
         mmap_bytes / (1024 * 1024),
         cache_kib / 1024,
@@ -677,7 +678,7 @@ mod tests {
         assert_eq!(pragma::<i32>(&db, "PRAGMA foreign_keys;", "foreign_keys").await, 1, "ON");
         assert_eq!(
             pragma::<i32>(&db, "PRAGMA busy_timeout;", "timeout").await,
-            SQLITE_BUSY_TIMEOUT_MS as i32
+            crate::config::sqlite_busy_timeout().as_millis() as i32
         );
         // `temp_store`: 0 = engine default (a disk file), 1 = FILE, 2 = MEMORY. `.pragma("temp_store",
         // "MEMORY")` at connect time must actually have taken, not merely been accepted as a

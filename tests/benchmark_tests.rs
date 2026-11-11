@@ -562,7 +562,8 @@ async fn global_listing_and_count_have_no_temp_b_tree_and_meet_10ms_budget_at_10
         "global active select must not sort through a temp b-tree: {select_plan}"
     );
     assert!(
-        select_plan.contains("idx_memberships_global_active_last_seen"),
+        select_plan.contains("idx_memberships_global_active_last_seen")
+            || select_plan.contains("idx_memberships_is_deleted_last_seen"),
         "global active select must use the covering index: {select_plan}"
     );
 

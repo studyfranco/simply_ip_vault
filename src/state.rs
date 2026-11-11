@@ -102,7 +102,7 @@ pub struct AppState {
     pub master_pin: Arc<MasterPin>,
     /// In-memory cache for analytical statistics (`GET /api/stats/analytics`), TTL ~300s (5 minutes).
     /// Prevents repeated expensive full-table queries when multiple dashboard tabs or users refresh.
-    pub analytics_cache: Arc<tokio::sync::RwLock<Option<(std::time::Instant, serde_json::Value)>>>,
+    pub analytics_cache: Arc<tokio::sync::RwLock<std::collections::HashMap<Option<Vec<uuid::Uuid>>, (std::time::Instant, serde_json::Value)>>>,
     /// Singleflight lock to prevent cache stampedes when computing analytical statistics.
     pub analytics_lock: Arc<tokio::sync::Mutex<()>>,
 }
@@ -130,7 +130,7 @@ impl AppState {
             cipher: Arc::new(SecretCipher::from_env()?),
             replay: Arc::new(ReplayGuard::default()),
             master_pin: Arc::new(MasterPin::new()),
-            analytics_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            analytics_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             analytics_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
@@ -153,7 +153,7 @@ impl AppState {
             cipher: Arc::new(cipher),
             replay: Arc::new(ReplayGuard::default()),
             master_pin: Arc::new(MasterPin::new()),
-            analytics_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            analytics_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             analytics_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }

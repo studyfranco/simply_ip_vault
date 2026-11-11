@@ -331,8 +331,22 @@ pub fn database_idle_timeout() -> std::time::Duration {
 pub fn database_acquire_timeout() -> std::time::Duration {
     static VALUE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     std::time::Duration::from_secs(*VALUE.get_or_init(|| {
-        clamp_acquire_timeout_secs(numeric_env::<u64>(DATABASE_ACQUIRE_TIMEOUT_ENV, 10))
+        clamp_acquire_timeout_secs(numeric_env::<u64>(DATABASE_ACQUIRE_TIMEOUT_ENV, 30))
     }))
+}
+
+/// Environment variable overriding the SQLite `busy_timeout` pragma in milliseconds.
+pub const SQLITE_BUSY_TIMEOUT_MS_ENV: &str = "SQLITE_BUSY_TIMEOUT_MS";
+/// Default SQLite busy timeout: 30,000 ms (30 seconds).
+pub const DEFAULT_SQLITE_BUSY_TIMEOUT_MS: u64 = 30_000;
+
+/// Reads [`SQLITE_BUSY_TIMEOUT_MS_ENV`] or defaults to 30,000ms. Clamped to at least 1,000ms.
+pub fn sqlite_busy_timeout() -> std::time::Duration {
+    static VALUE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *VALUE.get_or_init(|| {
+        numeric_env::<u64>(SQLITE_BUSY_TIMEOUT_MS_ENV, DEFAULT_SQLITE_BUSY_TIMEOUT_MS).max(1_000)
+    });
+    std::time::Duration::from_millis(ms)
 }
 
 /// Hard ceiling on the file-backed SQLite tier's connection count, regardless of what

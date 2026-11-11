@@ -301,28 +301,29 @@ pub async fn get_analytics(
             }).into_response());
     }
 
-    // Global analytics caching for Master or keys with full access (TTL 300s = 5 minutes).
-    let is_global = authorized_groups.is_none();
-    if is_global {
+    // Analytics caching per authorization scope (TTL 300s = 5 minutes).
+    let cache_key: Option<Vec<Uuid>> = authorized_groups.as_ref().map(|g| {
+        let mut v: Vec<Uuid> = g.iter().copied().collect();
+        v.sort();
+        v
+    });
+
+    {
         let cache_read = state.analytics_cache.read().await;
-        if let Some((ts, ref payload)) = *cache_read
+        if let Some((ts, payload)) = cache_read.get(&cache_key)
             && ts.elapsed() < std::time::Duration::from_secs(300)
         {
             return Ok(Json(payload.clone()).into_response());
         }
     }
 
-    // Acquire singleflight lock if calculating global stats to serialize concurrent requests
+    // Acquire singleflight lock to serialize concurrent analytics requests
     // and prevent database lock contention.
-    let _singleflight_guard = if is_global {
-        Some(state.analytics_lock.lock().await)
-    } else {
-        None
-    };
+    let _singleflight_guard = state.analytics_lock.lock().await;
 
-    if is_global {
+    {
         let cache_read = state.analytics_cache.read().await;
-        if let Some((ts, ref payload)) = *cache_read
+        if let Some((ts, payload)) = cache_read.get(&cache_key)
             && ts.elapsed() < std::time::Duration::from_secs(300)
         {
             return Ok(Json(payload.clone()).into_response());
@@ -758,11 +759,9 @@ pub async fn get_analytics(
         velocity_7d,
     };
 
-    if is_global
-        && let Ok(val) = serde_json::to_value(&response)
-    {
+    if let Ok(val) = serde_json::to_value(&response) {
         let mut cache_write = state.analytics_cache.write().await;
-        *cache_write = Some((std::time::Instant::now(), val));
+        cache_write.insert(cache_key, (std::time::Instant::now(), val));
     }
 
     Ok(Json(response).into_response())

@@ -375,9 +375,16 @@ async fn bench_api_keys_batching_vs_n_plus_one() {
         }
     }
 
+    // Warm-up both paths to ensure cached plans and memory pages
+    for _ in 0..5 {
+        let keys = api_key::Entity::find().all(&db).await.unwrap();
+        let kids: Vec<Uuid> = keys.iter().map(|k| k.id).collect();
+        let _ = simply_ip_vault::api::batch_key_group_permissions(&db, &kids, None).await.unwrap();
+    }
+
     // 1. Measure N+1 unbatched loading (51 queries for 50 keys)
     let start_n_plus_one = Instant::now();
-    for _ in 0..10 {
+    for _ in 0..20 {
         let keys = api_key::Entity::find().all(&db).await.unwrap();
         let mut summaries = Vec::with_capacity(keys.len());
         for k in keys {
@@ -388,11 +395,11 @@ async fn bench_api_keys_batching_vs_n_plus_one() {
         }
         assert_eq!(summaries.len(), 50);
     }
-    let dur_n_plus_one = start_n_plus_one.elapsed() / 10;
+    let dur_n_plus_one = start_n_plus_one.elapsed() / 20;
 
     // 2. Measure batched loading (2 queries total for 50 keys)
     let start_batched = Instant::now();
-    for _ in 0..10 {
+    for _ in 0..20 {
         let keys = api_key::Entity::find().all(&db).await.unwrap();
         let kids: Vec<Uuid> = keys.iter().map(|k| k.id).collect();
         let mut perm_map = simply_ip_vault::api::batch_key_group_permissions(&db, &kids, None)
@@ -407,7 +414,7 @@ async fn bench_api_keys_batching_vs_n_plus_one() {
             .collect();
         assert_eq!(summaries.len(), 50);
     }
-    let dur_batched = start_batched.elapsed() / 10;
+    let dur_batched = start_batched.elapsed() / 20;
 
     println!(
         "API keys listing for 50 keys: N+1 unbatched (51 queries) = {:?}, batched (2 queries) = {:?}",
