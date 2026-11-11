@@ -570,6 +570,19 @@ class FirewallClient {
 
     async init() {
         this.bindEvents();
+
+        if (window.location.protocol === 'file:') {
+            this.showLogin();
+            const errEl = document.getElementById('login-error');
+            if (errEl) {
+                errEl.textContent = "This dashboard must be opened through the daemon's own web server (http:// or https://), not as a local file — opening index.html directly blocks every request this page makes.";
+                errEl.classList.remove('hidden');
+            }
+            document.getElementById('login-form')?.querySelectorAll('input, button')
+                ?.forEach(el => { el.disabled = true; });
+            return;
+        }
+
         // Both halves of the credential are required: the key alone can no longer authenticate.
         if (this.apiKey && this.signingSecret) {
             await this.verifyAuth();
@@ -1078,23 +1091,22 @@ class FirewallClient {
     // Data Loading
     // ───────────────────────────────────────────────────────
     async loadInitialData() {
-        await this.loadIps();
-        if (this.state.profile.is_master || this.state.profile.can_manage_keys) {
-            await this.loadKeys();
+        const tasks = [
+            this.loadIps(),
+            this.loadGroups(),
+        ];
+        if (this.state.profile?.is_master || this.state.profile?.can_manage_keys) {
+            tasks.push(this.loadKeys());
         }
-        // Unconditional (not scope-gated): GET /api/groups is safe for any authenticated key —
-        // the backend already narrows results to what that key can read — and the result feeds
-        // the IP Group filter's suggestion combobox for every user, not just the admin-only
-        // "Manage Group Rights" and "Target Group" selectors on the Keys/Webhooks tabs.
-        await this.loadGroups();
-        if (this.state.profile.is_master || this.state.profile.can_manage_webhooks) {
-            await this.loadWebhooks();
-            await this.loadExecutions();
+        if (this.state.profile?.is_master || this.state.profile?.can_manage_webhooks) {
+            tasks.push(this.loadWebhooks());
+            tasks.push(this.loadExecutions());
         }
-        if (this.state.profile.is_master) {
-            await this.loadSettings();
-            await this.loadAuditLogs();
+        if (this.state.profile?.is_master) {
+            tasks.push(this.loadSettings());
+            tasks.push(this.loadAuditLogs());
         }
+        await Promise.allSettled(tasks);
     }
 
     // Fetches one chunk (up to 100 records) from the server for the current filter values —

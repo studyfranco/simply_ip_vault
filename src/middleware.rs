@@ -325,9 +325,15 @@ pub async fn auth_middleware(
     let mut key_record = key_record;
     state.master_pin.authenticate(&state.db, &mut key_record).await;
 
+    let key_id = key_record.id;
     let mut req = Request::from_parts(parts, Body::from(body_bytes));
     req.extensions_mut().insert(ClientIp(client_ip));
     req.extensions_mut().insert(key_record);
 
-    Ok(next.run(req).await)
+    let res = next.run(req).await;
+    if res.status().is_server_error() {
+        state.replay.unrecord(key_id, &digest);
+    }
+
+    Ok(res)
 }

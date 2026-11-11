@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use chrono::Utc;
 use sea_orm::{
-    ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, TransactionTrait,
-    sea_query::{Expr, ExprTrait, Query},
+    ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, SqliteTransactionMode,
+    TransactionOptions, TransactionTrait, sea_query::{Expr, ExprTrait, Query},
 };
 use tokio::sync::mpsc;
 
@@ -85,7 +85,12 @@ pub async fn purge_expired_ip_records(
 
     let threshold = (Utc::now() - chrono::Duration::days(retention_days)).naive_utc();
 
-    let txn = db.begin().await?;
+    let txn = db
+        .begin_with_options(TransactionOptions {
+            sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
+            ..Default::default()
+        })
+        .await?;
     let result = ip_record_group_membership::Entity::delete_many()
         .filter(ip_record_group_membership::Column::IsDeleted.eq(true))
         .filter(ip_record_group_membership::Column::DeletedAt.is_not_null())
@@ -155,7 +160,7 @@ pub async fn run_retention_worker(db: DatabaseConnection, mut shutdown: mpsc::Re
 
     // First tick delayed so startup, master key pinning, and initial health checks complete cleanly
     // before the first retention sweep acquires write transactions.
-    let initial_delay = Duration::from_secs(std::cmp::min(10, sweep_seconds));
+    let initial_delay = Duration::from_secs(std::cmp::min(60, sweep_seconds));
     let mut ticker = tokio::time::interval_at(
         tokio::time::Instant::now() + initial_delay,
         Duration::from_secs(sweep_seconds),
@@ -293,7 +298,8 @@ pub async fn run_webhook_execution_retention_worker(
         "Webhook execution retention worker started."
     );
 
-    let initial_delay = Duration::from_secs(std::cmp::min(10, sweep_seconds));
+    // Deliberately delayed past IP retention to prevent write-lock collisions on SQLite.
+    let initial_delay = Duration::from_secs(std::cmp::min(120, sweep_seconds));
     let mut ticker = tokio::time::interval_at(
         tokio::time::Instant::now() + initial_delay,
         Duration::from_secs(sweep_seconds),

@@ -201,6 +201,19 @@ impl ReplayGuard {
         }
     }
 
+    /// Removes a recorded signature digest so that a transiently failed request (e.g. 503 Service
+    /// Unavailable due to SQLite database locking or connection pool exhaustion) can be retried by
+    /// the caller with the same signature without being falsely rejected as a replay.
+    pub fn unrecord(&self, key_id: Uuid, digest: &[u8]) {
+        if let Ok(mut seen) = self.seen.lock() {
+            let id = SignatureId {
+                key_id,
+                digest: digest.to_vec(),
+            };
+            seen.remove(&id);
+        }
+    }
+
     /// How many signatures are currently remembered.
     ///
     /// Test-only, so a suite can assert that expired entries are actually *released* rather than
@@ -274,6 +287,11 @@ mod tests {
         assert!(guard.check_and_record(key, &digest(1)), "the first use is the legitimate request");
         assert!(!guard.check_and_record(key, &digest(1)), "the same signature is a replay");
         assert!(!guard.check_and_record(key, &digest(1)), "...and stays one on every later attempt");
+
+        // Unrecord allows retrying the request after a transient failure
+        guard.unrecord(key, &digest(1));
+        assert!(guard.check_and_record(key, &digest(1)), "unrecorded signature can be used again");
+        assert!(!guard.check_and_record(key, &digest(1)), "and is protected against replays once again");
     }
 
     #[tokio::test]
