@@ -70,8 +70,8 @@ async fn bootstrap_master_key(
         return Ok(());
     }
 
-    let plaintext_key = match std::env::var(simply_ip_vault::config::INITIAL_MASTER_KEY_ENV) {
-        Ok(fixed_key) if !fixed_key.is_empty() => {
+    let plaintext_key = match simply_ip_vault::config::get_secret_or_env(simply_ip_vault::config::INITIAL_MASTER_KEY_ENV) {
+        Some(fixed_key) if !fixed_key.is_empty() => {
             // Strict, and fatal. Until this check existed the variable accepted any non-empty
             // string, with the warning below as the only objection — a safeguard that reads like
             // one and stops nothing. See `config::validate_initial_master_key`.
@@ -96,8 +96,8 @@ async fn bootstrap_master_key(
     };
     // The signing secret follows the same rule as the key itself: deterministic when explicitly
     // provided for test/CI bootstrap, random otherwise.
-    let signing_secret = match std::env::var("INITIAL_MASTER_SIGNING_SECRET") {
-        Ok(fixed_secret) if !fixed_secret.is_empty() => {
+    let signing_secret = match simply_ip_vault::config::get_secret_or_env("INITIAL_MASTER_SIGNING_SECRET") {
+        Some(fixed_secret) if !fixed_secret.is_empty() => {
             tracing::warn!(
                 "INITIAL_MASTER_SIGNING_SECRET is set: using the provided value as the master \
                  key's HMAC signing secret instead of generating a random one. Intended for \
@@ -248,8 +248,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "sqlite://simply_ip_vault.db?mode=rwc".to_owned());
+    let db_url = simply_ip_vault::config::get_secret_or_env("DATABASE_URL")
+        .unwrap_or_else(|| "sqlite://simply_ip_vault.db?mode=rwc".to_owned());
 
     // Built once, here, and carried in `AppState` from now on — never re-read per request.
     //

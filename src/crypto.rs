@@ -267,14 +267,8 @@ impl SecretCipher {
     /// betray that belief at exactly the wrong moment. `main` propagates this, so the daemon refuses
     /// to start rather than degrading quietly.
     pub fn from_env() -> Result<Self, CryptoError> {
-        let configured = std::env::var(ENCRYPTION_KEY_ENV)
-            .ok()
-            .filter(|raw| !raw.trim().is_empty())
-            .or_else(|| {
-                std::env::var(ENCRYPTION_KEY_ENV_ALIAS)
-                    .ok()
-                    .filter(|raw| !raw.trim().is_empty())
-            });
+        let configured = crate::config::get_secret_or_env(ENCRYPTION_KEY_ENV)
+            .or_else(|| crate::config::get_secret_or_env(ENCRYPTION_KEY_ENV_ALIAS));
 
         match configured {
             Some(raw) => Self::from_hex_key(raw.trim()),
