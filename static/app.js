@@ -3516,6 +3516,7 @@ class FirewallClient {
         const modalCreateKey = document.getElementById('create-key-modal');
         const formCreateKey = document.getElementById('form-create-apikey');
         const btnCancelCreateKey = document.getElementById('btn-cancel-create-key');
+        const btnCloseXCreateKey = document.getElementById('create-key-close-x');
         if (btnOpenCreateKey && modalCreateKey) {
             btnOpenCreateKey.addEventListener('click', () => {
                 modalCreateKey.classList.remove('hidden');
@@ -3524,6 +3525,12 @@ class FirewallClient {
         }
         if (btnCancelCreateKey && modalCreateKey) {
             btnCancelCreateKey.addEventListener('click', () => {
+                modalCreateKey.classList.add('hidden');
+                formCreateKey?.reset();
+            });
+        }
+        if (btnCloseXCreateKey && modalCreateKey) {
+            btnCloseXCreateKey.addEventListener('click', () => {
                 modalCreateKey.classList.add('hidden');
                 formCreateKey?.reset();
             });

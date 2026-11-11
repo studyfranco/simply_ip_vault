@@ -169,6 +169,13 @@ body {
     letter-spacing: -0.02em;
 }
 
+.header-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+}
+
 .api-key-container {
     display: flex;
     align-items: center;
@@ -805,12 +812,12 @@ body {
 
 /* ─── List Section ──────────────────────────────────────── */
 
-.list-section .list-header {
+.list-header {
     display: flex;
     flex-wrap: wrap;
     justify-content: space-between;
     align-items: center;
-    margin-bottom: 1rem;
+    margin-bottom: 1.25rem;
     gap: 0.75rem;
 }
 
@@ -1490,17 +1497,16 @@ body {
 
 .form-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
     gap: 1rem;
     margin-bottom: 1.5rem;
 }
 
 .permissions-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-    gap: 0.75rem;
-    margin-top: 1rem;
-    padding: 1rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1rem;
+    padding: 0.75rem 1rem;
     background-color: var(--bg-surface);
     border-radius: var(--radius);
     border: 1px solid var(--border);
@@ -1690,7 +1696,7 @@ body {
    wide monitor actually gets to use the extra space for these longer, denser fields instead of
    floating a fixed-size box in a sea of unused background. */
 .modal-card-form {
-    max-width: clamp(420px, 65vw, 1200px);
+    max-width: clamp(420px, 60vw, 840px);
     max-height: calc(100vh - 3rem);
     overflow-y: auto;
 }

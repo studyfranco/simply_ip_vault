@@ -970,7 +970,10 @@
     <div id="create-key-modal" class="modal-overlay hidden" role="dialog" aria-modal="true"
          aria-labelledby="create-key-modal-title">
         <div class="modal-card modal-card-form card">
-            <h3 id="create-key-modal-title">Create API Key</h3>
+            <div class="modal-header">
+                <h3 id="create-key-modal-title">Create API Key</h3>
+                <button type="button" id="create-key-close-x" class="btn-modal-close" aria-label="Close">&times;</button>
+            </div>
             <p class="subtitle">Issue a new API key with specific network bindings and global scopes.</p>
             <form id="form-create-apikey">
                 <div class="form-grid">
@@ -980,7 +983,7 @@
                     </div>
                     <div class="form-group">
                         <label for="apikey-bound-ips">Bound IPs (CIDR) <span>*</span></label>
-                        <textarea id="apikey-bound-ips" placeholder="e.g. 127.0.0.1/32" required class="input-field" rows="2"></textarea>
+                        <input type="text" id="apikey-bound-ips" placeholder="0.0.0.0/0,::/0" required class="input-field font-mono">
                     </div>
                 </div>
 
@@ -990,18 +993,15 @@
                 <div class="permissions-grid mt-2 mb-4" id="apikey-scope-grid">
                     <label class="checkbox-container">
                         <input type="checkbox" id="apikey-can-manage-keys">
-                        <span class="checkmark"></span>
-                        Manage Keys
+                        <span>can_manage_keys</span>
                     </label>
                     <label class="checkbox-container">
                         <input type="checkbox" id="apikey-can-manage-webhooks">
-                        <span class="checkmark"></span>
-                        Manage Webhooks
+                        <span>can_manage_webhooks</span>
                     </label>
                     <label class="checkbox-container">
                         <input type="checkbox" id="apikey-can-create-groups">
-                        <span class="checkmark"></span>
-                        Can Create Groups
+                        <span>can_create_groups</span>
                     </label>
                 </div>
                 <p class="rbac-note mt-2 mb-4 hidden" id="apikey-scope-note">
@@ -1014,7 +1014,7 @@
 
                 <div class="form-actions mt-4">
                     <button type="submit" class="btn btn-primary">Create Key</button>
-                    <button type="button" id="btn-cancel-create-key" class="btn btn-cancel">Cancel</button>
+                    <button type="button" id="btn-cancel-create-key" class="btn btn-secondary">Cancel</button>
                 </div>
             </form>
         </div>
