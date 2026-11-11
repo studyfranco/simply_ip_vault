@@ -2194,3 +2194,155 @@ input[type="checkbox"]:indeterminate::after {
     margin-right: 0.3rem;
     margin-bottom: 0.2rem;
 }
+
+/* ─── Ban Breakdown & Velocity Visuals ──────────────────── */
+
+.ban-breakdown-body {
+    display: flex;
+    flex-direction: column;
+    padding: 0.5rem 0;
+}
+
+.ban-breakdown-stats {
+    display: flex;
+    justify-content: space-between;
+    gap: 1.5rem;
+}
+
+.breakdown-stat-item {
+    display: flex;
+    flex-direction: column;
+}
+
+.breakdown-label {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    font-weight: 500;
+    margin-bottom: 0.35rem;
+}
+
+.breakdown-value {
+    font-size: 1.75rem;
+    font-weight: 700;
+    font-family: var(--font-mono);
+    line-height: 1.1;
+}
+
+.breakdown-pct {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    margin-top: 0.25rem;
+}
+
+.text-accent {
+    color: var(--accent);
+}
+
+.text-highlight {
+    color: var(--highlight);
+}
+
+.text-success {
+    color: #4ade80;
+}
+
+.breakdown-progress-container {
+    height: 10px;
+    background-color: rgba(61, 174, 233, 0.25);
+    border-radius: 9999px;
+    overflow: hidden;
+    position: relative;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.breakdown-progress-bar {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), #16b37c);
+    border-radius: 9999px;
+    transition: width var(--transition-slow);
+}
+
+.velocity-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 1rem;
+    padding: 0.5rem 0;
+}
+
+.velocity-box {
+    background-color: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem;
+}
+
+.velocity-header {
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+    margin-bottom: 0.75rem;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    padding-bottom: 0.35rem;
+}
+
+.velocity-metrics {
+    display: flex;
+    justify-content: space-around;
+    gap: 1rem;
+}
+
+.velocity-metric {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.velocity-num {
+    font-size: 1.5rem;
+    font-weight: 700;
+    font-family: var(--font-mono);
+}
+
+.velocity-label {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-top: 0.25rem;
+}
+
+/* ─── Harmonized Audit Log Action Badges ─────────────────── */
+.badge-action-create,
+.badge-success {
+    background-color: rgba(34, 197, 94, 0.15);
+    color: #4ade80;
+    border: 1px solid rgba(34, 197, 94, 0.35);
+}
+
+.badge-action-delete,
+.badge-danger {
+    background-color: rgba(239, 68, 68, 0.15);
+    color: #f87171;
+    border: 1px solid rgba(239, 68, 68, 0.35);
+}
+
+.badge-action-update,
+.badge-warning {
+    background-color: rgba(245, 158, 11, 0.15);
+    color: #fbbf24;
+    border: 1px solid rgba(245, 158, 11, 0.35);
+}
+
+.badge-action-execute,
+.badge-info,
+.badge-highlight {
+    background-color: rgba(59, 130, 246, 0.15);
+    color: #60a5fa;
+    border: 1px solid rgba(59, 130, 246, 0.35);
+}
+
+.badge-action-auth {
+    background-color: rgba(168, 85, 247, 0.15);
+    color: #c084fc;
+    border: 1px solid rgba(168, 85, 247, 0.35);
+}

@@ -1018,8 +1018,8 @@ class FirewallClient {
         const mayCreateKeys = p.is_master || p.can_manage_keys;
         const btnOpenCreateKey = document.getElementById('btn-open-create-key');
         if (btnOpenCreateKey) btnOpenCreateKey.classList.toggle('hidden', !mayCreateKeys);
-        const createKeyForm = document.getElementById('form-create-apikey');
-        if (createKeyForm && !mayCreateKeys) createKeyForm.classList.add('hidden');
+        const createKeyModal = document.getElementById('create-key-modal');
+        if (createKeyModal && !mayCreateKeys) createKeyModal.classList.add('hidden');
 
         // ── Master-only global scopes (R4) ──────────────────────────────────
         //
@@ -1345,8 +1345,8 @@ class FirewallClient {
                     const causeBadges = (r.latest_causes || []).map(cause =>
                         `<span class="badge-cause">${escapeHtml(cause)}</span>`
                     ).join('') || '<span class="text-muted">—</span>';
-                    const firstSeen = r.first_seen ? formatDateTime(r.first_seen) : '—';
-                    const lastSeen = r.last_seen ? formatDateTime(r.last_seen) : '—';
+                    const firstSeen = r.first_seen ? formatTimestamp(r.first_seen) : '—';
+                    const lastSeen = r.last_seen ? formatTimestamp(r.last_seen) : '—';
                     return `
                         <tr>
                             <td class="font-mono font-bold">${escapeHtml(r.target_address)}</td>
@@ -1355,6 +1355,63 @@ class FirewallClient {
                             <td class="text-muted">${firstSeen}</td>
                             <td class="text-muted">${lastSeen}</td>
                             <td>${causeBadges}</td>
+                        </tr>
+                    `;
+                }).join('');
+            }
+        }
+
+        // 4. Locked vs Dynamic bans breakdown
+        if (data.locked_breakdown) {
+            const lb = data.locked_breakdown;
+            const lockedEl = document.getElementById('stat-locked-count');
+            const dynamicEl = document.getElementById('stat-dynamic-count');
+            const lockedPctEl = document.getElementById('stat-locked-pct');
+            const dynamicPctEl = document.getElementById('stat-dynamic-pct');
+            const totalEl = document.getElementById('stat-breakdown-total');
+            const barEl = document.getElementById('stat-breakdown-bar');
+
+            const total = lb.total_active || (lb.locked_count + lb.dynamic_count) || 0;
+            const lockedPct = total > 0 ? ((lb.locked_count / total) * 100).toFixed(1) : '0.0';
+            const dynamicPct = total > 0 ? ((lb.dynamic_count / total) * 100).toFixed(1) : '0.0';
+
+            if (lockedEl) lockedEl.textContent = (lb.locked_count || 0).toLocaleString();
+            if (dynamicEl) dynamicEl.textContent = (lb.dynamic_count || 0).toLocaleString();
+            if (lockedPctEl) lockedPctEl.textContent = `${lockedPct} %`;
+            if (dynamicPctEl) dynamicPctEl.textContent = `${dynamicPct} %`;
+            if (totalEl) totalEl.textContent = total.toLocaleString();
+            if (barEl) barEl.style.width = `${lockedPct}%`;
+        }
+
+        // 5. Velocity breakdown (24h & 7d)
+        if (data.velocity_24h) {
+            const v24Active = document.getElementById('stat-velocity-24h-active');
+            const v24Deleted = document.getElementById('stat-velocity-24h-deleted');
+            if (v24Active) v24Active.textContent = (data.velocity_24h.active_added_or_seen || 0).toLocaleString();
+            if (v24Deleted) v24Deleted.textContent = (data.velocity_24h.soft_deleted || 0).toLocaleString();
+        }
+        if (data.velocity_7d) {
+            const v7Active = document.getElementById('stat-velocity-7d-active');
+            const v7Deleted = document.getElementById('stat-velocity-7d-deleted');
+            if (v7Active) v7Active.textContent = (data.velocity_7d.active_added_or_seen || 0).toLocaleString();
+            if (v7Deleted) v7Deleted.textContent = (data.velocity_7d.soft_deleted || 0).toLocaleString();
+        }
+
+        // 6. Subnet / CIDR distribution table
+        const subnetsTbody = document.getElementById('analytics-subnets-table-body');
+        if (subnetsTbody) {
+            const list = data.cidr_breakdown || [];
+            if (list.length === 0) {
+                subnetsTbody.innerHTML = '<tr><td colspan="3" class="text-center text-muted">No subnet distribution data recorded.</td></tr>';
+            } else {
+                const totalActive = data.total_active_ips || 1;
+                subnetsTbody.innerHTML = list.map(item => {
+                    const share = ((item.active_count / totalActive) * 100).toFixed(1);
+                    return `
+                        <tr>
+                            <td class="font-mono font-bold">${escapeHtml(item.subnet)}</td>
+                            <td class="font-mono">${item.active_count.toLocaleString()}</td>
+                            <td><span class="badge badge-scope">${share} %</span></td>
                         </tr>
                     `;
                 }).join('');
@@ -1433,7 +1490,7 @@ class FirewallClient {
                 tbody.innerHTML = res.items.map(item => {
                     const dateCols = res.groups.map(g => {
                         const ts = item.group_last_seen && item.group_last_seen[g.name];
-                        return `<td class="text-muted">${ts ? formatDateTime(ts) : '—'}</td>`;
+                        return `<td class="text-muted">${ts ? formatTimestamp(ts) : '—'}</td>`;
                     }).join('');
 
                     return `
@@ -2259,7 +2316,7 @@ class FirewallClient {
                 <td class="text-sm">${formatTimestamp(log.timestamp)}</td>
                 <td class="text-sm">${keyDisplay}</td>
                 <td class="font-mono text-sm">${escapeHtml(log.client_ip || '-')}</td>
-                <td><span class="badge badge-scope">${escapeHtml(log.action)}</span></td>
+                <td><span class="badge ${getActionBadgeClass(log.action)}">${escapeHtml(log.action)}</span></td>
                 <td class="font-mono text-sm">${escapeHtml(log.target_address || '-')}</td>
                 <td class="text-sm">${escapeHtml(log.group_names || '-')}</td>
                 <td class="text-sm">${escapeHtml(log.details || '-')}</td>
@@ -2484,16 +2541,20 @@ class FirewallClient {
 
         try {
             const res = await this.apiFetch('/keys', { method: 'POST', body: JSON.stringify(payload) });
-            const reveal = document.getElementById('apikey-created');
+            const createModal = document.getElementById('create-key-modal');
+            if (createModal) createModal.classList.add('hidden');
+            document.getElementById('form-create-apikey')?.reset();
+
             const pt = document.getElementById('apikey-plaintext');
-            pt.textContent = res.plaintext_key;
+            if (pt) pt.textContent = res.plaintext_key;
             // Both halves must be surfaced: a key without its signing secret cannot sign a single
             // request, and the secret is never retrievable again after this response.
-            document.getElementById('apikey-signing-secret').textContent = res.signing_secret;
-            reveal.classList.remove('hidden');
-            
-            document.getElementById('form-create-apikey').reset();
-            document.getElementById('form-create-apikey').classList.add('hidden');
+            const ss = document.getElementById('apikey-signing-secret');
+            if (ss) ss.textContent = res.signing_secret;
+
+            const revealModal = document.getElementById('key-secret-modal');
+            if (revealModal) revealModal.classList.remove('hidden');
+
             this.loadKeys();
         } catch(e) {}
     }
@@ -3419,22 +3480,43 @@ class FirewallClient {
             if (e.key === 'Enter') { e.preventDefault(); pageInput.blur(); }
         });
 
-        // Admin Forms
+        // Create Key modal
         const btnOpenCreateKey = document.getElementById('btn-open-create-key');
+        const modalCreateKey = document.getElementById('create-key-modal');
         const formCreateKey = document.getElementById('form-create-apikey');
         const btnCancelCreateKey = document.getElementById('btn-cancel-create-key');
-        if (btnOpenCreateKey && formCreateKey) {
+        if (btnOpenCreateKey && modalCreateKey) {
             btnOpenCreateKey.addEventListener('click', () => {
-                formCreateKey.classList.remove('hidden');
+                modalCreateKey.classList.remove('hidden');
                 document.getElementById('apikey-name')?.focus();
             });
         }
-        if (btnCancelCreateKey && formCreateKey) {
+        if (btnCancelCreateKey && modalCreateKey) {
             btnCancelCreateKey.addEventListener('click', () => {
-                formCreateKey.classList.add('hidden');
-                formCreateKey.reset();
+                modalCreateKey.classList.add('hidden');
+                formCreateKey?.reset();
             });
         }
+        modalCreateKey?.addEventListener('click', (e) => {
+            if (e.target.id === 'create-key-modal') {
+                modalCreateKey.classList.add('hidden');
+                formCreateKey?.reset();
+            }
+        });
+
+        // Key Secret Modal
+        const modalKeySecret = document.getElementById('key-secret-modal');
+        const btnKeySecretClose = document.getElementById('key-secret-close');
+        if (btnKeySecretClose && modalKeySecret) {
+            btnKeySecretClose.addEventListener('click', () => {
+                modalKeySecret.classList.add('hidden');
+            });
+        }
+        modalKeySecret?.addEventListener('click', (e) => {
+            if (e.target.id === 'key-secret-modal') {
+                modalKeySecret.classList.add('hidden');
+            }
+        });
 
         document.getElementById('form-create-apikey').addEventListener('submit', (e) => this.createApiKey(e));
         document.getElementById('form-manage-rights').addEventListener('submit', (e) => this.manageKeyRights(e));
@@ -3508,6 +3590,15 @@ class FirewallClient {
             if (e.key !== 'Escape') return;
             if (!document.getElementById('clone-webhook-modal').classList.contains('hidden')) {
                 this.closeCloneWebhookModal();
+            }
+            const createKeyModal = document.getElementById('create-key-modal');
+            if (createKeyModal && !createKeyModal.classList.contains('hidden')) {
+                createKeyModal.classList.add('hidden');
+                document.getElementById('form-create-apikey')?.reset();
+            }
+            const keySecretModal = document.getElementById('key-secret-modal');
+            if (keySecretModal && !keySecretModal.classList.contains('hidden')) {
+                keySecretModal.classList.add('hidden');
             }
         });
 
@@ -3672,6 +3763,27 @@ function formatTimestamp(raw) {
     const date = new Date(hasTimezone ? raw : `${raw}Z`);
     if (Number.isNaN(date.getTime())) return escapeHtml(raw);
     return date.toLocaleString();
+}
+
+/**
+ * Global fallback alias for formatTimestamp to avoid ReferenceError from any external or cached calls.
+ */
+function formatDateTime(raw) {
+    return formatTimestamp(raw);
+}
+
+/**
+ * Maps an audit log action string to harmonized CSS badge classes.
+ */
+function getActionBadgeClass(action) {
+    if (!action) return 'badge-scope';
+    const act = String(action).toUpperCase();
+    if (/CREATE|ADD|INSERT|REGISTER/.test(act)) return 'badge-action-create badge-success';
+    if (/DELETE|DESTROY|REVOKE|REMOVE|PURGE/.test(act)) return 'badge-action-delete badge-danger';
+    if (/UPDATE|EDIT|MODIFY|SET|ROTATE|RESTORE|LOCK|UNLOCK|GRANT/.test(act)) return 'badge-action-update badge-warning';
+    if (/EXECUTE|TRIGGER|DEPLOY|GENERATE|RELOAD|REFETCH|RUN|TEST|DISPATCH/.test(act)) return 'badge-action-execute badge-info badge-highlight';
+    if (/AUTH|LOGIN|SIGNIN|SIGNOUT|TOKEN/.test(act)) return 'badge-action-auth';
+    return 'badge-scope';
 }
 
 // Bootstrap

@@ -27,8 +27,11 @@ pub async fn run_once(db: &DatabaseConnection) {
     if let Err(e) = crate::db::wal_checkpoint_truncate(db).await {
         tracing::error!("Maintenance: WAL checkpoint failed: {e}");
     }
+    let started = std::time::Instant::now();
     if let Err(e) = crate::db::run_sqlite_optimize(db).await {
-        tracing::warn!("Maintenance: PRAGMA optimize failed: {e}");
+        tracing::warn!("Maintenance: PRAGMA optimize failed after {:?}: {e}", started.elapsed());
+    } else {
+        tracing::info!("Maintenance: PRAGMA optimize completed in {:?}", started.elapsed());
     }
 }
 

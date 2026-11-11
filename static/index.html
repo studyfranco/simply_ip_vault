@@ -34,9 +34,9 @@
                     <input type="text" id="login-api-base" placeholder="/api" class="input-field" autocomplete="off">
                     <small class="field-hint">
                         Leave blank unless a reverse proxy rewrites the path. Signatures must cover the path the
-                        <em>server</em> sees: if the proxy strips a prefix (<code>/vault/api/ips</code> →
+                        <em>server</em> sees: if the proxy strips a prefix (<code>/ip_vault/api/ips</code> →
                         <code>/api/ips</code>), keep <code>/api</code>; if it forwards the prefix untouched, set
-                        <code>/vault/api</code>. Requests themselves are always sent relative to this page.
+                        <code>/ip_vault/api</code>. Requests themselves are always sent relative to this page.
                     </small>
                 </div>
                 <button type="submit" id="login-submit" class="btn btn-primary">Unlock Dashboard</button>
@@ -62,7 +62,7 @@
                      Keys tab?" should be answerable without reading the specification. -->
                 <span id="current-key-tier" class="badge badge-tier" title="Your key's RBAC tier"></span>
                 <button id="refresh-btn" class="btn btn-secondary btn-sm">Refresh</button>
-                <button id="logout-btn" class="btn btn-logout">Logout</button>
+                <button id="logout-btn" class="btn btn-logout btn-sm">Logout</button>
             </div>
         </header>
 
@@ -294,7 +294,100 @@
                 </section>
             </div>
 
-            <!-- Multi-Group Intersection Explorer -->
+            <!-- Ban State Breakdown & Velocity Metrics -->
+            <div class="analytics-two-col mt-4">
+                <!-- Locked vs Dynamic Breakdown Card -->
+                <section class="card">
+                    <div class="card-header">
+                        <div>
+                            <h2>Ban State Breakdown (Locked vs Dynamic)</h2>
+                            <p class="subtitle">Permanent / Manual locks vs Expiring / Dynamic memberships</p>
+                        </div>
+                    </div>
+                    <div class="ban-breakdown-body">
+                        <div class="ban-breakdown-stats">
+                            <div class="breakdown-stat-item">
+                                <span class="breakdown-label">Permanent / Locked</span>
+                                <span class="breakdown-value text-accent" id="stat-locked-count">-</span>
+                                <span class="breakdown-pct" id="stat-locked-pct">- %</span>
+                            </div>
+                            <div class="breakdown-stat-item">
+                                <span class="breakdown-label">Expiring / Dynamic</span>
+                                <span class="breakdown-value text-highlight" id="stat-dynamic-count">-</span>
+                                <span class="breakdown-pct" id="stat-dynamic-pct">- %</span>
+                            </div>
+                        </div>
+                        <div class="breakdown-progress-container mt-3">
+                            <div class="breakdown-progress-bar" id="stat-breakdown-bar" style="width: 0%"></div>
+                        </div>
+                        <div class="breakdown-total text-muted text-sm mt-3">
+                            Total evaluated memberships: <strong id="stat-breakdown-total">-</strong>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Ban Velocity Card -->
+                <section class="card">
+                    <div class="card-header">
+                        <div>
+                            <h2>Ban Velocity &amp; Activity</h2>
+                            <p class="subtitle">New &amp; refreshed vs soft-deleted bans in recent time windows</p>
+                        </div>
+                    </div>
+                    <div class="velocity-grid">
+                        <div class="velocity-box">
+                            <div class="velocity-header">Last 24 Hours</div>
+                            <div class="velocity-metrics">
+                                <div class="velocity-metric">
+                                    <span class="velocity-num text-success" id="stat-velocity-24h-active">-</span>
+                                    <span class="velocity-label">New / Refreshed</span>
+                                </div>
+                                <div class="velocity-metric">
+                                    <span class="velocity-num text-danger" id="stat-velocity-24h-deleted">-</span>
+                                    <span class="velocity-label">Deleted / Purged</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="velocity-box">
+                            <div class="velocity-header">Last 7 Days</div>
+                            <div class="velocity-metrics">
+                                <div class="velocity-metric">
+                                    <span class="velocity-num text-success" id="stat-velocity-7d-active">-</span>
+                                    <span class="velocity-label">New / Refreshed</span>
+                                </div>
+                                <div class="velocity-metric">
+                                    <span class="velocity-num text-danger" id="stat-velocity-7d-deleted">-</span>
+                                    <span class="velocity-label">Deleted / Purged</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+            </div>
+
+            <!-- Subnet / CIDR Distribution -->
+            <section class="card mt-4">
+                <div class="card-header">
+                    <div>
+                        <h2>Subnet &amp; Network Distribution</h2>
+                        <p class="subtitle">Top /24 subnets (IPv4) and /64 subnets (IPv6) with highest active IP density.</p>
+                    </div>
+                </div>
+                <div class="table-container table-scroll">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Subnet / CIDR Prefix</th>
+                                <th>Active IP Count</th>
+                                <th>Share of Active IPs</th>
+                            </tr>
+                        </thead>
+                        <tbody id="analytics-subnets-table-body">
+                            <tr><td colspan="3" class="text-center text-muted">Loading subnet distribution...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
             <section class="card">
                 <div class="card-header">
                     <div>
@@ -377,66 +470,6 @@
                         <button type="button" id="btn-open-create-key" class="btn btn-primary">+ New Key</button>
                     </div>
                     <p class="subtitle">Create and manage API keys (Global Scopes).</p>
-
-                    <!-- Hidden entirely for Daughter keys (can_manage_keys = false), which cannot
-                         create keys at all. The server refuses regardless; this stops the form being
-                         offered only to answer 403. -->
-                    <form id="form-create-apikey" class="admin-form hidden">
-                        <div class="form-grid">
-                            <div class="form-group">
-                                <label for="apikey-name">Key Name <span>*</span></label>
-                                <input type="text" id="apikey-name" placeholder="e.g. Monitoring Script" required class="input-field">
-                            </div>
-                            <div class="form-group">
-                                <label for="apikey-bound-ips">Bound IPs (CIDR) <span>*</span></label>
-                                <textarea id="apikey-bound-ips" placeholder="e.g. 127.0.0.1/32" required class="input-field" rows="2"></textarea>
-                            </div>
-                        </div>
-
-                        <!-- Master-only, per R4: only the Master key may grant `can_manage_keys`,
-                             `can_manage_webhooks` or `can_create_groups`. A Parent key sees the note
-                             below instead, because every key it creates is a Daughter by definition. -->
-                        <div class="permissions-grid mt-2 mb-4" id="apikey-scope-grid">
-                            <!-- No "Master Access" checkbox: master status is established at
-                                 bootstrap only (RBAC_MODEL.md §5), enforced by a unique index on the
-                                 engine-derived api_keys.master_marker, and the API rejects the field
-                                 outright — it is not present on the payload type at all. -->
-                            <label class="checkbox-container">
-                                <input type="checkbox" id="apikey-can-manage-keys">
-                                <span class="checkmark"></span>
-                                Manage Keys
-                            </label>
-                            <label class="checkbox-container">
-                                <input type="checkbox" id="apikey-can-manage-webhooks">
-                                <span class="checkmark"></span>
-                                Manage Webhooks
-                            </label>
-                            <label class="checkbox-container">
-                                <input type="checkbox" id="apikey-can-create-groups">
-                                <span class="checkmark"></span>
-                                Can Create Groups
-                            </label>
-                        </div>
-                        <p class="rbac-note mt-2 mb-4 hidden" id="apikey-scope-note">
-                            Keys you create are <strong>Daughter</strong> keys. Only the Master key can
-                            grant the global scopes <em>Manage Keys</em>, <em>Manage Webhooks</em> or
-                            <em>Can Create Groups</em> (RBAC_MODEL.md R4), so those toggles are not
-                            offered here. Grant this key access to specific IP Groups instead, using
-                            <em>Manage Group Rights</em> below.
-                        </p>
-
-                        <div class="form-actions mt-4">
-                            <button type="submit" class="btn btn-primary">Create API Key</button>
-                            <button type="button" id="btn-cancel-create-key" class="btn btn-cancel">Cancel</button>
-                        </div>
-                    </form>
-
-                    <div id="apikey-created" class="key-reveal hidden">
-                        <p class="key-reveal-label">New API Key (copy now):</p>
-                        <code id="apikey-plaintext" class="key-reveal-value"></code>
-                        <p class="key-reveal-label">Signing Secret (copy now — required to sign requests):</p>
-                        <code id="apikey-signing-secret" class="key-reveal-value"></code>
-                    </div>
 
                     <!-- `batch-actions-keys` adds the vertical separation from the Create API Key
                          form above; without it the two controls sat flush against each other. -->
@@ -929,6 +962,60 @@
         </div>
     </div>
 
+    <!-- Create API Key Modal -->
+    <div id="create-key-modal" class="modal-overlay hidden" role="dialog" aria-modal="true"
+         aria-labelledby="create-key-modal-title">
+        <div class="modal-card modal-card-form card">
+            <h3 id="create-key-modal-title">Create API Key</h3>
+            <p class="subtitle">Issue a new API key with specific network bindings and global scopes.</p>
+            <form id="form-create-apikey">
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label for="apikey-name">Key Name <span>*</span></label>
+                        <input type="text" id="apikey-name" placeholder="e.g. Monitoring Script" required class="input-field">
+                    </div>
+                    <div class="form-group">
+                        <label for="apikey-bound-ips">Bound IPs (CIDR) <span>*</span></label>
+                        <textarea id="apikey-bound-ips" placeholder="e.g. 127.0.0.1/32" required class="input-field" rows="2"></textarea>
+                    </div>
+                </div>
+
+                <!-- Master-only, per R4: only the Master key may grant `can_manage_keys`,
+                     `can_manage_webhooks` or `can_create_groups`. A Parent key sees the note
+                     below instead, because every key it creates is a Daughter by definition. -->
+                <div class="permissions-grid mt-2 mb-4" id="apikey-scope-grid">
+                    <label class="checkbox-container">
+                        <input type="checkbox" id="apikey-can-manage-keys">
+                        <span class="checkmark"></span>
+                        Manage Keys
+                    </label>
+                    <label class="checkbox-container">
+                        <input type="checkbox" id="apikey-can-manage-webhooks">
+                        <span class="checkmark"></span>
+                        Manage Webhooks
+                    </label>
+                    <label class="checkbox-container">
+                        <input type="checkbox" id="apikey-can-create-groups">
+                        <span class="checkmark"></span>
+                        Can Create Groups
+                    </label>
+                </div>
+                <p class="rbac-note mt-2 mb-4 hidden" id="apikey-scope-note">
+                    Keys you create are <strong>Daughter</strong> keys. Only the Master key can
+                    grant the global scopes <em>Manage Keys</em>, <em>Manage Webhooks</em> or
+                    <em>Can Create Groups</em> (RBAC_MODEL.md R4), so those toggles are not
+                    offered here. Grant this key access to specific IP Groups instead, using
+                    <em>Manage Group Rights</em> below.
+                </p>
+
+                <div class="form-actions mt-4">
+                    <button type="submit" class="btn btn-primary">Create Key</button>
+                    <button type="button" id="btn-cancel-create-key" class="btn btn-cancel">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
     <!-- Edit API Key Modal -->
     <div id="edit-key-modal" class="modal-overlay hidden">
         <div class="modal-card card">
@@ -1174,6 +1261,24 @@
             <div id="key-lineage-body"></div>
             <div class="form-actions mt-4">
                 <button type="button" id="key-lineage-close" class="btn btn-secondary">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Issued Key / Secret Modal (used after key creation) -->
+    <div id="key-secret-modal" class="modal-overlay hidden" role="dialog" aria-modal="true"
+         aria-labelledby="key-secret-modal-title">
+        <div class="modal-card card">
+            <h3 id="key-secret-modal-title">API Key Created</h3>
+            <p class="subtitle">Copy both values now — the signing secret cannot be retrieved or displayed again.</p>
+            <div id="apikey-created" class="key-reveal">
+                <p class="key-reveal-label">New API Key (copy now):</p>
+                <code id="apikey-plaintext" class="key-reveal-value"></code>
+                <p class="key-reveal-label">Signing Secret (copy now — required to sign requests):</p>
+                <code id="apikey-signing-secret" class="key-reveal-value"></code>
+            </div>
+            <div class="form-actions mt-4">
+                <button type="button" id="key-secret-close" class="btn btn-primary">Done</button>
             </div>
         </div>
     </div>
