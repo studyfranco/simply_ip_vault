@@ -225,6 +225,10 @@
         <!-- TAB: Statistiques & Récidive                     -->
         <!-- ═══════════════════════════════════════════════ -->
         <main id="tab-analytics" class="tab-panel">
+            <div id="analytics-loading-indicator" class="analytics-loading-bar hidden">
+                <span class="analytics-spinner"></span>
+                <span>Loading analytics data...</span>
+            </div>
             <div class="stats-overview-grid">
                 <div class="card stat-card">
                     <div class="stat-card-title">Total Active IPs</div>
@@ -1272,9 +1276,15 @@
             <h3 id="key-secret-modal-title">API Key Created</h3>
             <p class="subtitle">Copy both values now — the signing secret cannot be retrieved or displayed again.</p>
             <div id="apikey-created" class="key-reveal">
-                <p class="key-reveal-label">New API Key (copy now):</p>
+                <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <p class="key-reveal-label">New API Key (copy now):</p>
+                    <button type="button" class="btn btn-secondary btn-sm" id="btn-copy-vault-apikey" style="padding:0.2rem 0.5rem;font-size:0.75rem;">Copy</button>
+                </div>
                 <code id="apikey-plaintext" class="key-reveal-value"></code>
-                <p class="key-reveal-label">Signing Secret (copy now — required to sign requests):</p>
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-top:0.5rem;">
+                    <p class="key-reveal-label">Signing Secret (copy now — required to sign requests):</p>
+                    <button type="button" class="btn btn-secondary btn-sm" id="btn-copy-vault-signing-secret" style="padding:0.2rem 0.5rem;font-size:0.75rem;">Copy</button>
+                </div>
                 <code id="apikey-signing-secret" class="key-reveal-value"></code>
             </div>
             <div class="form-actions mt-4">

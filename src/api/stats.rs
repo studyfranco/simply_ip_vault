@@ -216,13 +216,13 @@ async fn compute_velocity(
     authorized_groups: Option<&HashSet<Uuid>>,
     threshold: NaiveDateTime,
 ) -> Result<VelocityStat, AppError> {
+    // For active memberships, last_seen_at is always >= created_at. Filtering by last_seen_at >= threshold
+    // covers both newly created and re-seen active memberships, allowing SQLite to use the composite
+    // index `idx_memberships_is_deleted_last_seen` in a fast B-tree range scan rather than falling back
+    // to a full table scan across millions of records.
     let mut active_q = ip_record_group_membership::Entity::find()
         .filter(ip_record_group_membership::Column::IsDeleted.eq(false))
-        .filter(
-            sea_orm::Condition::any()
-                .add(ip_record_group_membership::Column::CreatedAt.gte(threshold))
-                .add(ip_record_group_membership::Column::LastSeenAt.gte(threshold)),
-        );
+        .filter(ip_record_group_membership::Column::LastSeenAt.gte(threshold));
     if let Some(allowed) = authorized_groups {
         active_q = active_q.filter(
             ip_record_group_membership::Column::GroupId.is_in(allowed.iter().copied()),
@@ -301,10 +301,29 @@ pub async fn get_analytics(
             }).into_response());
     }
 
-    if caller.is_master {
+    // Global analytics caching for Master or keys with full access (TTL 300s = 5 minutes).
+    let is_global = authorized_groups.is_none();
+    if is_global {
         let cache_read = state.analytics_cache.read().await;
         if let Some((ts, ref payload)) = *cache_read
-            && ts.elapsed() < std::time::Duration::from_secs(30)
+            && ts.elapsed() < std::time::Duration::from_secs(300)
+        {
+            return Ok(Json(payload.clone()).into_response());
+        }
+    }
+
+    // Acquire singleflight lock if calculating global stats to serialize concurrent requests
+    // and prevent database lock contention.
+    let _singleflight_guard = if is_global {
+        Some(state.analytics_lock.lock().await)
+    } else {
+        None
+    };
+
+    if is_global {
+        let cache_read = state.analytics_cache.read().await;
+        if let Some((ts, ref payload)) = *cache_read
+            && ts.elapsed() < std::time::Duration::from_secs(300)
         {
             return Ok(Json(payload.clone()).into_response());
         }
@@ -634,25 +653,34 @@ pub async fn get_analytics(
     };
 
     // 6. CIDR / Subnet distribution (/24 for IPv4, /48-/64 for IPv6)
-    let mut active_ip_q = ip_record::Entity::find()
-        .join(
-            JoinType::InnerJoin,
-            ip_record::Relation::IpRecordGroupMembership.def(),
-        )
+    // Query active IP record IDs first via covering index, avoiding multi-million row Cartesian joins
+    let mut active_ip_q = ip_record_group_membership::Entity::find()
         .filter(ip_record_group_membership::Column::IsDeleted.eq(false));
     if let Some(ref allowed) = authorized_groups {
         active_ip_q = active_ip_q.filter(
             ip_record_group_membership::Column::GroupId.is_in(allowed.iter().copied()),
         );
     }
-    let addresses: Vec<String> = active_ip_q
+    let ip_ids: Vec<Uuid> = active_ip_q
         .select_only()
-        .column(ip_record::Column::TargetAddress)
+        .column(ip_record_group_membership::Column::IpRecordId)
         .distinct()
-        .limit(25000)
-        .into_tuple::<String>()
+        .limit(10000)
+        .into_tuple::<Uuid>()
         .all(&state.db)
         .await?;
+
+    let addresses: Vec<String> = if ip_ids.is_empty() {
+        Vec::new()
+    } else {
+        ip_record::Entity::find()
+            .filter(ip_record::Column::Id.is_in(ip_ids))
+            .select_only()
+            .column(ip_record::Column::TargetAddress)
+            .into_tuple::<String>()
+            .all(&state.db)
+            .await?
+    };
 
     let mut subnet_counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     for addr in addresses {
@@ -730,7 +758,7 @@ pub async fn get_analytics(
         velocity_7d,
     };
 
-    if caller.is_master
+    if is_global
         && let Ok(val) = serde_json::to_value(&response)
     {
         let mut cache_write = state.analytics_cache.write().await;

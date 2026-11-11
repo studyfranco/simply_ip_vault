@@ -523,6 +523,7 @@ class FirewallClient {
             // same reveal modal.
             pendingCloneEditId: null,
             analyticsData: null,
+            analyticsDataTime: 0,
             intersectionPage: 0,
             intersectionLimit: 25,
             intersectionTotal: 0,
@@ -1264,13 +1265,43 @@ class FirewallClient {
         `).join('');
     }
 
-    async loadAnalytics() {
+    async loadAnalytics(force = false) {
+        // Cache analytics data for 5 minutes unless forced to avoid repeated heavy queries
+        if (!force && this.state.analyticsData && this.state.analyticsDataTime && (Date.now() - this.state.analyticsDataTime < 300000)) {
+            this.renderAnalytics(this.state.analyticsData);
+            return;
+        }
+
+        if (this._analyticsLoading) return;
+        this._analyticsLoading = true;
+
+        const refreshBtn = document.getElementById('refresh-analytics-btn');
+        const loadingIndicator = document.getElementById('analytics-loading-indicator');
+        if (refreshBtn) {
+            refreshBtn.disabled = true;
+            refreshBtn.textContent = 'Refreshing...';
+        }
+        if (loadingIndicator) {
+            loadingIndicator.classList.remove('hidden');
+        }
+
         try {
             const data = await this.apiFetch('/stats/analytics');
             this.state.analyticsData = data;
+            this.state.analyticsDataTime = Date.now();
             this.renderAnalytics(data);
         } catch (e) {
             console.error('Failed to load analytics', e);
+            this.showToast('Failed to load analytics', 'danger');
+        } finally {
+            if (refreshBtn) {
+                refreshBtn.disabled = false;
+                refreshBtn.textContent = 'Refresh Stats';
+            }
+            if (loadingIndicator) {
+                loadingIndicator.classList.add('hidden');
+            }
+            this._analyticsLoading = false;
         }
     }
 
@@ -3385,7 +3416,7 @@ class FirewallClient {
                 const panel = document.getElementById(`tab-${trg.dataset.tab}`);
                 if (panel) panel.classList.add('active');
                 if (trg.dataset.tab === 'analytics') {
-                    this.loadAnalytics();
+                    this.loadAnalytics(false);
                 }
             });
         });
@@ -3515,6 +3546,29 @@ class FirewallClient {
         modalKeySecret?.addEventListener('click', (e) => {
             if (e.target.id === 'key-secret-modal') {
                 modalKeySecret.classList.add('hidden');
+            }
+        });
+
+        document.getElementById('btn-copy-vault-apikey')?.addEventListener('click', () => {
+            const text = document.getElementById('apikey-plaintext')?.textContent;
+            if (text) {
+                navigator.clipboard?.writeText(text);
+                const btn = document.getElementById('btn-copy-vault-apikey');
+                if (btn) {
+                    btn.textContent = 'Copied!';
+                    setTimeout(() => (btn.textContent = 'Copy'), 1500);
+                }
+            }
+        });
+        document.getElementById('btn-copy-vault-signing-secret')?.addEventListener('click', () => {
+            const text = document.getElementById('apikey-signing-secret')?.textContent;
+            if (text) {
+                navigator.clipboard?.writeText(text);
+                const btn = document.getElementById('btn-copy-vault-signing-secret');
+                if (btn) {
+                    btn.textContent = 'Copied!';
+                    setTimeout(() => (btn.textContent = 'Copy'), 1500);
+                }
             }
         });
 
@@ -3723,7 +3777,7 @@ class FirewallClient {
         });
 
         // Analytics & Recidivism
-        document.getElementById('refresh-analytics-btn')?.addEventListener('click', () => this.loadAnalytics());
+        document.getElementById('refresh-analytics-btn')?.addEventListener('click', () => this.loadAnalytics(true));
         document.getElementById('intersection-compare-btn')?.addEventListener('click', () => this.loadIntersection(0));
         document.getElementById('intersection-btn-prev')?.addEventListener('click', () => {
             if (this.state.intersectionPage > 0) {

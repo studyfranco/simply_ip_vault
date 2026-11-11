@@ -2346,3 +2346,36 @@ input[type="checkbox"]:indeterminate::after {
     color: #c084fc;
     border: 1px solid rgba(168, 85, 247, 0.35);
 }
+
+/* Analytics Loading State */
+.analytics-spinner {
+    display: inline-block;
+    width: 1rem;
+    height: 1rem;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: analytics-spin 0.7s linear infinite;
+    vertical-align: middle;
+}
+
+@keyframes analytics-spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.analytics-loading-bar {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    padding: 0.75rem 1rem;
+    margin-bottom: 1rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    color: var(--text-muted);
+    font-size: 0.875rem;
+}
+
