@@ -105,6 +105,11 @@ pub struct AppState {
     pub analytics_cache: Arc<tokio::sync::RwLock<std::collections::HashMap<Option<Vec<uuid::Uuid>>, (std::time::Instant, serde_json::Value)>>>,
     /// Singleflight lock to prevent cache stampedes when computing analytical statistics.
     pub analytics_lock: Arc<tokio::sync::Mutex<()>>,
+    /// In-memory cache for system settings and entity counts (`GET /api/settings`), TTL ~120s (2 minutes).
+    /// Prevents repeated full-table count scans when multiple tabs or monitoring pollers refresh concurrently.
+    pub settings_cache: Arc<tokio::sync::RwLock<Option<(std::time::Instant, crate::api::SettingsResponse)>>>,
+    /// Singleflight lock to serialize concurrent settings count computations.
+    pub settings_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -132,6 +137,8 @@ impl AppState {
             master_pin: Arc::new(MasterPin::new()),
             analytics_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             analytics_lock: Arc::new(tokio::sync::Mutex::new(())),
+            settings_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            settings_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -155,6 +162,8 @@ impl AppState {
             master_pin: Arc::new(MasterPin::new()),
             analytics_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             analytics_lock: Arc::new(tokio::sync::Mutex::new(())),
+            settings_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            settings_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 

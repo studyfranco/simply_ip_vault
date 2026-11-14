@@ -1507,6 +1507,25 @@ body {
     border: 1px solid var(--border);
 }
 
+.permissions-grid .checkbox-container {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding-left: 0;
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    cursor: pointer;
+}
+
+.permissions-grid .checkbox-container input[type="checkbox"] {
+    position: static;
+    opacity: 1;
+    width: 1rem;
+    height: 1rem;
+    accent-color: var(--accent);
+    cursor: pointer;
+}
+
 /* Custom Checkbox */
 .checkbox-container {
     display: flex;

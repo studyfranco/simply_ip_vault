@@ -2565,8 +2565,8 @@ class FirewallClient {
     async createApiKey(e) {
         e.preventDefault();
         const payload = {
-            name: document.getElementById('apikey-name').value,
-            bound_ips: document.getElementById('apikey-bound-ips').value,
+            name: document.getElementById('apikey-name').value.trim(),
+            bound_ips: document.getElementById('apikey-bound-ips').value.trim() || null,
             // No `is_master`: master status is established at bootstrap only (RBAC_MODEL.md §5). The
             // field is not on the payload type at all and the struct denies unknown fields, so
             // sending it is a 400 — not a silently ignored no-op.

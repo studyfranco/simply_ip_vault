@@ -977,44 +977,42 @@
             </div>
             <p class="subtitle">Issue a new API key with specific network bindings and global scopes.</p>
             <form id="form-create-apikey">
-                <div class="form-grid">
+                <div class="form-grid mt-2">
                     <div class="form-group">
-                        <label for="apikey-name">Key Name <span>*</span></label>
+                        <label for="apikey-name">Key Name</label>
                         <input type="text" id="apikey-name" placeholder="e.g. Monitoring Script" required class="input-field">
                     </div>
                     <div class="form-group">
-                        <label for="apikey-bound-ips">Bound IPs (CIDR) <span>*</span></label>
-                        <input type="text" id="apikey-bound-ips" placeholder="0.0.0.0/0,::/0" required class="input-field font-mono">
+                        <label for="apikey-bound-ips">Bound IPs (CIDR, comma-separated)</label>
+                        <input type="text" id="apikey-bound-ips" placeholder="0.0.0.0/0,::/0" class="input-field font-mono">
                     </div>
                 </div>
 
                 <!-- Master-only, per R4: only the Master key may grant `can_manage_keys`,
                      `can_manage_webhooks` or `can_create_groups`. A Parent key sees the note
                      below instead, because every key it creates is a Daughter by definition. -->
-                <div class="permissions-grid mt-2 mb-4" id="apikey-scope-grid">
-                    <label class="checkbox-container">
-                        <input type="checkbox" id="apikey-can-manage-keys">
-                        <span>can_manage_keys</span>
-                    </label>
-                    <label class="checkbox-container">
-                        <input type="checkbox" id="apikey-can-manage-webhooks">
-                        <span>can_manage_webhooks</span>
-                    </label>
-                    <label class="checkbox-container">
-                        <input type="checkbox" id="apikey-can-create-groups">
-                        <span>can_create_groups</span>
-                    </label>
+                <div id="apikey-scopes-container">
+                    <div class="permissions-grid mt-2 mb-4" id="apikey-scope-grid">
+                        <label class="checkbox-container">
+                            <input type="checkbox" id="apikey-can-manage-keys">
+                            <span>can_manage_keys</span>
+                        </label>
+                        <label class="checkbox-container">
+                            <input type="checkbox" id="apikey-can-manage-webhooks">
+                            <span>can_manage_webhooks</span>
+                        </label>
+                        <label class="checkbox-container">
+                            <input type="checkbox" id="apikey-can-create-groups">
+                            <span>can_create_groups</span>
+                        </label>
+                    </div>
+                    <p class="text-muted text-sm mt-2 mb-4 hidden" id="apikey-scope-note">
+                        Only the Master key may grant global scopes (R4). Keys you create are Daughter keys.
+                    </p>
                 </div>
-                <p class="rbac-note mt-2 mb-4 hidden" id="apikey-scope-note">
-                    Keys you create are <strong>Daughter</strong> keys. Only the Master key can
-                    grant the global scopes <em>Manage Keys</em>, <em>Manage Webhooks</em> or
-                    <em>Can Create Groups</em> (RBAC_MODEL.md R4), so those toggles are not
-                    offered here. Grant this key access to specific IP Groups instead, using
-                    <em>Manage Group Rights</em> below.
-                </p>
 
                 <div class="form-actions mt-4">
-                    <button type="submit" class="btn btn-primary">Create Key</button>
+                    <button type="submit" class="btn btn-primary" id="apikey-submit-btn">Create Key</button>
                     <button type="button" id="btn-cancel-create-key" class="btn btn-secondary">Cancel</button>
                 </div>
             </form>
@@ -1278,12 +1276,12 @@
             <p class="subtitle">Copy both values now — the signing secret cannot be retrieved or displayed again.</p>
             <div id="apikey-created" class="key-reveal">
                 <div style="display:flex;justify-content:space-between;align-items:center;">
-                    <p class="key-reveal-label">New API Key (copy now):</p>
+                    <span class="key-reveal-label">API Key:</span>
                     <button type="button" class="btn btn-secondary btn-sm" id="btn-copy-vault-apikey" style="padding:0.2rem 0.5rem;font-size:0.75rem;">Copy</button>
                 </div>
                 <code id="apikey-plaintext" class="key-reveal-value"></code>
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-top:0.5rem;">
-                    <p class="key-reveal-label">Signing Secret (copy now — required to sign requests):</p>
+                    <span class="key-reveal-label">Signing Secret:</span>
                     <button type="button" class="btn btn-secondary btn-sm" id="btn-copy-vault-signing-secret" style="padding:0.2rem 0.5rem;font-size:0.75rem;">Copy</button>
                 </div>
                 <code id="apikey-signing-secret" class="key-reveal-value"></code>
