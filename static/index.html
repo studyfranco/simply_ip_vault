@@ -525,15 +525,15 @@
                             <div class="permissions-grid mt-2 mb-4">
                                 <label class="checkbox-container">
                                     <input type="checkbox" id="manage-rights-read">
-                                    <span class="checkmark"></span> Read
+                                    <span>Read</span>
                                 </label>
                                 <label class="checkbox-container">
                                     <input type="checkbox" id="manage-rights-write">
-                                    <span class="checkmark"></span> Write
+                                    <span>Write</span>
                                 </label>
                                 <label class="checkbox-container">
                                     <input type="checkbox" id="manage-rights-delete">
-                                    <span class="checkmark"></span> Delete
+                                    <span>Delete</span>
                                 </label>
                             </div>
                             <div class="form-actions">
@@ -1020,18 +1020,25 @@
     </div>
 
     <!-- Edit API Key Modal -->
-    <div id="edit-key-modal" class="modal-overlay hidden">
-        <div class="modal-card card">
-            <h3>Edit API Key</h3>
+    <div id="edit-key-modal" class="modal-overlay hidden" role="dialog" aria-modal="true"
+         aria-labelledby="edit-key-modal-title">
+        <div class="modal-card modal-card-form card">
+            <div class="modal-header">
+                <h3 id="edit-key-modal-title">Edit API Key</h3>
+                <button type="button" id="edit-key-close-x" class="btn-modal-close" aria-label="Close">&times;</button>
+            </div>
+            <p class="subtitle">Issue a new API key with specific network bindings and global scopes.</p>
             <form id="form-edit-key">
                 <input type="hidden" id="edit-key-id">
-                <div class="form-group">
-                    <label for="edit-key-name">Key Name <span>*</span></label>
-                    <input type="text" id="edit-key-name" required class="input-field">
-                </div>
-                <div class="form-group">
-                    <label for="edit-key-bound-ips">Bound IPs (CIDR)</label>
-                    <textarea id="edit-key-bound-ips" class="input-field" rows="2"></textarea>
+                <div class="form-grid mt-2">
+                    <div class="form-group">
+                        <label for="edit-key-name">Key Name</label>
+                        <input type="text" id="edit-key-name" required class="input-field">
+                    </div>
+                    <div class="form-group">
+                        <label for="edit-key-bound-ips">Bound IPs (CIDR, comma-separated)</label>
+                        <input type="text" id="edit-key-bound-ips" placeholder="0.0.0.0/0,::/0" class="input-field font-mono">
+                    </div>
                 </div>
                 <!-- Master-only, per R4 — same rule as the creation form. A Parent editing a
                      Daughter may change its name and bound IPs; the global scopes are not its to
@@ -1040,22 +1047,21 @@
                 <div class="permissions-grid mt-2 mb-4" id="edit-key-scope-grid">
                     <label class="checkbox-container">
                         <input type="checkbox" id="edit-key-can-manage-keys">
-                        <span class="checkmark"></span> Manage Keys
+                        <span>can_manage_keys</span>
                     </label>
                     <label class="checkbox-container">
                         <input type="checkbox" id="edit-key-can-manage-webhooks">
-                        <span class="checkmark"></span> Manage Webhooks
+                        <span>can_manage_webhooks</span>
                     </label>
                     <label class="checkbox-container">
                         <input type="checkbox" id="edit-key-can-create-groups">
-                        <span class="checkmark"></span> Can Create Groups
+                        <span>can_create_groups</span>
                     </label>
                 </div>
-                <p class="rbac-note mt-2 mb-4 hidden" id="edit-key-scope-note">
-                    Global scopes are granted only by the Master key (RBAC_MODEL.md R4) and are left
-                    unchanged by this form.
+                <p class="text-muted text-sm mt-2 mb-4 hidden" id="edit-key-scope-note">
+                    Only the Master key may grant global scopes (R4). Global scopes are left unchanged by this form.
                 </p>
-                <div class="form-actions">
+                <div class="form-actions mt-4">
                     <button type="submit" class="btn btn-primary">Save Changes</button>
                     <button type="button" id="edit-key-cancel" class="btn btn-secondary">Cancel</button>
                 </div>

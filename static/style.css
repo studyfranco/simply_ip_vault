@@ -1004,13 +1004,15 @@ body {
     display: flex;
     flex-wrap: wrap;
     gap: 0.35rem;
-    max-width: 320px;
 }
 
 .badge-scope {
-    background-color: rgba(61, 174, 233, 0.12);
-    color: var(--highlight);
-    border: 1px solid rgba(61, 174, 233, 0.3);
+    background-color: rgba(28, 220, 154, 0.1);
+    color: var(--accent);
+    border: 1px solid rgba(28, 220, 154, 0.25);
+    text-transform: none;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
 }
 
 .badge-scope-master {
@@ -1517,13 +1519,23 @@ body {
     cursor: pointer;
 }
 
+.permissions-grid .checkbox-container:hover {
+    color: var(--text-muted);
+}
+
 .permissions-grid .checkbox-container input[type="checkbox"] {
+    appearance: auto;
+    -webkit-appearance: auto;
     position: static;
     opacity: 1;
     width: 1rem;
     height: 1rem;
     accent-color: var(--accent);
     cursor: pointer;
+}
+
+.permissions-grid .checkbox-container .checkmark {
+    display: none;
 }
 
 /* Custom Checkbox */
@@ -1610,16 +1622,6 @@ body {
 
 .form-grid > .col-span-2 {
     flex: 1 1 100%;
-}
-
-.permissions-grid {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 1rem;
-    padding: 0.75rem 1rem;
-    background-color: var(--bg-input);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
 }
 
 /* ─── Modals ────────────────────────────────────────────── */
@@ -1717,6 +1719,11 @@ body {
 
 .modal-card-form .form-actions {
     justify-content: flex-end;
+}
+
+#create-key-modal .form-actions,
+#edit-key-modal .form-actions {
+    justify-content: flex-start;
 }
 
 /* Label/value pairs in a compact two-column grid — the Execution Detail modal's summary fields.

@@ -1941,7 +1941,7 @@ class FirewallClient {
                         <button class="btn btn-sm btn-secondary" onclick="window.app.openEditKeyModal('${k.id}')">Edit</button>
                         <button class="btn btn-sm btn-secondary" onclick="window.app.openKeyLineageModal('${k.id}')" title="View this key's ancestors and children">Lineage</button>
                         <button class="btn btn-sm btn-secondary" onclick="window.app.regenerateKeySecret('${k.id}')" title="Replace BOTH the API key and its signing secret">Regenerate</button>
-                        <button class="btn btn-sm btn-cancel" onclick="window.app.rotateSigningSecret('${k.id}')" title="Replace only the HMAC signing secret; the API key, name and permissions stay the same">Rotate Secret</button>
+                        <button class="btn btn-sm btn-secondary" onclick="window.app.rotateSigningSecret('${k.id}')" title="Replace only the HMAC signing secret; the API key, name and permissions stay the same">Rotate Secret</button>
                         <button class="btn btn-sm btn-danger" onclick="window.app.deleteKey('${k.id}')">Delete</button>`;
             return `
             <tr>
@@ -1984,9 +1984,9 @@ class FirewallClient {
             }[tier];
             scopes.push(`<span class="badge badge-tier badge-tier-${tier}" title="${why}">${label}</span>`);
         }
-        if (k.can_manage_keys) scopes.push('<span class="badge badge-scope">Manage Keys</span>');
-        if (k.can_manage_webhooks) scopes.push('<span class="badge badge-scope">Manage Webhooks</span>');
-        if (k.can_create_groups) scopes.push('<span class="badge badge-scope">Create Groups</span>');
+        if (k.can_manage_keys) scopes.push('<span class="badge badge-scope">can_manage_keys</span>');
+        if (k.can_manage_webhooks) scopes.push('<span class="badge badge-scope">can_manage_webhooks</span>');
+        if (k.can_create_groups) scopes.push('<span class="badge badge-scope">can_create_groups</span>');
 
         const groupBadges = (k.group_permissions || []).map(p => {
             const rights = [p.can_read ? 'R' : '', p.can_write ? 'W' : '', p.can_delete ? 'D' : '']
@@ -2668,6 +2668,8 @@ class FirewallClient {
     openEditKeyModal(id) {
         const k = this.state.apiKeys.find(k => k.id === id);
         if (!k) return;
+        const titleEl = document.getElementById('edit-key-modal-title');
+        if (titleEl) titleEl.textContent = `Edit Key: ${k.name}`;
         document.getElementById('edit-key-id').value = k.id;
         document.getElementById('edit-key-name').value = k.name;
         document.getElementById('edit-key-bound-ips').value = k.bound_ips || '';
@@ -3599,6 +3601,10 @@ class FirewallClient {
         // Edit Key modal
         document.getElementById('form-edit-key').addEventListener('submit', (e) => this.submitEditKey(e));
         document.getElementById('edit-key-cancel').addEventListener('click', () => this.closeEditKeyModal());
+        document.getElementById('edit-key-close-x')?.addEventListener('click', () => this.closeEditKeyModal());
+        document.getElementById('edit-key-modal')?.addEventListener('click', (e) => {
+            if (e.target.id === 'edit-key-modal') this.closeEditKeyModal();
+        });
 
         // Key Lineage modal: close on button / backdrop / Escape.
         document.getElementById('key-lineage-close').addEventListener('click', () => this.closeKeyLineageModal());
@@ -3672,6 +3678,10 @@ class FirewallClient {
             const keySecretModal = document.getElementById('key-secret-modal');
             if (keySecretModal && !keySecretModal.classList.contains('hidden')) {
                 keySecretModal.classList.add('hidden');
+            }
+            const editKeyModal = document.getElementById('edit-key-modal');
+            if (editKeyModal && !editKeyModal.classList.contains('hidden')) {
+                editKeyModal.classList.add('hidden');
             }
         });
 
