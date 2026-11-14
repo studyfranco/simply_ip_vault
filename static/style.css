@@ -319,20 +319,18 @@ body {
     color: var(--text-main);
 }
 
-/* Modal "Cancel": a deliberate bluish-slate theme rather than the generic dark grey of
-   .btn-secondary, so the safe escape hatch reads as its own affordance next to the red confirm
-   button instead of blending into the card background. */
+/* Modal "Cancel": unified neutral slate tone across the suite. */
 .btn-cancel {
-    background-color: #1e293b;
-    color: #60a5fa;
-    border-color: #60a5fa;
+    background-color: var(--bg-surface);
+    color: var(--text-muted);
+    border-color: var(--border);
     font-weight: 600;
 }
 
 .btn-cancel:hover:not(:disabled) {
-    background-color: #2563eb;
-    color: #ffffff;
-    border-color: #2563eb;
+    background-color: var(--border);
+    color: var(--text-main);
+    border-color: var(--border);
 }
 
 .btn-logout {
@@ -1018,10 +1016,11 @@ body {
     font-size: 0.7rem;
 }
 
-.badge-scope-master {
-    background-color: rgba(28, 220, 154, 0.15);
-    color: var(--accent);
-    border: 1px solid rgba(28, 220, 154, 0.3);
+.badge-scope-master,
+.scope-badges .badge-tier-master {
+    background-color: rgba(231, 76, 60, 0.16);
+    color: #ff7b6b;
+    border: 1px solid rgba(231, 76, 60, 0.45);
 }
 
 /* ─── RBAC tier badges ──────────────────────────────────────
@@ -1662,7 +1661,7 @@ body {
    than being the *only* value wide viewports ever saw. */
 .modal-card {
     width: 100%;
-    max-width: clamp(360px, 45vw, 760px);
+    max-width: clamp(520px, 46vw, 860px);
     box-shadow: var(--shadow-lg);
     animation: fadeIn var(--transition-slow);
 }
@@ -1715,28 +1714,30 @@ body {
    wide monitor actually gets to use the extra space for these longer, denser fields instead of
    floating a fixed-size box in a sea of unused background. */
 .modal-card-form {
-    max-width: clamp(420px, 60vw, 840px);
+    max-width: clamp(600px, 56vw, 960px);
     max-height: calc(100vh - 3rem);
     overflow-y: auto;
 }
 
 #key-secret-modal .modal-card,
 #secret-reveal-modal .modal-card {
-    max-width: 560px;
+    max-width: clamp(580px, 48vw, 860px);
 }
 
 #create-key-modal .modal-card-form,
 #edit-key-modal .modal-card-form {
-    max-width: 780px;
+    max-width: clamp(620px, 56vw, 960px);
 }
 
 #form-create-group .form-row {
-    max-width: 960px;
-    background-color: var(--bg-input);
-    padding: 0.85rem 1.1rem;
-    border: 1px solid var(--border);
+    width: 100%;
+    max-width: none;
+    background-color: #383e45;
+    padding: 0.95rem 1.2rem;
+    border: 1px solid #565b63;
     border-radius: var(--radius);
     margin-bottom: 1rem;
+    box-shadow: var(--shadow);
 }
 
 .modal-card-form .form-actions {
@@ -1828,7 +1829,7 @@ dl.kv-grid {
 /* Auth Mode and its description share a row: the selector stays narrow and the hint takes the
    remaining width, instead of a full-width paragraph pushing every later field down the page. */
 .auth-mode-row {
-    grid-template-columns: minmax(230px, 20rem) 1fr;
+    grid-template-columns: minmax(300px, 28rem) 1fr;
     align-items: center;
 }
 
