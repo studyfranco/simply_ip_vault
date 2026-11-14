@@ -192,6 +192,7 @@ fn is_in_memory_sqlite(db_url: &str) -> bool {
 /// which the module header explains must be set at open time because a reopened connection replays
 /// its `SqliteConnectOptions` but not hand-issued `PRAGMA` statements.
 fn build_sqlite_connect_options(db_url: &str) -> Result<SqliteConnectOptions, DbErr> {
+    use sea_orm::sqlx::ConnectOptions as _;
     use std::str::FromStr;
 
     Ok(SqliteConnectOptions::from_str(db_url)
@@ -223,7 +224,11 @@ fn build_sqlite_connect_options(db_url: &str) -> Result<SqliteConnectOptions, Db
         // Page cache per connection (negative = KiB). See `SQLITE_CACHE_SIZE_KIB_ENV`.
         .pragma("cache_size", format!("-{}", sqlite_cache_size_kib()))
         // Limits ANALYZE and PRAGMA optimize sampling so multi-million row databases do not block.
-        .pragma("analysis_limit", "400"))
+        .pragma("analysis_limit", "400")
+        .log_slow_statements(
+            log::LevelFilter::Warn,
+            crate::config::database_slow_threshold(),
+        ))
 }
 
 /// Runs every pending migration on a dedicated pool that opens with exactly one connection, applies
@@ -252,7 +257,12 @@ pub async fn run_migrations_isolated(db_url: &str) -> Result<(), DbErr> {
         SqlxSqliteConnector::from_sqlx_sqlite_pool(pool)
     } else {
         let mut opt = ConnectOptions::new(db_url.to_owned());
-        opt.sqlx_logging_level(log::LevelFilter::Debug).max_connections(MIGRATION_POOL_MAX_CONNECTIONS);
+        opt.sqlx_logging_level(log::LevelFilter::Debug)
+            .sqlx_slow_statements_logging_settings(
+                log::LevelFilter::Warn,
+                crate::config::database_slow_threshold(),
+            )
+            .max_connections(MIGRATION_POOL_MAX_CONNECTIONS);
         Database::connect(opt).await?
     };
 
@@ -287,7 +297,11 @@ pub async fn connect(db_url: &str) -> Result<DatabaseConnection, DbErr> {
     // cannot.
     if !db_url.starts_with("sqlite:") {
         let mut opt = ConnectOptions::new(db_url.to_owned());
-        opt.sqlx_logging_level(log::LevelFilter::Debug);
+        opt.sqlx_logging_level(log::LevelFilter::Debug)
+            .sqlx_slow_statements_logging_settings(
+                log::LevelFilter::Warn,
+                crate::config::database_slow_threshold(),
+            );
         // PostgreSQL/MySQL pool tuning — `config::database_*`, all environment-configurable. Set
         // here rather than left to SeaORM's own defaults (`max_connections: 10`, no floor, no
         // acquire timeout) because those defaults are what produced the slow-pool-acquisition

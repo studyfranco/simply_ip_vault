@@ -349,6 +349,28 @@ pub fn sqlite_busy_timeout() -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
+/// Environment variable overriding the SQLx slow-statement warning threshold, in milliseconds.
+pub const DATABASE_SLOW_THRESHOLD_MS_ENV: &str = "DATABASE_SLOW_THRESHOLD_MS";
+/// Default SQLx slow-statement alert threshold: 5,000 ms (5 seconds).
+///
+/// Raised from SQLx's 1,000 ms default so that 10,001-row bulk sync pages and multi-million-row
+/// analytical index scans finishing in 1–4 seconds on spinning or network-attached storage do not
+/// flood warning logs while genuinely slow queries remain surfaced.
+pub const DEFAULT_DATABASE_SLOW_THRESHOLD_MS: u64 = 5_000;
+
+/// Reads [`DATABASE_SLOW_THRESHOLD_MS_ENV`] or defaults to 5,000ms. Clamped to at least 100ms.
+pub fn database_slow_threshold() -> std::time::Duration {
+    static VALUE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *VALUE.get_or_init(|| {
+        numeric_env::<u64>(
+            DATABASE_SLOW_THRESHOLD_MS_ENV,
+            DEFAULT_DATABASE_SLOW_THRESHOLD_MS,
+        )
+        .max(100)
+    });
+    std::time::Duration::from_millis(ms)
+}
+
 /// Hard ceiling on the file-backed SQLite tier's connection count, regardless of what
 /// `DATABASE_MAX_CONNECTIONS` requests.
 ///

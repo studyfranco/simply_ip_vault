@@ -1709,7 +1709,7 @@ pub async fn batch_records(
 
     for chunk in normalized.chunks(500) {
         let chunk_addrs: Vec<String> = chunk.iter().map(|(addr, _)| addr.clone()).collect();
-        let prefetched_records: std::collections::HashMap<String, ip_record::Model> =
+        let mut prefetched_records: std::collections::HashMap<String, ip_record::Model> =
             ip_record::Entity::find()
                 .filter(ip_record::Column::TargetAddress.is_in(chunk_addrs))
                 .all(&txn)
@@ -1735,22 +1735,52 @@ pub async fn batch_records(
                 .collect()
         };
 
+        // Bulk-insert canonical `ip_records` for addresses not yet present in the database,
+        // avoiding hundreds of single-row INSERT statements inside the write lock.
+        let mut new_records: Vec<ip_record::ActiveModel> = Vec::new();
         for (address, input) in chunk {
-            let (record, record_is_new) = match prefetched_records.get(address) {
-                Some(existing_rec) => (existing_rec.clone(), false),
-                None => {
-                    find_or_insert_address(&txn, address, input.created_at.unwrap_or(now)).await?
-                }
-            };
-            if record_is_new {
+            if !prefetched_records.contains_key(address) {
+                let id = Uuid::new_v4();
+                let created_at = input.created_at.unwrap_or(now);
+                new_records.push(ip_record::ActiveModel {
+                    id: Set(id),
+                    target_address: Set(address.clone()),
+                    created_at: Set(created_at),
+                });
+                prefetched_records.insert(
+                    address.clone(),
+                    ip_record::Model {
+                        id,
+                        target_address: address.clone(),
+                        created_at,
+                    },
+                );
                 summary.created += 1;
             }
+        }
+        if !new_records.is_empty() {
+            ip_record::Entity::insert_many(new_records)
+                .exec_without_returning(&txn)
+                .await?;
+        }
 
-            let existing = if record_is_new {
-                None
-            } else {
-                prefetched_memberships.remove(&record.id)
+        let mut new_memberships: Vec<ip_record_group_membership::ActiveModel> = Vec::new();
+        let mut updates_by_state: std::collections::BTreeMap<
+            (
+                chrono::NaiveDateTime,
+                bool,
+                Option<chrono::NaiveDateTime>,
+                Option<String>,
+            ),
+            Vec<Uuid>,
+        > = std::collections::BTreeMap::new();
+        let mut new_causes: Vec<ip_record_cause::ActiveModel> = Vec::new();
+
+        for (address, input) in chunk {
+            let Some(record) = prefetched_records.get(address) else {
+                continue;
             };
+            let existing = prefetched_memberships.remove(&record.id);
 
             let observed_at = input.last_seen_at.or(input.updated_at).unwrap_or(now);
             let (membership_id, action) = match existing {
@@ -1761,30 +1791,35 @@ pub async fn batch_records(
                 Some(m) => {
                     let was_deleted = m.is_deleted;
                     let id = m.id;
-                    let mut active: ip_record_group_membership::ActiveModel = m.into();
-                    active.last_seen_at = Set(observed_at);
-                    match input.is_deleted {
-                        Some(true) => {
-                            active.is_deleted = Set(true);
-                            active.deleted_at = Set(Some(input.deleted_at.unwrap_or(now)));
-                            active.deleted_by = Set(Some(key.id.to_string()));
-                        }
-                        _ if was_deleted => {
-                            active.is_deleted = Set(false);
-                            active.deleted_at = Set(None);
-                            active.deleted_by = Set(None);
-                            summary.restored += 1;
-                        }
-                        _ => {}
-                    }
-                    active.update(&txn).await?;
+                    let (target_is_deleted, target_deleted_at, target_deleted_by) =
+                        match input.is_deleted {
+                            Some(true) => (
+                                true,
+                                Some(input.deleted_at.unwrap_or(now)),
+                                Some(key.id.to_string()),
+                            ),
+                            _ if was_deleted => {
+                                summary.restored += 1;
+                                (false, None, None)
+                            }
+                            _ => (false, m.deleted_at, m.deleted_by),
+                        };
+                    updates_by_state
+                        .entry((
+                            observed_at,
+                            target_is_deleted,
+                            target_deleted_at,
+                            target_deleted_by,
+                        ))
+                        .or_default()
+                        .push(id);
                     summary.updated += 1;
                     (id, "IP_UPDATE")
                 }
                 None => {
                     let id = Uuid::new_v4();
                     let deleted = input.is_deleted == Some(true);
-                    ip_record_group_membership::ActiveModel {
+                    new_memberships.push(ip_record_group_membership::ActiveModel {
                         id: Set(id),
                         ip_record_id: Set(record.id),
                         group_id: Set(group.id),
@@ -1802,9 +1837,7 @@ pub async fn batch_records(
                         } else {
                             None
                         }),
-                    }
-                    .insert(&txn)
-                    .await?;
+                    });
                     summary.linked += 1;
                     (id, "IP_ADD")
                 }
@@ -1816,14 +1849,12 @@ pub async fn batch_records(
                 .map(str::trim)
                 .filter(|c| !c.is_empty())
             {
-                ip_record_cause::ActiveModel {
+                new_causes.push(ip_record_cause::ActiveModel {
                     id: Set(Uuid::new_v4()),
                     membership_id: Set(membership_id),
                     cause: Set(text.to_owned()),
                     created_at: Set(now),
-                }
-                .insert(&txn)
-                .await?;
+                });
             }
 
             if !skip_webhooks {
@@ -1836,6 +1867,41 @@ pub async fn batch_records(
                     cause: input.cause.clone(),
                 });
             }
+        }
+
+        if !new_memberships.is_empty() {
+            ip_record_group_membership::Entity::insert_many(new_memberships)
+                .exec_without_returning(&txn)
+                .await?;
+        }
+
+        for ((obs_at, is_del, del_at, del_by), ids) in updates_by_state {
+            ip_record_group_membership::Entity::update_many()
+                .col_expr(
+                    ip_record_group_membership::Column::LastSeenAt,
+                    Expr::value(obs_at),
+                )
+                .col_expr(
+                    ip_record_group_membership::Column::IsDeleted,
+                    Expr::value(is_del),
+                )
+                .col_expr(
+                    ip_record_group_membership::Column::DeletedAt,
+                    Expr::value(del_at),
+                )
+                .col_expr(
+                    ip_record_group_membership::Column::DeletedBy,
+                    Expr::value(del_by),
+                )
+                .filter(ip_record_group_membership::Column::Id.is_in(ids))
+                .exec(&txn)
+                .await?;
+        }
+
+        if !new_causes.is_empty() {
+            ip_record_cause::Entity::insert_many(new_causes)
+                .exec_without_returning(&txn)
+                .await?;
         }
     }
 
@@ -1856,17 +1922,14 @@ pub async fn batch_records(
             )
             .all(&txn)
             .await?;
+        let mut swept_ids: Vec<Uuid> = Vec::new();
         for (membership, record) in candidates {
             let Some(record) = record else { continue };
             if seen.contains(&record.target_address) {
                 continue;
             }
             let swept_address = record.target_address;
-            let mut active: ip_record_group_membership::ActiveModel = membership.into();
-            active.is_deleted = Set(true);
-            active.deleted_at = Set(Some(now));
-            active.deleted_by = Set(Some(key.id.to_string()));
-            active.update(&txn).await?;
+            swept_ids.push(membership.id);
             summary.soft_deleted += 1;
             if !skip_webhooks {
                 webhook_events.push(WebhookEvent {
@@ -1878,6 +1941,25 @@ pub async fn batch_records(
                     cause: Some("Removed via batch full_replace synchronisation".to_owned()),
                 });
             }
+        }
+        let deleted_by = Some(key.id.to_string());
+        for id_chunk in swept_ids.chunks(500) {
+            ip_record_group_membership::Entity::update_many()
+                .col_expr(
+                    ip_record_group_membership::Column::IsDeleted,
+                    Expr::value(true),
+                )
+                .col_expr(
+                    ip_record_group_membership::Column::DeletedAt,
+                    Expr::value(Some(now)),
+                )
+                .col_expr(
+                    ip_record_group_membership::Column::DeletedBy,
+                    Expr::value(deleted_by.clone()),
+                )
+                .filter(ip_record_group_membership::Column::Id.is_in(id_chunk.iter().copied()))
+                .exec(&txn)
+                .await?;
         }
     }
 

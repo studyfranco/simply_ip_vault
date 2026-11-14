@@ -2134,9 +2134,9 @@ else
     echo -e "$(ts)   ${RED}✗ FAIL${RESET} SQLite WAL mode was not reported at startup" >&2
 fi
 
-if grep -q "busy_timeout=10000ms" "$SERVER_LOG"; then
+if grep -q "busy_timeout=30000ms" "$SERVER_LOG"; then
     PASS_COUNT=$((PASS_COUNT + 1))
-    echo -e "$(ts)   ${GREEN}✓ PASS${RESET} SQLite busy_timeout is set to 10000ms" >&2
+    echo -e "$(ts)   ${GREEN}✓ PASS${RESET} SQLite busy_timeout is set to 30000ms" >&2
 else
     FAIL_COUNT=$((FAIL_COUNT + 1))
     echo -e "$(ts)   ${RED}✗ FAIL${RESET} SQLite busy_timeout was not reported at startup" >&2
