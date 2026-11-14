@@ -46,6 +46,7 @@ body {
     font-family: var(--font-sans);
     line-height: 1.6;
     min-height: 100vh;
+    overflow-x: clip;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
 }
@@ -59,10 +60,10 @@ body {
    display — fluid does not mean unbounded. Converged with `simply_hook_executor`, this ecosystem's
    gold-standard peer (`AGENT.MD`), which made this same change first. */
 .container {
-    max-width: 1800px;
+    max-width: min(2400px, 96vw);
     width: 100%;
     margin: 0 auto;
-    padding: 2rem clamp(1rem, 3vw, 4rem);
+    padding: 1.75rem clamp(1rem, 2.5vw, 3rem);
     transition: opacity var(--transition-slow), transform var(--transition-slow);
 }
 
@@ -909,7 +910,9 @@ body {
     font-family: var(--font-mono);
     font-size: 0.85rem;
     color: var(--text-main);
-    word-break: break-all;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
     padding: 0.5rem 0.7rem;
     background-color: var(--bg-input);
     border-radius: var(--radius);
@@ -1715,6 +1718,25 @@ body {
     max-width: clamp(420px, 60vw, 840px);
     max-height: calc(100vh - 3rem);
     overflow-y: auto;
+}
+
+#key-secret-modal .modal-card,
+#secret-reveal-modal .modal-card {
+    max-width: 560px;
+}
+
+#create-key-modal .modal-card-form,
+#edit-key-modal .modal-card-form {
+    max-width: 780px;
+}
+
+#form-create-group .form-row {
+    max-width: 960px;
+    background-color: var(--bg-input);
+    padding: 0.85rem 1.1rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    margin-bottom: 1rem;
 }
 
 .modal-card-form .form-actions {

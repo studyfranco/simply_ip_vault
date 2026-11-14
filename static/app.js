@@ -1242,12 +1242,20 @@ class FirewallClient {
         const trustedProxiesDisplay = (s.trusted_proxies && s.trusted_proxies.length > 0)
             ? `<div class="tag-list">${s.trusted_proxies.map(p => `<span class="badge badge-scope font-mono">${escapeHtml(p)}</span>`).join(' ')}</div>`
             : '<span class="text-muted">None configured</span>';
+        const ipv6NormEnabled = s.normalize_ipv6_to_48 !== false;
+        const ipv6NormControl = `
+            <span class="badge ${ipv6NormEnabled ? 'badge-success' : 'badge-timeout'}">${ipv6NormEnabled ? 'enabled (/48 storage)' : 'disabled (exact IPv6)'}</span>
+            <button type="button" class="btn btn-secondary btn-xs" id="toggle-ipv6-48-btn" style="margin-left: 0.5rem;">
+                ${ipv6NormEnabled ? 'Disable /48' : 'Enable /48'}
+            </button>
+        `;
 
         grid.innerHTML = [
             item('Trusted Proxies', trustedProxiesDisplay),
             item('Secrets at rest', s.encryption_enabled
                 ? '<span class="badge badge-success">encrypted</span>'
                 : '<span class="badge badge-timeout">unencrypted</span>'),
+            item('IPv6 /48 ban normalization', ipv6NormControl),
             item('Webhook workers', s.webhook_workers),
             item('Webhook dispatch interval', `${s.webhook_dispatch_interval_ms} ms`),
             item('Webhook queue capacity', s.webhook_queue_capacity),
@@ -1259,6 +1267,26 @@ class FirewallClient {
             item('Webhook executions retained', s.execution_count),
             item('Audit logs retained', s.audit_log_count),
         ].join('');
+
+        const toggleBtn = document.getElementById('toggle-ipv6-48-btn');
+        if (toggleBtn) {
+            toggleBtn.addEventListener('click', async () => {
+                toggleBtn.disabled = true;
+                try {
+                    await this.apiFetch('/settings', {
+                        method: 'PUT',
+                        body: JSON.stringify({ normalize_ipv6_to_48: !ipv6NormEnabled }),
+                    });
+                    this.showToast(
+                        `IPv6 /48 normalization ${!ipv6NormEnabled ? 'enabled' : 'disabled'}`,
+                        'success'
+                    );
+                    await this.loadSettings();
+                } catch (e) {
+                    toggleBtn.disabled = false;
+                }
+            });
+        }
     }
 
     renderIntersectionGroupCheckboxes() {
