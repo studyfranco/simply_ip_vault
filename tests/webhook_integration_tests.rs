@@ -320,3 +320,83 @@ async fn disabling_ipv6_48_normalization_via_api_stores_exact_host_ipv6() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].target_address, "2001:db8:9999:aaaa::1");
 }
+
+#[tokio::test]
+async fn ban_and_batch_preserve_non_128_ipv6_cidrs_without_converting_to_48() {
+    let (db, app, mut rx) = setup().await;
+
+    // Single bans with explicit non-/128 prefixes (/56, /64, /32) must keep their exact prefix.
+    ban(&app, "2001:db8:5656:1234::1/56", "Seedbox_Ban", 0).await;
+    ban(&app, "2001:db8:6464:abcd::9/64", "Seedbox_Ban", 1).await;
+    ban(&app, "2001:3200::/32", "Seedbox_Ban", 2).await;
+
+    // Batch with a bare host IPv6 (/48-normalized) alongside an explicit /64 and /120 must keep
+    // each distinct prefix separate.
+    let batch_body = json!({
+        "group_name": "Seedbox_Ban",
+        "mode": "upsert",
+        "records": [
+            { "target_address": "2001:db8:c0de:1111::1", "cause": "bare host" },
+            { "target_address": "2001:db8:c0de:2222::/64", "cause": "explicit /64" },
+            { "target_address": "2001:db8:c0de:3333:1:2:3:9/120", "cause": "explicit /120" }
+        ]
+    })
+    .to_string();
+    let res = app
+        .clone()
+        .oneshot(signed_request("POST", "/api/records/batch", batch_body, 3))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), axum::http::StatusCode::OK);
+
+    let mut stored: Vec<String> = simply_ip_vault::entities::ip_record::Entity::find()
+        .all(&db)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.target_address)
+        .collect();
+    stored.sort();
+    assert_eq!(
+        stored,
+        vec![
+            "2001:3200::/32",
+            "2001:db8:5656:1200::/56",
+            "2001:db8:6464:abcd::/64",
+            "2001:db8:c0de:2222::/64",
+            "2001:db8:c0de:3333:1:2:3:0/120",
+            "2001:db8:c0de::/48",
+        ]
+    );
+
+    let events = drain(&mut rx);
+    let event_addrs: Vec<String> = events.into_iter().map(|e| e.address).collect();
+    assert_eq!(
+        event_addrs,
+        vec![
+            "2001:db8:5656:1200::/56",
+            "2001:db8:6464:abcd::/64",
+            "2001:3200::/32",
+            "2001:db8:c0de:1111::1",
+            "2001:db8:c0de:2222::/64",
+            "2001:db8:c0de:3333:1:2:3:0/120",
+        ]
+    );
+
+    // Deleting an explicit /64 must target ONLY that /64 and leave the /48 untouched.
+    let del_res = app
+        .clone()
+        .oneshot(signed_request(
+            "DELETE",
+            "/api/ips?target_address=2001:db8:c0de:2222::/64&group_name=Seedbox_Ban",
+            String::new(),
+            4,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(del_res.status(), axum::http::StatusCode::NO_CONTENT);
+
+    let del_events = drain(&mut rx);
+    assert_eq!(del_events.len(), 1);
+    assert_eq!(del_events[0].address, "2001:db8:c0de:2222::/64");
+}

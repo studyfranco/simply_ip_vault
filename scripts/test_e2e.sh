@@ -3659,8 +3659,12 @@ api_call GET "/api/ips?groups=cidr-group&ip=2001:db8:beef&limit=100" "$MASTER_KE
 check_true '[.[] | select(.target_address == "2001:db8:beef::/64")] | length == 1' \
     "#30 the IPv6 CIDR is stored masked to its network address"
 
-# ── IPv6 canonicalisation over the wire ─────────────────────────────────────
-# Fully expanded, with a redundant /128. Must be stored compressed and without the prefix.
+# ── IPv6 canonicalisation over the wire (with /48 normalization temporarily off) ──────────────
+# Fully expanded, with a redundant /128. When /48 normalization is disabled, must be stored
+# compressed and without the prefix.
+api_call PUT "/api/settings" "$MASTER_KEY" '{"normalize_ipv6_to_48":false}'
+check "200" "#30 disable IPv6 /48 normalization temporarily to test raw /128 host canonicalisation"
+
 api_call POST "/api/records/batch" "$MASTER_KEY" \
     "{\"group_name\":\"edge-group\",\"records\":[{\"target_address\":\"2001:0db8:0000:0000:0000:0000:0000:00ff/128\",\"cause\":\"expanded form\"}]}"
 check "200" "#30 an expanded IPv6 address with /128 is accepted"
@@ -3685,6 +3689,9 @@ check_true '.created == 0 and .updated == 1' \
 api_call GET "/api/ips?groups=edge-group&ip=2001:db8::ff&limit=100" "$MASTER_KEY"
 check_true 'length == 1' "#30 exactly one row exists for the IPv6 host, whatever the spelling"
 check_true '.[0].cause == "mixed case, compressed"' "#30 and the re-submission updated it"
+
+api_call PUT "/api/settings" "$MASTER_KEY" '{"normalize_ipv6_to_48":true}'
+check "200" "#30 re-enable IPv6 /48 normalization after raw /128 canonicalisation checks"
 
 
 
@@ -4730,6 +4737,160 @@ api_call GET "/api/ips?cursor=&format=iplist" "$MASTER_KEY"
 check "400" "#36 cursor combined with format=iplist is rejected with 400"
 api_call GET "/api/ips?cursor=invalid-hex" "$MASTER_KEY"
 check "400" "#36 malformed cursor is rejected with 400"
+
+# ── 37. IPv6 /48 Ban Normalization, Non-/128 CIDR Preservation & Full-IP Webhooks ──────────
+
+log_section "37. IPv6 /48 Normalization, Non-/128 CIDR Preservation & Full-IP Webhooks"
+
+api_call GET "/api/settings" "$MASTER_KEY"
+check "200" "#37 GET /api/settings succeeds for master"
+check_jq ".normalize_ipv6_to_48" "true" "#37 normalize_ipv6_to_48 is enabled by default"
+
+IPV6_NORM_GROUP="ipv6-norm-e2e"
+api_call POST "/api/groups" "$MASTER_KEY" "{\"name\":\"$IPV6_NORM_GROUP\",\"group_type\":\"banlist\"}"
+check "200" "#37 create banlist group for IPv6 /48 tests"
+IPV6_NORM_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
+    : > "$RECEIVER_LOG"
+    api_call POST "/api/webhooks" "$MASTER_KEY" \
+        "{\"name\":\"ipv6-norm-hook\",\"target_url\":\"http://127.0.0.1:$RECEIVER_PORT/v6norm\",\"payload_template\":\"{\\\"ip\\\":\\\"\$target_address\\\",\\\"normalized\\\":\\\"\$normalized_address\\\",\\\"action\\\":\\\"\$action\\\"}\",\"group_id\":\"$IPV6_NORM_GROUP_ID\",\"auth_mode\":\"NONE\",\"events\":\"IP_ADD,IP_UPDATE,IP_DELETE\"}"
+    check "200" "#37 register live webhook on $IPV6_NORM_GROUP"
+    IPV6_NORM_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+fi
+
+# 37a. Bare IPv6 host ban -> stored as /48, webhook carries full host IPv6.
+api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"2001:0db8:4848:1111::1\",\"group_name\":\"$IPV6_NORM_GROUP\",\"cause\":\"v6 ssh brute\"}"
+check "200" "#37a ban bare host IPv6 2001:0db8:4848:1111::1"
+
+api_call GET "/api/ips?groups=$IPV6_NORM_GROUP&limit=100" "$MASTER_KEY"
+check "200" "#37a list $IPV6_NORM_GROUP after first ban"
+check_true '[.[] | select(.target_address == "2001:db8:4848::/48")] | length == 1' \
+    "#37a bare IPv6 ban is stored normalized to /48"
+check_true '[.[] | select(.target_address == "2001:db8:4848:1111::1")] | length == 0' \
+    "#37a full host IPv6 is not duplicated in storage"
+
+# Search by full host IPv6 still resolves the /48 record.
+api_call GET "/api/ips?groups=$IPV6_NORM_GROUP&ip=2001:db8:4848:1111::1&limit=100" "$MASTER_KEY"
+check_true 'length == 1 and .[0].target_address == "2001:db8:4848::/48"' \
+    "#37a GET /api/ips?ip=<full host> finds the stored /48 record"
+
+# Second bare IPv6 host in the same /48 -> deduplicates in DB, emits IP_UPDATE with new full host IPv6.
+api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"2001:db8:4848:9999::2\",\"group_name\":\"$IPV6_NORM_GROUP\",\"cause\":\"v6 port scan\"}"
+check "200" "#37a ban second bare host IPv6 in same /48"
+
+api_call GET "/api/ips?groups=$IPV6_NORM_GROUP&limit=100" "$MASTER_KEY"
+check_true '[.[] | select(.target_address == "2001:db8:4848::/48")] | length == 1' \
+    "#37a second IPv6 in same /48 deduplicates onto the single /48 record"
+
+# 37b. IPv6 CIDRs with prefix != /128 (/56, /64, /120, /32) MUST NOT be converted to /48.
+api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"2001:db8:5656:1234::1/56\",\"group_name\":\"$IPV6_NORM_GROUP\",\"cause\":\"explicit /56\"}"
+check "200" "#37b ban explicit /56 IPv6 CIDR"
+api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"2001:db8:6464:abcd::9/64\",\"group_name\":\"$IPV6_NORM_GROUP\",\"cause\":\"explicit /64\"}"
+check "200" "#37b ban explicit /64 IPv6 CIDR"
+api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"2001:3200::/32\",\"group_name\":\"$IPV6_NORM_GROUP\",\"cause\":\"explicit /32\"}"
+check "200" "#37b ban explicit /32 IPv6 CIDR"
+
+api_call POST "/api/records/batch" "$MASTER_KEY" \
+    "{\"group_name\":\"$IPV6_NORM_GROUP\",\"mode\":\"upsert\",\"records\":[{\"target_address\":\"2001:db8:bbbb:0001::a\",\"cause\":\"batch host 1\"},{\"target_address\":\"2001:db8:bbbb:0002::b\",\"cause\":\"batch host 2\"},{\"target_address\":\"2001:db8:bbbb:0003::1/64\",\"cause\":\"batch /64\"},{\"target_address\":\"2001:db8:c0de:1:2:3:4:9/120\",\"cause\":\"batch /120\"}]}"
+check "200" "#37b batch ban mixing bare IPv6 hosts and explicit non-/128 CIDRs"
+
+api_call GET "/api/ips?groups=$IPV6_NORM_GROUP&limit=100" "$MASTER_KEY"
+check_true '[.[] | select(.target_address == "2001:db8:5656:1200::/56")] | length == 1' \
+    "#37b /56 prefix is preserved (not altered to /48)"
+check_true '[.[] | select(.target_address == "2001:db8:6464:abcd::/64")] | length == 1' \
+    "#37b /64 prefix is preserved (not altered to /48)"
+check_true '[.[] | select(.target_address == "2001:3200::/32")] | length == 1' \
+    "#37b /32 prefix is preserved (not altered to /48)"
+check_true '[.[] | select(.target_address == "2001:db8:c0de:1:2:3:4:0/120")] | length == 1' \
+    "#37b /120 prefix is preserved (not altered to /48)"
+check_true '[.[] | select(.target_address == "2001:db8:bbbb::/48")] | length == 1' \
+    "#37b bare batch IPv6 hosts deduplicate to one /48"
+check_true '[.[] | select(.target_address == "2001:db8:bbbb:3::/64")] | length == 1' \
+    "#37b explicit /64 inside same /48 batch remains its own /64 record"
+
+# 37c. Whitelist must never normalize IPv6 to /48.
+IPV6_WHITE_GROUP="ipv6-norm-white-e2e"
+api_call POST "/api/white" "$MASTER_KEY" "{\"target_address\":\"2001:db8:7777:8888::1\",\"group_name\":\"$IPV6_WHITE_GROUP\",\"cause\":\"trusted host\"}"
+check "200" "#37c whitelist bare IPv6 host"
+api_call GET "/api/ips?groups=$IPV6_WHITE_GROUP&limit=100" "$MASTER_KEY"
+check_true '[.[] | select(.target_address == "2001:db8:7777:8888::1")] | length == 1' \
+    "#37c whitelist preserves exact host IPv6 without /48 normalization"
+
+# 37d. Delete by bare host resolves /48, leaves /56 untouched, and restore works.
+api_call DELETE "/api/ips?target_address=2001:db8:4848:2222::5&group_name=$IPV6_NORM_GROUP" "$MASTER_KEY"
+check "204" "#37d DELETE by bare host inside /48 soft-deletes the stored /48 membership"
+
+api_call GET "/api/ips?groups=$IPV6_NORM_GROUP&limit=100" "$MASTER_KEY"
+check_true '[.[] | select(.target_address == "2001:db8:4848::/48")] | length == 0' \
+    "#37d /48 record is no longer active after delete by bare host"
+check_true '[.[] | select(.target_address == "2001:db8:5656:1200::/56")] | length == 1' \
+    "#37d /56 record remains unaffected"
+
+api_call POST "/api/ips/restore" "$MASTER_KEY" "{\"target_address\":\"2001:db8:4848:1111::1\",\"group_name\":\"$IPV6_NORM_GROUP\"}"
+check "200" "#37d restore by bare host IPv6 resolves stored /48"
+check_jq ".target_address" "2001:db8:4848::/48" "#37d restore returns stored /48 target_address"
+
+# 37e. Verify live webhook deliveries received full host IPv6s (for AbuseIPDB) & untouched non-/128 CIDRs.
+if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
+    V6_HITS=0
+    for _ in $(seq 1 30); do
+        V6_HITS=$(grep -c '"/v6norm"' "$RECEIVER_LOG" 2>/dev/null || echo 0)
+        [ "$V6_HITS" -ge 10 ] && break
+        sleep 0.2
+    done
+    check_true "true" "#37e webhook receiver captured $V6_HITS /v6norm deliveries"
+
+    HAS_FULL_ADD=$(python3 - "$RECEIVER_LOG" <<'PY'
+import json, sys
+hits = []
+with open(sys.argv[1]) as f:
+    for line in f:
+        rec = json.loads(line)
+        if rec.get("path") == "/v6norm":
+            hits.append(json.loads(rec["body"]))
+ok = (
+    any(h["action"] == "IP_ADD" and h["ip"] == "2001:db8:4848:1111::1" and h["normalized"] == "2001:db8:4848::/48" for h in hits)
+    and any(h["action"] == "IP_UPDATE" and h["ip"] == "2001:db8:4848:9999::2" and h["normalized"] == "2001:db8:4848::/48" for h in hits)
+    and any(h["ip"] == "2001:db8:5656:1200::/56" and h["normalized"] == "2001:db8:5656:1200::/56" for h in hits)
+    and any(h["ip"] == "2001:db8:6464:abcd::/64" and h["normalized"] == "2001:db8:6464:abcd::/64" for h in hits)
+    and any(h["ip"] == "2001:3200::/32" and h["normalized"] == "2001:3200::/32" for h in hits)
+    and any(h["ip"] == "2001:db8:bbbb:1::a" and h["normalized"] == "2001:db8:bbbb::/48" for h in hits)
+    and any(h["ip"] == "2001:db8:bbbb:2::b" and h["normalized"] == "2001:db8:bbbb::/48" for h in hits)
+    and any(h["ip"] == "2001:db8:bbbb:3::/64" and h["normalized"] == "2001:db8:bbbb:3::/64" for h in hits)
+    and any(h["ip"] == "2001:db8:c0de:1:2:3:4:0/120" and h["normalized"] == "2001:db8:c0de:1:2:3:4:0/120" for h in hits)
+    and any(h["action"] == "IP_DELETE" and h["ip"] == "2001:db8:4848::/48" for h in hits)
+)
+print("1" if ok else "0")
+PY
+)
+    check_local "$HAS_FULL_ADD" "1" \
+        "#37e live webhooks carried full host IPv6s for /48 bans and preserved non-/128 CIDRs (/56,/64,/32,/120)"
+
+    api_call DELETE "/api/webhooks/$IPV6_NORM_HOOK_ID" "$MASTER_KEY"
+    check "204" "#37e clean up test webhook"
+fi
+
+# 37f. Runtime toggle via PUT /api/settings (Master-only).
+api_call PUT "/api/settings" "$EXPORTER_KEY" '{"normalize_ipv6_to_48":false}'
+check "403" "#37f non-master key is forbidden from toggling /api/settings"
+
+api_call PUT "/api/settings" "$MASTER_KEY" '{"normalize_ipv6_to_48":false}'
+check "200" "#37f master disables IPv6 /48 normalization via PUT /api/settings"
+check_jq ".normalize_ipv6_to_48" "false" "#37f PUT response reflects normalize_ipv6_to_48=false"
+
+api_call GET "/api/settings" "$MASTER_KEY"
+check "200" "#37f GET /api/settings reflects disabled toggle immediately (cache invalidated)"
+check_jq ".normalize_ipv6_to_48" "false" "#37f GET /api/settings normalize_ipv6_to_48 == false"
+
+api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"2001:db8:eeee:1111::1\",\"group_name\":\"$IPV6_NORM_GROUP\",\"cause\":\"exact v6 check\"}"
+check "200" "#37f ban bare IPv6 while normalization is disabled"
+api_call GET "/api/ips?groups=$IPV6_NORM_GROUP&ip=2001:db8:eeee:1111::1&limit=100" "$MASTER_KEY"
+check_true 'length == 1 and .[0].target_address == "2001:db8:eeee:1111::1"' \
+    "#37f exact host IPv6 is stored when normalize_ipv6_to_48 is disabled"
+
+api_call PUT "/api/settings" "$MASTER_KEY" '{"normalize_ipv6_to_48":true}'
+check "200" "#37f master re-enables IPv6 /48 normalization"
 
 log_section "Summary"
 echo -e "$(ts) ${GREEN}Passed: $PASS_COUNT${RESET}   ${RED}Failed: $FAIL_COUNT${RESET}" >&2
