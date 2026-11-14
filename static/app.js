@@ -2197,12 +2197,15 @@ class FirewallClient {
             const templateBadge = customTemplate
                 ? ` <span class="badge badge-scope" title="${escapeHtml(w.hmac_template)}">custom template</span>`
                 : '';
+            const ipv6NormBadge = w.send_normalized_ipv6
+                ? ' <span class="badge badge-scope" title="Sends /48-normalized IPv6 for bare host IPv6 bans">IPv6 /48</span>'
+                : '';
             return `
             <tr>
                 <td class="font-mono text-sm">${w.id.split('-')[0]}...</td>
                 <td><strong>${escapeHtml(w.name)}</strong></td>
                 <td class="font-mono text-sm">${escapeHtml(w.target_url)}</td>
-                <td><span class="badge ${badgeClass}">${escapeHtml(mode)}</span>${keyBadge}${templateBadge}</td>
+                <td><span class="badge ${badgeClass}">${escapeHtml(mode)}</span>${keyBadge}${templateBadge}${ipv6NormBadge}</td>
                 <td>
                     <div class="flex gap-2">
                         <button class="btn btn-sm btn-secondary" onclick="window.app.openEditWebhookModal('${w.id}')">Edit</button>
@@ -3039,6 +3042,7 @@ class FirewallClient {
             group_id: groupId,
             payload_template: document.getElementById('webhook-template').value,
             auth_mode: authMode,
+            send_normalized_ipv6: document.getElementById('webhook-send-normalized-ipv6').checked,
             events
         };
 
@@ -3253,6 +3257,7 @@ class FirewallClient {
         document.getElementById('edit-webhook-url').value = w.target_url;
         document.getElementById('edit-webhook-template').value = w.payload_template;
         document.getElementById('edit-webhook-is-active').checked = w.is_active;
+        document.getElementById('edit-webhook-send-normalized-ipv6').checked = Boolean(w.send_normalized_ipv6);
 
         const group = this.state.groups.find(g => g.id === w.group_id);
         document.getElementById('edit-webhook-group-search').value = group ? group.name : w.group_id;
@@ -3317,6 +3322,7 @@ class FirewallClient {
             auth_mode: document.getElementById('edit-webhook-auth-mode').value,
             payload_template: document.getElementById('edit-webhook-template').value,
             is_active: document.getElementById('edit-webhook-is-active').checked,
+            send_normalized_ipv6: document.getElementById('edit-webhook-send-normalized-ipv6').checked,
             events
         };
 

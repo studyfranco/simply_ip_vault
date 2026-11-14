@@ -65,6 +65,10 @@ pub struct Model {
     pub group_id: Uuid,
     /// Toggle to enable/disable webhook dispatching without deleting the configuration.
     pub is_active: bool,
+    /// When `true`, `$target_address` and `$ip` emit the `/48`-normalized IPv6 subnet for
+    /// non-whitelist bare host IPv6 bans (e.g. for firewall hooks like `launch.block.ip`).
+    /// When `false` (default), they emit the exact full address (e.g. for AbuseIPDB reporting).
+    pub send_normalized_ipv6: bool,
     /// Comma-separated subset of `IP_ADD`/`IP_UPDATE`/`IP_DELETE` this webhook should fire for.
     /// `None` means all events (the historical, pre-filtering behavior).
     pub events: Option<String>,

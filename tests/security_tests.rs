@@ -3312,6 +3312,7 @@ async fn webhook_execution_retention_purges_each_outcome_on_its_own_window() {
         payload_template: Set("{}".to_owned()),
         group_id: Set(group_id),
         is_active: Set(true),
+        send_normalized_ipv6: Set(false),
         events: Set(None),
         owner_key_id: Set(None),
         created_at: Set(chrono::Utc::now().naive_utc()),

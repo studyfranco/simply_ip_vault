@@ -31,6 +31,7 @@ mod m20261014_120000_add_query_optimization_indexes;
 mod m20261111_120000_add_analytics_and_overlap_indexes;
 mod m20261111_160000_add_stats_perf_indexes;
 mod m20261111_190000_fix_sqlite_listing_index_regression;
+mod m20261114_120000_add_webhook_send_normalized_ipv6;
 
 /// The ordered set of all schema migrations for `simply_ip_vault`.
 pub struct Migrator;
@@ -69,6 +70,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261111_120000_add_analytics_and_overlap_indexes::Migration),
             Box::new(m20261111_160000_add_stats_perf_indexes::Migration),
             Box::new(m20261111_190000_fix_sqlite_listing_index_regression::Migration),
+            Box::new(m20261114_120000_add_webhook_send_normalized_ipv6::Migration),
         ]
     }
 }

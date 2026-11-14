@@ -5413,6 +5413,7 @@ async fn s4_webhook_executions_are_scoped_to_ownership_not_can_manage_keys() {
                 payload_template: Set("{}".to_owned()),
                 group_id: Set(group_id),
                 is_active: Set(true),
+                send_normalized_ipv6: Set(false),
                 events: Set(None),
                 owner_key_id: Set(Some(owner)),
                 created_at: Set(chrono::Utc::now().naive_utc()),
@@ -5532,6 +5533,7 @@ async fn s4_webhook_executions_endpoint_filters_paginates_and_rejects_unknown_fi
                 payload_template: Set("{}".to_owned()),
                 group_id: Set(group_id),
                 is_active: Set(true),
+                send_normalized_ipv6: Set(false),
                 events: Set(None),
                 owner_key_id: Set(None),
                 created_at: Set(chrono::Utc::now().naive_utc()),
@@ -5668,6 +5670,7 @@ async fn s4_webhook_executions_endpoint_supports_rich_filters() {
                 payload_template: Set("{}".to_owned()),
                 group_id: Set(group_id),
                 is_active: Set(true),
+                send_normalized_ipv6: Set(false),
                 events: Set(None),
                 owner_key_id: Set(None),
                 created_at: Set(chrono::Utc::now().naive_utc()),
@@ -5826,6 +5829,7 @@ async fn s4_webhook_execution_delete_is_scoped_to_ownership() {
         payload_template: Set("{}".to_owned()),
         group_id: Set(group_id),
         is_active: Set(true),
+        send_normalized_ipv6: Set(false),
         events: Set(None),
         owner_key_id: Set(Some(owner_id)),
         created_at: Set(chrono::Utc::now().naive_utc()),
@@ -6228,6 +6232,7 @@ async fn clone_webhook_duplicates_configuration_under_a_fresh_secret_and_owner()
             "headers_json": "{\"X-Custom\":\"yes\"}",
             "events": "IP_ADD,IP_DELETE",
             "is_active": false,
+            "send_normalized_ipv6": true,
         }).to_string());
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
@@ -6261,6 +6266,7 @@ async fn clone_webhook_duplicates_configuration_under_a_fresh_secret_and_owner()
     assert_eq!(cloned_body["headers_json"], "{\"X-Custom\":\"yes\"}");
     assert_eq!(cloned_body["events"], "IP_ADD,IP_DELETE");
     assert_eq!(cloned_body["is_active"], false, "is_active is duplicated, not reset to the default");
+    assert_eq!(cloned_body["send_normalized_ipv6"], true, "send_normalized_ipv6 is duplicated");
     assert_eq!(cloned_body["group_id"], group_id.to_string());
 
     let generated_secret =
@@ -6399,6 +6405,7 @@ async fn s4_oracle_discipline_an_invisible_key_is_indistinguishable_from_a_missi
         group_id: Set(group_id),
         owner_key_id: Set(Some(owner_id)),
         is_active: Set(true),
+        send_normalized_ipv6: Set(false),
         events: Set(None),
         created_at: Set(chrono::Utc::now().naive_utc()),
     }

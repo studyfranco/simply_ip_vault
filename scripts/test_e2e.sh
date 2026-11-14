@@ -4753,10 +4753,24 @@ IPV6_NORM_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
 if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
     : > "$RECEIVER_LOG"
+    # Hook 1: omit send_normalized_ipv6 -> defaults to false (AbuseIPDB-style: sends full host IPv6).
     api_call POST "/api/webhooks" "$MASTER_KEY" \
-        "{\"name\":\"ipv6-norm-hook\",\"target_url\":\"http://127.0.0.1:$RECEIVER_PORT/v6norm\",\"payload_template\":\"{\\\"ip\\\":\\\"\$target_address\\\",\\\"normalized\\\":\\\"\$normalized_address\\\",\\\"action\\\":\\\"\$action\\\"}\",\"group_id\":\"$IPV6_NORM_GROUP_ID\",\"auth_mode\":\"NONE\",\"events\":\"IP_ADD,IP_UPDATE,IP_DELETE\"}"
-    check "200" "#37 register live webhook on $IPV6_NORM_GROUP"
+        "{\"name\":\"ipv6-full-hook\",\"target_url\":\"http://127.0.0.1:$RECEIVER_PORT/v6full?url_ip=\$ip\",\"payload_template\":\"{\\\"target\\\":\\\"\$target_address\\\",\\\"ip\\\":\\\"\$ip\\\",\\\"normalized\\\":\\\"\$normalized_address\\\",\\\"action\\\":\\\"\$action\\\"}\",\"group_id\":\"$IPV6_NORM_GROUP_ID\",\"auth_mode\":\"NONE\",\"events\":\"IP_ADD,IP_UPDATE,IP_DELETE\"}"
+    check "200" "#37 register default full-IPv6 webhook on $IPV6_NORM_GROUP"
+    check_jq ".send_normalized_ipv6" "false" "#37 send_normalized_ipv6 defaults to false on create"
+    IPV6_FULL_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    # Hook 2: explicit send_normalized_ipv6=true (launch.block.ip-style: sends /48 for bare host IPv6 bans).
+    api_call POST "/api/webhooks" "$MASTER_KEY" \
+        "{\"name\":\"ipv6-norm-hook\",\"target_url\":\"http://127.0.0.1:$RECEIVER_PORT/v6norm?url_ip=\$ip\",\"payload_template\":\"{\\\"target\\\":\\\"\$target_address\\\",\\\"ip\\\":\\\"\$ip\\\",\\\"normalized\\\":\\\"\$normalized_address\\\",\\\"action\\\":\\\"\$action\\\"}\",\"group_id\":\"$IPV6_NORM_GROUP_ID\",\"auth_mode\":\"NONE\",\"send_normalized_ipv6\":true,\"events\":\"IP_ADD,IP_UPDATE,IP_DELETE\"}"
+    check "200" "#37 register normalized-IPv6 webhook (send_normalized_ipv6=true) on $IPV6_NORM_GROUP"
+    check_jq ".send_normalized_ipv6" "true" "#37 send_normalized_ipv6=true persisted on create"
     IPV6_NORM_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    api_call GET "/api/webhooks" "$MASTER_KEY"
+    check "200" "#37 list webhooks includes send_normalized_ipv6 flags"
+    check_true "([.[] | select(.id == \"$IPV6_FULL_HOOK_ID\")][0].send_normalized_ipv6 == false) and ([.[] | select(.id == \"$IPV6_NORM_HOOK_ID\")][0].send_normalized_ipv6 == true)" \
+        "#37 GET /api/webhooks exposes false vs true send_normalized_ipv6 accurately"
 fi
 
 # 37a. Bare IPv6 host ban -> stored as /48, webhook carries full host IPv6.
@@ -4809,8 +4823,17 @@ check_true '[.[] | select(.target_address == "2001:db8:bbbb::/48")] | length == 
 check_true '[.[] | select(.target_address == "2001:db8:bbbb:3::/64")] | length == 1' \
     "#37b explicit /64 inside same /48 batch remains its own /64 record"
 
-# 37c. Whitelist must never normalize IPv6 to /48.
+# 37c. Whitelist must never normalize IPv6 to /48 (even with send_normalized_ipv6=true).
 IPV6_WHITE_GROUP="ipv6-norm-white-e2e"
+api_call POST "/api/groups" "$MASTER_KEY" "{\"name\":\"$IPV6_WHITE_GROUP\",\"group_type\":\"whitelist\"}"
+check "200" "#37c create whitelist group for IPv6 tests"
+IPV6_WHITE_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
+    api_call POST "/api/webhooks" "$MASTER_KEY" \
+        "{\"name\":\"ipv6-white-hook\",\"target_url\":\"http://127.0.0.1:$RECEIVER_PORT/v6white?url_ip=\$ip\",\"payload_template\":\"{\\\"ip\\\":\\\"\$target_address\\\",\\\"normalized\\\":\\\"\$normalized_address\\\"}\",\"group_id\":\"$IPV6_WHITE_GROUP_ID\",\"auth_mode\":\"NONE\",\"send_normalized_ipv6\":true}"
+    check "200" "#37c register whitelist webhook with send_normalized_ipv6=true"
+    IPV6_WHITE_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+fi
 api_call POST "/api/white" "$MASTER_KEY" "{\"target_address\":\"2001:db8:7777:8888::1\",\"group_name\":\"$IPV6_WHITE_GROUP\",\"cause\":\"trusted host\"}"
 check "200" "#37c whitelist bare IPv6 host"
 api_call GET "/api/ips?groups=$IPV6_WHITE_GROUP&limit=100" "$MASTER_KEY"
@@ -4831,44 +4854,140 @@ api_call POST "/api/ips/restore" "$MASTER_KEY" "{\"target_address\":\"2001:db8:4
 check "200" "#37d restore by bare host IPv6 resolves stored /48"
 check_jq ".target_address" "2001:db8:4848::/48" "#37d restore returns stored /48 target_address"
 
-# 37e. Verify live webhook deliveries received full host IPv6s (for AbuseIPDB) & untouched non-/128 CIDRs.
+# 37e. Verify live webhook deliveries compare send_normalized_ipv6=false (AbuseIPDB) vs true (launch.block.ip),
+#      plus whitelist exemption, clone preservation, and PUT toggling.
 if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
-    V6_HITS=0
-    for _ in $(seq 1 30); do
-        V6_HITS=$(grep -c '"/v6norm"' "$RECEIVER_LOG" 2>/dev/null || echo 0)
-        [ "$V6_HITS" -ge 10 ] && break
+    V6_FULL_HITS=0
+    V6_NORM_HITS=0
+    V6_WHITE_HITS=0
+    for _ in $(seq 1 40); do
+        V6_FULL_HITS=$(grep -c '"/v6full?' "$RECEIVER_LOG" 2>/dev/null || echo 0)
+        V6_NORM_HITS=$(grep -c '"/v6norm?' "$RECEIVER_LOG" 2>/dev/null || echo 0)
+        V6_WHITE_HITS=$(grep -c '"/v6white?' "$RECEIVER_LOG" 2>/dev/null || echo 0)
+        [ "$V6_FULL_HITS" -ge 10 ] && [ "$V6_NORM_HITS" -ge 10 ] && [ "$V6_WHITE_HITS" -ge 1 ] && break
         sleep 0.2
     done
-    check_true "true" "#37e webhook receiver captured $V6_HITS /v6norm deliveries"
+    check_local "$(( V6_FULL_HITS >= 10 && V6_NORM_HITS >= 10 && V6_WHITE_HITS >= 1 ))" "1" \
+        "#37e webhook receiver captured deliveries (full=$V6_FULL_HITS norm=$V6_NORM_HITS white=$V6_WHITE_HITS)"
 
-    HAS_FULL_ADD=$(python3 - "$RECEIVER_LOG" <<'PY'
-import json, sys
-hits = []
+    HAS_SPLIT_DELIVERY=$(python3 - "$RECEIVER_LOG" <<'PY'
+import json, sys, urllib.parse
+full_hits, norm_hits, white_hits = [], [], []
 with open(sys.argv[1]) as f:
     for line in f:
         rec = json.loads(line)
-        if rec.get("path") == "/v6norm":
-            hits.append(json.loads(rec["body"]))
+        path = rec.get("path", "")
+        parsed = urllib.parse.urlparse(path)
+        url_ip = urllib.parse.parse_qs(parsed.query).get("url_ip", [None])[0]
+        payload = json.loads(rec["body"])
+        payload["_url_ip"] = url_ip
+        if parsed.path == "/v6full":
+            full_hits.append(payload)
+        elif parsed.path == "/v6norm":
+            norm_hits.append(payload)
+        elif parsed.path == "/v6white":
+            white_hits.append(payload)
+
+full_ok = (
+    any(h["action"] == "IP_ADD" and h["target"] == "2001:db8:4848:1111::1" and h["ip"] == "2001:db8:4848:1111::1" and h["_url_ip"] == "2001:db8:4848:1111::1" and h["normalized"] == "2001:db8:4848::/48" for h in full_hits)
+    and any(h["action"] == "IP_UPDATE" and h["target"] == "2001:db8:4848:9999::2" and h["ip"] == "2001:db8:4848:9999::2" and h["_url_ip"] == "2001:db8:4848:9999::2" and h["normalized"] == "2001:db8:4848::/48" for h in full_hits)
+    and any(h["ip"] == "2001:db8:5656:1200::/56" and h["_url_ip"] == "2001:db8:5656:1200::/56" for h in full_hits)
+    and any(h["ip"] == "2001:db8:6464:abcd::/64" and h["_url_ip"] == "2001:db8:6464:abcd::/64" for h in full_hits)
+    and any(h["ip"] == "2001:3200::/32" and h["_url_ip"] == "2001:3200::/32" for h in full_hits)
+    and any(h["ip"] == "2001:db8:bbbb:1::a" and h["normalized"] == "2001:db8:bbbb::/48" for h in full_hits)
+    and any(h["ip"] == "2001:db8:bbbb:2::b" and h["normalized"] == "2001:db8:bbbb::/48" for h in full_hits)
+    and any(h["ip"] == "2001:db8:bbbb:3::/64" for h in full_hits)
+    and any(h["ip"] == "2001:db8:c0de:1:2:3:4:0/120" for h in full_hits)
+    and any(h["action"] == "IP_DELETE" and h["ip"] == "2001:db8:4848::/48" for h in full_hits)
+)
+
+norm_ok = (
+    any(h["action"] == "IP_ADD" and h["target"] == "2001:db8:4848::/48" and h["ip"] == "2001:db8:4848::/48" and h["_url_ip"] == "2001:db8:4848::/48" and h["normalized"] == "2001:db8:4848::/48" for h in norm_hits)
+    and any(h["action"] == "IP_UPDATE" and h["target"] == "2001:db8:4848::/48" and h["ip"] == "2001:db8:4848::/48" and h["_url_ip"] == "2001:db8:4848::/48" for h in norm_hits)
+    and any(h["target"] == "2001:db8:5656:1200::/56" and h["_url_ip"] == "2001:db8:5656:1200::/56" for h in norm_hits)
+    and any(h["target"] == "2001:db8:6464:abcd::/64" and h["_url_ip"] == "2001:db8:6464:abcd::/64" for h in norm_hits)
+    and any(h["target"] == "2001:3200::/32" and h["_url_ip"] == "2001:3200::/32" for h in norm_hits)
+    and any(h["target"] == "2001:db8:bbbb::/48" and h["ip"] == "2001:db8:bbbb::/48" for h in norm_hits)
+    and any(h["target"] == "2001:db8:bbbb:3::/64" for h in norm_hits)
+    and any(h["target"] == "2001:db8:c0de:1:2:3:4:0/120" for h in norm_hits)
+    and any(h["action"] == "IP_DELETE" and h["target"] == "2001:db8:4848::/48" for h in norm_hits)
+)
+
+white_ok = (
+    any(h["ip"] == "2001:db8:7777:8888::1" and h["normalized"] == "2001:db8:7777:8888::1" and h["_url_ip"] == "2001:db8:7777:8888::1" for h in white_hits)
+)
+
+print("1" if (full_ok and norm_ok and white_ok) else f"0:full={full_ok},norm={norm_ok},white={white_ok}")
+PY
+)
+    check_local "$HAS_SPLIT_DELIVERY" "1" \
+        "#37e send_normalized_ipv6=false emits full IPv6 while send_normalized_ipv6=true emits /48 (preserving non-/128 CIDRs & whitelists)"
+
+    # Clone preserves send_normalized_ipv6=true.
+    api_call POST "/api/webhooks/$IPV6_NORM_HOOK_ID/clone" "$MASTER_KEY" '{"name":"ipv6-norm-hook-clone"}'
+    check "201" "#37e clone webhook preserves send_normalized_ipv6=true"
+    check_jq ".send_normalized_ipv6" "true" "#37e cloned webhook retains send_normalized_ipv6=true"
+    IPV6_CLONE_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+    api_call DELETE "/api/webhooks/$IPV6_CLONE_HOOK_ID" "$MASTER_KEY"
+    check "204" "#37e delete cloned webhook"
+
+    # Toggle send_normalized_ipv6 on both hooks via PUT and verify swapped live dispatches.
+    api_call PUT "/api/webhooks/$IPV6_FULL_HOOK_ID" "$MASTER_KEY" '{"send_normalized_ipv6":true}'
+    check "200" "#37e PUT send_normalized_ipv6=true on full hook"
+    check_jq ".send_normalized_ipv6" "true" "#37e PUT response shows send_normalized_ipv6=true"
+
+    api_call PUT "/api/webhooks/$IPV6_NORM_HOOK_ID" "$MASTER_KEY" '{"send_normalized_ipv6":false}'
+    check "200" "#37e PUT send_normalized_ipv6=false on norm hook"
+    check_jq ".send_normalized_ipv6" "false" "#37e PUT response shows send_normalized_ipv6=false"
+
+    : > "$RECEIVER_LOG"
+    api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"2001:db8:f00d:1234::1\",\"group_name\":\"$IPV6_NORM_GROUP\",\"cause\":\"toggle verification\"}"
+    check "200" "#37e ban host after toggling send_normalized_ipv6"
+
+    TOG_FULL_HITS=0
+    TOG_NORM_HITS=0
+    for _ in $(seq 1 30); do
+        TOG_FULL_HITS=$(grep -c '"/v6full?' "$RECEIVER_LOG" 2>/dev/null || echo 0)
+        TOG_NORM_HITS=$(grep -c '"/v6norm?' "$RECEIVER_LOG" 2>/dev/null || echo 0)
+        [ "$TOG_FULL_HITS" -ge 1 ] && [ "$TOG_NORM_HITS" -ge 1 ] && break
+        sleep 0.2
+    done
+    SWAP_OK=$(python3 - "$RECEIVER_LOG" <<'PY'
+import json, sys, urllib.parse
+full_hit, norm_hit = None, None
+with open(sys.argv[1]) as f:
+    for line in f:
+        rec = json.loads(line)
+        parsed = urllib.parse.urlparse(rec.get("path", ""))
+        url_ip = urllib.parse.parse_qs(parsed.query).get("url_ip", [None])[0]
+        payload = json.loads(rec["body"])
+        payload["_url_ip"] = url_ip
+        if parsed.path == "/v6full":
+            full_hit = payload
+        elif parsed.path == "/v6norm":
+            norm_hit = payload
 ok = (
-    any(h["action"] == "IP_ADD" and h["ip"] == "2001:db8:4848:1111::1" and h["normalized"] == "2001:db8:4848::/48" for h in hits)
-    and any(h["action"] == "IP_UPDATE" and h["ip"] == "2001:db8:4848:9999::2" and h["normalized"] == "2001:db8:4848::/48" for h in hits)
-    and any(h["ip"] == "2001:db8:5656:1200::/56" and h["normalized"] == "2001:db8:5656:1200::/56" for h in hits)
-    and any(h["ip"] == "2001:db8:6464:abcd::/64" and h["normalized"] == "2001:db8:6464:abcd::/64" for h in hits)
-    and any(h["ip"] == "2001:3200::/32" and h["normalized"] == "2001:3200::/32" for h in hits)
-    and any(h["ip"] == "2001:db8:bbbb:1::a" and h["normalized"] == "2001:db8:bbbb::/48" for h in hits)
-    and any(h["ip"] == "2001:db8:bbbb:2::b" and h["normalized"] == "2001:db8:bbbb::/48" for h in hits)
-    and any(h["ip"] == "2001:db8:bbbb:3::/64" and h["normalized"] == "2001:db8:bbbb:3::/64" for h in hits)
-    and any(h["ip"] == "2001:db8:c0de:1:2:3:4:0/120" and h["normalized"] == "2001:db8:c0de:1:2:3:4:0/120" for h in hits)
-    and any(h["action"] == "IP_DELETE" and h["ip"] == "2001:db8:4848::/48" for h in hits)
+    full_hit is not None
+    and full_hit["target"] == "2001:db8:f00d::/48"
+    and full_hit["ip"] == "2001:db8:f00d::/48"
+    and full_hit["_url_ip"] == "2001:db8:f00d::/48"
+    and norm_hit is not None
+    and norm_hit["target"] == "2001:db8:f00d:1234::1"
+    and norm_hit["ip"] == "2001:db8:f00d:1234::1"
+    and norm_hit["_url_ip"] == "2001:db8:f00d:1234::1"
 )
 print("1" if ok else "0")
 PY
 )
-    check_local "$HAS_FULL_ADD" "1" \
-        "#37e live webhooks carried full host IPv6s for /48 bans and preserved non-/128 CIDRs (/56,/64,/32,/120)"
+    check_local "$SWAP_OK" "1" \
+        "#37e toggled send_normalized_ipv6 takes effect immediately on live dispatches"
 
+    api_call DELETE "/api/webhooks/$IPV6_FULL_HOOK_ID" "$MASTER_KEY"
+    check "204" "#37e clean up full webhook"
     api_call DELETE "/api/webhooks/$IPV6_NORM_HOOK_ID" "$MASTER_KEY"
-    check "204" "#37e clean up test webhook"
+    check "204" "#37e clean up norm webhook"
+    api_call DELETE "/api/webhooks/$IPV6_WHITE_HOOK_ID" "$MASTER_KEY"
+    check "204" "#37e clean up whitelist webhook"
 fi
 
 # 37f. Runtime toggle via PUT /api/settings (Master-only).

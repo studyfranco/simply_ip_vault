@@ -697,6 +697,18 @@
                             </div>
                         </div>
 
+                        <div class="form-group">
+                            <label class="checkbox-container">
+                                <input type="checkbox" id="webhook-send-normalized-ipv6">
+                                <span class="checkmark"></span> Send normalized IPv6 (/48)
+                            </label>
+                            <small class="field-hint">
+                                When enabled, <code>$target_address</code> and <code>$ip</code> emit the <code>/48</code>
+                                subnet for bare IPv6 bans (e.g. for firewall hooks like <code>launch.block.ip</code>).
+                                Leave unchecked to send the full host IPv6 (e.g. for AbuseIPDB reporting).
+                            </small>
+                        </div>
+
                         <div class="form-actions mt-4">
                             <button type="submit" class="btn btn-primary">Create Webhook</button>
                         </div>
@@ -825,7 +837,8 @@
                             <tr><th>Variable</th><th>Expands to</th></tr>
                         </thead>
                         <tbody>
-                            <tr><td><code>$target_address</code> / <code>$ip</code></td><td>The IP address or CIDR the event concerns.</td></tr>
+                            <tr><td><code>$target_address</code> / <code>$ip</code></td><td>The IP address or CIDR the event concerns (the full host IPv6 by default, or the <code>/48</code> subnet when <em>Send normalized IPv6 (/48)</em> is enabled).</td></tr>
+                            <tr><td><code>$normalized_address</code></td><td>Always the <code>/48</code>-normalized subnet for non-whitelist bare host IPv6 bans, or <code>$target_address</code> otherwise.</td></tr>
                             <tr><td><code>$action</code> / <code>$event</code></td><td><code>IP_ADD</code>, <code>IP_UPDATE</code>, <code>IP_DELETE</code>, or <code>TEST</code>.</td></tr>
                             <tr><td><code>$cause</code></td><td>The record's freeform cause, or <code>Unknown</code> if none was given.</td></tr>
                             <tr><td><code>$group_name</code></td><td>The target group's name, or empty if the event has none.</td></tr>
@@ -1218,6 +1231,18 @@
                         <input type="checkbox" id="edit-webhook-is-active">
                         <span class="checkmark"></span> Dispatching enabled
                     </label>
+                </div>
+
+                <div class="form-group">
+                    <label class="checkbox-container">
+                        <input type="checkbox" id="edit-webhook-send-normalized-ipv6">
+                        <span class="checkmark"></span> Send normalized IPv6 (/48)
+                    </label>
+                    <small class="field-hint">
+                        When enabled, <code>$target_address</code> and <code>$ip</code> emit the <code>/48</code>
+                        subnet for bare IPv6 bans (e.g. <code>launch.block.ip</code>). Leave unchecked to send
+                        the full host IPv6 (e.g. AbuseIPDB).
+                    </small>
                 </div>
 
                 <!-- Populated by testWebhook() from the live POST /api/webhooks/{id}/test result.

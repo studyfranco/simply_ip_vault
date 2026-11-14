@@ -84,6 +84,7 @@ async fn bench_webhook_executions_retention_and_status_optimization() {
             payload_template: sea_orm::Set(r#"{"test":true}"#.to_owned()),
             group_id: sea_orm::Set(group_id),
             is_active: sea_orm::Set(true),
+            send_normalized_ipv6: sea_orm::NotSet,
             events: sea_orm::Set(None),
             owner_key_id: sea_orm::Set(None),
             created_at: sea_orm::Set(now),

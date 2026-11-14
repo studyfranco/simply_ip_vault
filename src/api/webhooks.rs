@@ -114,6 +114,10 @@ pub struct CreateWebhookPayload {
     /// The empty string is meaningful rather than absent here, which is why it is not normalised
     /// away: some receivers reject a prefixed value outright.
     pub signature_prefix: Option<String>,
+    /// When `true`, `$target_address` and `$ip` expand to the `/48`-normalized IPv6 subnet for
+    /// non-whitelist bare host IPv6 bans (intended for firewall hooks like `launch.block.ip`).
+    /// Defaults to `false` so reporting endpoints like AbuseIPDB receive exact full IPv6 hosts.
+    pub send_normalized_ipv6: Option<bool>,
 }
 
 
@@ -230,6 +234,7 @@ pub async fn create_webhook(
         // scoping available was the group's, which is the shared-resource rule §4 forbids here.
         owner_key_id: Set(resource_owner(&key)),
         is_active: Set(payload.is_active.unwrap_or(true)),
+        send_normalized_ipv6: Set(payload.send_normalized_ipv6.unwrap_or(false)),
         events: Set(payload.events.clone()),
         created_at: Set(now),
     };
@@ -241,6 +246,7 @@ pub async fn create_webhook(
         "id": id,
         "target_url": payload.target_url,
         "auth_mode": auth_mode.as_str(),
+        "send_normalized_ipv6": payload.send_normalized_ipv6.unwrap_or(false),
     })))
 }
 
@@ -284,6 +290,8 @@ pub struct WebhookSummary {
     pub signature_header: String,
     /// The prefix actually applied to the digest, resolved the same way. May legitimately be empty.
     pub signature_prefix: String,
+    /// When `true`, `$target_address` and `$ip` emit `/48` for non-whitelist bare host IPv6 bans.
+    pub send_normalized_ipv6: bool,
     /// Creation timestamp
     pub created_at: chrono::NaiveDateTime,
 }
@@ -302,6 +310,7 @@ impl From<webhook_config::Model> for WebhookSummary {
             payload_template: w.payload_template,
             group_id: w.group_id,
             is_active: w.is_active,
+            send_normalized_ipv6: w.send_normalized_ipv6,
             events: w.events,
             auth_mode: auth_mode.as_str().to_owned(),
             hmac_template: w
@@ -365,6 +374,8 @@ pub struct UpdateWebhookPayload {
     pub signature_header: Option<String>,
     /// New prefix on the hex digest. `Some("")` sends a bare digest; omit to leave unchanged.
     pub signature_prefix: Option<String>,
+    /// Toggle whether `$target_address` and `$ip` emit `/48` for non-whitelist bare host IPv6 bans.
+    pub send_normalized_ipv6: Option<bool>,
 }
 
 
@@ -640,6 +651,9 @@ pub async fn update_webhook(
     if let Some(prefix) = payload.signature_prefix {
         active.signature_prefix = Set(Some(prefix));
     }
+    if let Some(send_normalized_ipv6) = payload.send_normalized_ipv6 {
+        active.send_normalized_ipv6 = Set(send_normalized_ipv6);
+    }
 
     let updated = active.update(&state.db).await?;
 
@@ -794,6 +808,7 @@ pub async fn clone_webhook(
         // every other creation endpoint).
         owner_key_id: resource_owner(&key),
         is_active: source.is_active,
+        send_normalized_ipv6: source.send_normalized_ipv6,
         events: source.events.clone(),
         created_at: now,
     };

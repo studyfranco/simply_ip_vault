@@ -240,6 +240,7 @@ async fn seed_webhook(db: &DatabaseConnection, name: &str, group: Uuid, owner: O
         payload_template: Set("{}".to_owned()),
         group_id: Set(group),
         is_active: Set(true),
+        send_normalized_ipv6: Set(false),
         events: Set(None),
         owner_key_id: Set(owner),
         created_at: Set(Utc::now().naive_utc()),

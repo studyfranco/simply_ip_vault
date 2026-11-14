@@ -400,3 +400,134 @@ async fn ban_and_batch_preserve_non_128_ipv6_cidrs_without_converting_to_48() {
     assert_eq!(del_events.len(), 1);
     assert_eq!(del_events[0].address, "2001:db8:c0de:2222::/64");
 }
+
+#[tokio::test]
+async fn webhook_send_normalized_ipv6_crud_and_clone_round_trip() {
+    let (_db, app, _rx) = setup().await;
+
+    let group_res = app
+        .clone()
+        .oneshot(signed_request(
+            "POST",
+            "/api/groups",
+            json!({ "name": "NormHookGroup", "group_type": "banlist" }).to_string(),
+            0,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(group_res.status(), axum::http::StatusCode::OK);
+    let group_json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(group_res.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let group_id = group_json["id"].as_str().unwrap();
+
+    // 1. Default omitted -> send_normalized_ipv6 is false.
+    let create_default = app
+        .clone()
+        .oneshot(signed_request(
+            "POST",
+            "/api/webhooks",
+            json!({
+                "name": "abuseipdb-default",
+                "target_url": "https://example.com/abuseipdb",
+                "auth_mode": "NONE",
+                "payload_template": "{\"ip\":\"$target_address\"}",
+                "group_id": group_id,
+            })
+            .to_string(),
+            1,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_default.status(), axum::http::StatusCode::OK);
+    let default_body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(create_default.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(default_body["send_normalized_ipv6"], false);
+    let default_id = default_body["id"].as_str().unwrap().to_owned();
+
+    // 2. Explicit true -> persisted and returned in POST, GET, PUT, and CLONE.
+    let create_norm = app
+        .clone()
+        .oneshot(signed_request(
+            "POST",
+            "/api/webhooks",
+            json!({
+                "name": "firewall-norm",
+                "target_url": "https://example.com/fw",
+                "auth_mode": "NONE",
+                "payload_template": "{\"ip\":\"$target_address\"}",
+                "group_id": group_id,
+                "send_normalized_ipv6": true,
+            })
+            .to_string(),
+            2,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_norm.status(), axum::http::StatusCode::OK);
+    let norm_body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(create_norm.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(norm_body["send_normalized_ipv6"], true);
+    let norm_id = norm_body["id"].as_str().unwrap().to_owned();
+
+    let list_res = app
+        .clone()
+        .oneshot(signed_request("GET", "/api/webhooks", String::new(), 3))
+        .await
+        .unwrap();
+    assert_eq!(list_res.status(), axum::http::StatusCode::OK);
+    let list_json: Vec<serde_json::Value> = serde_json::from_slice(
+        &axum::body::to_bytes(list_res.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let find_flag = |id: &str| {
+        list_json
+            .iter()
+            .find(|w| w["id"] == id)
+            .and_then(|w| w["send_normalized_ipv6"].as_bool())
+            .expect("webhook present in GET /api/webhooks")
+    };
+    assert!(!find_flag(&default_id));
+    assert!(find_flag(&norm_id));
+
+    // Toggle default hook from false -> true via PUT.
+    let put_res = app
+        .clone()
+        .oneshot(signed_request(
+            "PUT",
+            &format!("/api/webhooks/{default_id}"),
+            json!({ "send_normalized_ipv6": true }).to_string(),
+            4,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_res.status(), axum::http::StatusCode::OK);
+    let put_json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(put_res.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(put_json["send_normalized_ipv6"], true);
+
+    // Clone keeps send_normalized_ipv6 == true.
+    let clone_res = app
+        .clone()
+        .oneshot(signed_request(
+            "POST",
+            &format!("/api/webhooks/{norm_id}/clone"),
+            json!({ "name": "firewall-norm-copy" }).to_string(),
+            5,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(clone_res.status(), axum::http::StatusCode::CREATED);
+    let clone_json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(clone_res.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(clone_json["send_normalized_ipv6"], true);
+}

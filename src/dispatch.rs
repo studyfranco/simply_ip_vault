@@ -255,9 +255,11 @@ fn substitute_placeholders(template: &str, substitutions: &[(&str, &str)]) -> St
 /// can route on the same event data its body carries, and so a change to what a variable means
 /// never has to be made twice.
 ///
-/// Available variables: `$target_address`/`$ip` (the address the event concerns — for a bare IPv6
-/// host ban, the original canonicalized host IPv6 address), `$normalized_address` (the `/48`-truncated
-/// subnet for non-whitelist bare IPv6 host bans, or `$target_address` otherwise), `$action`/`$event`
+/// Available variables: `$target_address`/`$ip` (the address the event concerns — for a non-whitelist
+/// bare IPv6 host ban, the full canonicalized host IPv6 address when `send_normalized_ipv6` is
+/// `false`, or the `/48`-truncated subnet when `send_normalized_ipv6` is `true`),
+/// `$normalized_address` (always the `/48`-truncated subnet for non-whitelist bare IPv6 host bans,
+/// or `$target_address` otherwise), `$action`/`$event`
 /// (`IP_ADD`/`IP_UPDATE`/`IP_DELETE`/`TEST`), `$cause` (the freeform reason, or `"Unknown"` if none
 /// was given), `$group_name` (the target group's name, or empty if the event has none),
 /// `$group_id` (the target group's UUID, or empty), and `$timestamp` (the dispatch's Unix
@@ -270,19 +272,29 @@ fn substitute_placeholders(template: &str, substitutions: &[(&str, &str)]) -> St
 /// still redirect the request to a different *public* host than the operator intended. Variables
 /// are safest confined to the path or query; putting one in the host trades some of the operator's
 /// own control over the destination to whoever can set that variable's source field.
-fn resolve_event_variables(template: &str, event: &WebhookEvent, timestamp: &str) -> String {
+fn resolve_event_variables(
+    template: &str,
+    event: &WebhookEvent,
+    timestamp: &str,
+    send_normalized_ipv6: bool,
+) -> String {
     let group_id = event.group_id.map(|g| g.to_string()).unwrap_or_default();
     let group_name = event.group_name.as_deref().unwrap_or("");
     let cause = event.cause.as_deref().unwrap_or("Unknown");
     let normalized_address =
         crate::api::normalize_ipv6_ban_storage(&event.address, !event.is_whitelist);
+    let primary_address = if send_normalized_ipv6 {
+        normalized_address.as_str()
+    } else {
+        event.address.as_str()
+    };
 
     substitute_placeholders(
         template,
         &[
-            ("$target_address", event.address.as_str()),
+            ("$target_address", primary_address),
             ("$normalized_address", normalized_address.as_str()),
-            ("$ip", event.address.as_str()),
+            ("$ip", primary_address),
             ("$action", event.action.as_str()),
             ("$event", event.action.as_str()),
             ("$cause", cause),
@@ -352,12 +364,18 @@ fn prepare_dispatch(
     // a few instructions apart that happen to usually agree.
     let timestamp = chrono::Utc::now().timestamp().to_string();
 
-    let payload = resolve_event_variables(&config.payload_template, event, &timestamp);
+    let payload = resolve_event_variables(
+        &config.payload_template,
+        event,
+        &timestamp,
+        config.send_normalized_ipv6,
+    );
     // Resolved *before* anything downstream reads it: the SSRF re-screen, the HTTP client, and the
     // `CANONICAL_V1` path derivation below must all see the real destination, not the unexpanded
     // template — a signature computed over `{path}` derived from the template would not match the
     // path the receiver actually gets on the wire.
-    let target_url = resolve_event_variables(&config.target_url, event, &timestamp);
+    let target_url =
+        resolve_event_variables(&config.target_url, event, &timestamp, config.send_normalized_ipv6);
 
     let mut headers = HeaderMap::new();
     headers.insert("Content-Type", HeaderValue::from_static("application/json"));
@@ -1058,6 +1076,7 @@ mod tests {
             "https://x.example/$action/$event/$ip/$target_address/$cause/$group_name/$group_id/$timestamp",
             &event,
             "1700",
+            false,
         );
         assert_eq!(
             resolved,
@@ -1079,7 +1098,7 @@ mod tests {
             group_name: None,
             cause: None,
         };
-        let resolved = resolve_event_variables("$cause|$group_name|$group_id|", &event, "0");
+        let resolved = resolve_event_variables("$cause|$group_name|$group_id|", &event, "0", false);
         assert_eq!(resolved, "Unknown|||");
     }
 
@@ -1090,7 +1109,7 @@ mod tests {
     fn substitute_placeholders_never_rescans_an_inserted_value() {
         let mut event = sample_event();
         event.cause = Some("$group_name".to_owned());
-        let resolved = resolve_event_variables("cause=$cause group=$group_name", &event, "1700");
+        let resolved = resolve_event_variables("cause=$cause group=$group_name", &event, "1700", false);
         assert_eq!(
             resolved,
             "cause=$group_name group=hijack-group",
@@ -1118,6 +1137,7 @@ mod tests {
             payload_template: "{}".to_owned(),
             group_id: Uuid::new_v4(),
             is_active: true,
+            send_normalized_ipv6: false,
             events: None,
             owner_key_id: None,
             created_at: chrono::Utc::now().naive_utc(),
@@ -1149,6 +1169,7 @@ mod tests {
             payload_template: "{}".to_owned(),
             group_id: Uuid::new_v4(),
             is_active: true,
+            send_normalized_ipv6: false,
             events: None,
             owner_key_id: None,
             created_at: chrono::Utc::now().naive_utc(),
@@ -1307,6 +1328,7 @@ mod tests {
             payload_template: Set("{}".to_owned()),
             group_id: Set(group_id),
             is_active: Set(true),
+            send_normalized_ipv6: Set(false),
             events: Set(None),
             owner_key_id: Set(None),
             created_at: Set(chrono::Utc::now().naive_utc()),
@@ -1501,6 +1523,7 @@ mod tests {
             payload_template: Set("{}".to_owned()),
             group_id: Set(group_id),
             is_active: Set(true),
+            send_normalized_ipv6: Set(false),
             events: Set(None),
             owner_key_id: Set(None),
             created_at: Set(chrono::Utc::now().naive_utc()),
@@ -1811,6 +1834,7 @@ mod tests {
             payload_template: "{\"event\":\"test\"}".to_owned(),
             group_id: uuid::Uuid::new_v4(),
             is_active: true,
+            send_normalized_ipv6: false,
             events: None,
             owner_key_id: None,
             created_at: chrono::Utc::now().naive_utc(),
@@ -1866,6 +1890,7 @@ mod tests {
             payload_template: "{}".to_owned(),
             group_id: uuid::Uuid::new_v4(),
             is_active: true,
+            send_normalized_ipv6: false,
             events: None,
             owner_key_id: None,
             created_at: chrono::Utc::now().naive_utc(),
@@ -1891,5 +1916,72 @@ mod tests {
             0,
             "a request the SSRF filter refused was never attempted, so it must not be logged as one"
         );
+    }
+
+    #[test]
+    fn prepare_dispatch_respects_send_normalized_ipv6_option() {
+        let mut config = webhook_config::Model {
+            id: Uuid::new_v4(),
+            name: "ipv6-mode-test".to_owned(),
+            target_url: "https://x.example/hook?ip=$ip".to_owned(),
+            secret_token: String::new(),
+            auth_mode: AuthMode::NONE.to_owned(),
+            api_key: None,
+            hmac_template: None,
+            signature_header: None,
+            signature_prefix: None,
+            headers_json: None,
+            payload_template: r#"{"target":"$target_address","ip":"$ip","norm":"$normalized_address"}"#.to_owned(),
+            group_id: Uuid::new_v4(),
+            is_active: true,
+            send_normalized_ipv6: false,
+            events: None,
+            owner_key_id: None,
+            created_at: chrono::Utc::now().naive_utc(),
+        };
+
+        let host_ban = WebhookEvent {
+            action: "IP_ADD".to_owned(),
+            address: "2001:db8:1234:5678::1".to_owned(),
+            is_whitelist: false,
+            group_id: Some(config.group_id),
+            group_name: Some("Seedbox_Ban".to_owned()),
+            cause: Some("brute force".to_owned()),
+        };
+
+        // Default (`false`): `$target_address` & `$ip` stay full host IPv6 (e.g. AbuseIPDB).
+        let prepared_full = prepare_dispatch(&config, &host_ban).expect("full mode resolves");
+        assert_eq!(prepared_full.target_url, "https://x.example/hook?ip=2001:db8:1234:5678::1");
+        assert_eq!(
+            prepared_full.payload,
+            r#"{"target":"2001:db8:1234:5678::1","ip":"2001:db8:1234:5678::1","norm":"2001:db8:1234::/48"}"#
+        );
+
+        // Explicit (`true`): `$target_address` & `$ip` resolve to `/48` (e.g. launch.block.ip).
+        config.send_normalized_ipv6 = true;
+        let prepared_norm = prepare_dispatch(&config, &host_ban).expect("normalized mode resolves");
+        assert_eq!(prepared_norm.target_url, "https://x.example/hook?ip=2001:db8:1234::/48");
+        assert_eq!(
+            prepared_norm.payload,
+            r#"{"target":"2001:db8:1234::/48","ip":"2001:db8:1234::/48","norm":"2001:db8:1234::/48"}"#
+        );
+
+        // Explicit non-/128 CIDR, whitelist entries, and IPv4 keep their exact values even when `true`.
+        for (addr, is_whitelist, expected) in [
+            ("2001:db8:5656:1200::/56", false, "2001:db8:5656:1200::/56"),
+            ("2001:db8:1234:5678::1", true, "2001:db8:1234:5678::1"),
+            ("203.0.113.42", false, "203.0.113.42"),
+        ] {
+            let ev = WebhookEvent {
+                action: "IP_ADD".to_owned(),
+                address: addr.to_owned(),
+                is_whitelist,
+                group_id: Some(config.group_id),
+                group_name: None,
+                cause: None,
+            };
+            let p = prepare_dispatch(&config, &ev).expect("variant resolves");
+            assert_eq!(p.target_url, format!("https://x.example/hook?ip={expected}"));
+        }
     }
 }
