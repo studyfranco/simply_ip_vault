@@ -110,6 +110,11 @@ pub struct AppState {
     pub settings_cache: Arc<tokio::sync::RwLock<Option<(std::time::Instant, crate::api::SettingsResponse)>>>,
     /// Singleflight lock to serialize concurrent settings count computations.
     pub settings_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Whether bare IPv6 host addresses on ban endpoints (`POST /api/ban`, `POST /api/records/batch`,
+    /// `POST /api/ban/batch`) are normalized to `/48` subnets when stored in `ip_records`, while
+    /// preserving the original full IPv6 host address in outbound `WebhookEvent` notifications.
+    /// Seeded from `NORMALIZE_IPV6_TO_48` (default `true`) at startup and toggleable at runtime.
+    pub normalize_ipv6_to_48: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppState {
@@ -139,6 +144,9 @@ impl AppState {
             analytics_lock: Arc::new(tokio::sync::Mutex::new(())),
             settings_cache: Arc::new(tokio::sync::RwLock::new(None)),
             settings_lock: Arc::new(tokio::sync::Mutex::new(())),
+            normalize_ipv6_to_48: Arc::new(std::sync::atomic::AtomicBool::new(
+                crate::config::normalize_ipv6_to_48_from_env(),
+            )),
         })
     }
 
@@ -164,7 +172,29 @@ impl AppState {
             analytics_lock: Arc::new(tokio::sync::Mutex::new(())),
             settings_cache: Arc::new(tokio::sync::RwLock::new(None)),
             settings_lock: Arc::new(tokio::sync::Mutex::new(())),
+            normalize_ipv6_to_48: Arc::new(std::sync::atomic::AtomicBool::new(
+                crate::config::normalize_ipv6_to_48_from_env(),
+            )),
         }
+    }
+
+    /// Builds state with an explicit `normalize_ipv6_to_48` mode, bypassing the environment.
+    pub fn with_ipv6_48_normalization(self, enabled: bool) -> Self {
+        self.normalize_ipv6_to_48
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+
+    /// Whether bare IPv6 host bans should be stored normalized to `/48` subnets.
+    pub fn is_ipv6_48_normalization_enabled(&self) -> bool {
+        self.normalize_ipv6_to_48
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Updates the runtime IPv6 `/48` ban normalization toggle.
+    pub fn set_ipv6_48_normalization(&self, enabled: bool) {
+        self.normalize_ipv6_to_48
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Builds state whose Master identity is fixed to `master_key_id` without a database lookup.

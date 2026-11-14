@@ -255,7 +255,9 @@ fn substitute_placeholders(template: &str, substitutions: &[(&str, &str)]) -> St
 /// can route on the same event data its body carries, and so a change to what a variable means
 /// never has to be made twice.
 ///
-/// Available variables: `$target_address`/`$ip` (the address the event concerns), `$action`/`$event`
+/// Available variables: `$target_address`/`$ip` (the address the event concerns — for a bare IPv6
+/// host ban, the original canonicalized host IPv6 address), `$normalized_address` (the `/48`-truncated
+/// subnet for non-whitelist bare IPv6 host bans, or `$target_address` otherwise), `$action`/`$event`
 /// (`IP_ADD`/`IP_UPDATE`/`IP_DELETE`/`TEST`), `$cause` (the freeform reason, or `"Unknown"` if none
 /// was given), `$group_name` (the target group's name, or empty if the event has none),
 /// `$group_id` (the target group's UUID, or empty), and `$timestamp` (the dispatch's Unix
@@ -272,11 +274,14 @@ fn resolve_event_variables(template: &str, event: &WebhookEvent, timestamp: &str
     let group_id = event.group_id.map(|g| g.to_string()).unwrap_or_default();
     let group_name = event.group_name.as_deref().unwrap_or("");
     let cause = event.cause.as_deref().unwrap_or("Unknown");
+    let normalized_address =
+        crate::api::normalize_ipv6_ban_storage(&event.address, !event.is_whitelist);
 
     substitute_placeholders(
         template,
         &[
             ("$target_address", event.address.as_str()),
+            ("$normalized_address", normalized_address.as_str()),
             ("$ip", event.address.as_str()),
             ("$action", event.action.as_str()),
             ("$event", event.action.as_str()),

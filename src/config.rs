@@ -239,6 +239,37 @@ pub fn max_body_bytes() -> usize {
     })
 }
 
+/// Environment variable controlling whether bare IPv6 host bans (`POST /api/ban`,
+/// `POST /api/records/batch`, `POST /api/ban/batch`) are normalized to `/48` subnets in database
+/// storage (`ip_records`) while still passing the original full IPv6 host address in outbound
+/// `WebhookEvent` notifications (`$target_address` / `$ip`). Defaults to `true`.
+pub const NORMALIZE_IPV6_TO_48_ENV: &str = "NORMALIZE_IPV6_TO_48";
+
+/// Parses an optional boolean environment variable string (`true`/`1`/`yes`/`on` vs
+/// `false`/`0`/`no`/`off`), logging a warning and returning `default` if unrecognized.
+pub fn parse_bool_env(raw: Option<&str>, default: bool, name: &str) -> bool {
+    let Some(trimmed) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return default;
+    };
+    match trimmed.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => true,
+        "false" | "0" | "no" | "off" => false,
+        _ => {
+            tracing::warn!(
+                "{name}={trimmed:?} is not a recognized boolean (expected true/false/1/0/yes/no/on/off); \
+                 using default of {default}"
+            );
+            default
+        }
+    }
+}
+
+/// Reads [`NORMALIZE_IPV6_TO_48_ENV`] from the environment, defaulting to `true`.
+pub fn normalize_ipv6_to_48_from_env() -> bool {
+    let raw = std::env::var(NORMALIZE_IPV6_TO_48_ENV).ok();
+    parse_bool_env(raw.as_deref(), true, NORMALIZE_IPV6_TO_48_ENV)
+}
+
 // ─────────────────────────────────────────────────────────────
 // Database pool tuning
 // ─────────────────────────────────────────────────────────────

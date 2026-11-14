@@ -70,4 +70,7 @@ pub use webhooks::*;
 // mint keys directly against the database — a test hashes a plaintext exactly as the service would,
 // which is the only way to seed a key whose secret the test already knows. Named explicitly rather
 // than left to the glob above, which caps them at `pub(crate)`.
-pub use support::{ReassignOwnerPayload, generate_random_key, hash_key, normalize_ip_or_cidr};
+pub use support::{
+    ReassignOwnerPayload, generate_random_key, hash_key, normalize_ip_or_cidr,
+    normalize_ipv6_ban_storage,
+};

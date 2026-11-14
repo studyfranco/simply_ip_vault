@@ -111,7 +111,7 @@ pub fn create_app(state: AppState) -> Router {
         .route("/webhooks/{id}/owner", put(api::reassign_webhook_owner))
         .route("/webhooks/{id}/test", post(api::test_webhook))
         .route("/webhooks/{id}/clone", post(api::clone_webhook))
-        .route("/settings", get(api::get_settings))
+        .route("/settings", get(api::get_settings).put(api::update_settings))
         .route("/audit-logs", get(api::list_audit_logs))
         .route("/stats/analytics", get(api::get_analytics))
         .route("/stats/intersection", get(api::get_intersection))

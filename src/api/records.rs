@@ -35,7 +35,7 @@ use crate::state::{AppState, WebhookEvent};
 
 use super::{
     create_audit_log, format_key_reference, get_or_create_group, normalize_ip_or_cidr,
-    resolve_group_ref, resource_owner,
+    normalize_ipv6_ban_storage, resolve_group_ref, resource_owner,
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -157,7 +157,9 @@ pub(crate) async fn handle_ip_upsert(
 ) -> Result<impl IntoResponse, AppError> {
     let network: IpNet = super::support::parse_cidr_or_ip(&payload.target_address)
         .map_err(|_| AppError::InvalidInput("Invalid IP or CIDR format".to_owned()))?;
-    let normalized_address = normalize_ip_or_cidr(&payload.target_address);
+    let canonical_input_address = normalize_ip_or_cidr(&payload.target_address);
+    let normalize_v6_48 = !is_whitelist && state.is_ipv6_48_normalization_enabled();
+    let stored_address = normalize_ipv6_ban_storage(&payload.target_address, normalize_v6_48);
 
     if !is_whitelist {
         guard_bannable_address(&network)?;
@@ -272,7 +274,7 @@ pub(crate) async fn handle_ip_upsert(
         })
         .await?;
 
-    let (address_row, _) = find_or_insert_address(&txn, &normalized_address, now).await?;
+    let (address_row, _) = find_or_insert_address(&txn, &stored_address, now).await?;
 
     let existing = ip_record_group_membership::Entity::find()
         .filter(ip_record_group_membership::Column::IpRecordId.eq(address_row.id))
@@ -335,7 +337,7 @@ pub(crate) async fn handle_ip_upsert(
         &key,
         client_ip,
         action,
-        Some(normalized_address.clone()),
+        Some(stored_address.clone()),
         Some(resolved_group_name.clone()),
         Some(format!("Added IP to group. Whitelist: {}", is_whitelist)),
     )
@@ -345,7 +347,7 @@ pub(crate) async fn handle_ip_upsert(
 
     state.enqueue_webhook(WebhookEvent {
         action: action.to_owned(),
-        address: normalized_address,
+        address: canonical_input_address,
         is_whitelist,
         group_id: Some(target_group_id),
         group_name: Some(resolved_group_name),
@@ -923,8 +925,18 @@ pub async fn list_ips(
     if let Some(ip) = &filters.ip
         && !ip.is_empty()
     {
-        condition = condition
-            .add(ip_record::Column::TargetAddress.contains(normalize_ip_or_cidr(ip.trim())));
+        let norm_ip = normalize_ip_or_cidr(ip.trim());
+        let norm_48 =
+            normalize_ipv6_ban_storage(ip.trim(), state.is_ipv6_48_normalization_enabled());
+        if norm_48 != norm_ip {
+            condition = condition.add(
+                Condition::any()
+                    .add(ip_record::Column::TargetAddress.contains(norm_ip))
+                    .add(ip_record::Column::TargetAddress.eq(norm_48)),
+            );
+        } else {
+            condition = condition.add(ip_record::Column::TargetAddress.contains(norm_ip));
+        }
     }
 
     // A cause lives in the history table, so a cause filter selects memberships through a subquery
@@ -1227,23 +1239,48 @@ fn membership_ref_from(
 /// Resolves a membership from an address and a group reference, applying the same oracle rule as
 /// every other lookup: an unknown address, an unknown group, and an address not in that group all
 /// answer `404`.
+///
+/// When `normalize_ipv6_to_48` is enabled and the group is not a whitelist, if the exact
+/// `address` is not present in the group and `address` is a bare IPv6 host, this also checks the
+/// normalized `/48` subnet so callers can unban or restore by either the original host IP or the
+/// stored `/48` prefix.
 async fn find_membership(
     db: &DatabaseTransaction,
     address: &str,
     group: &ip_group::Model,
+    normalize_ipv6_to_48: bool,
 ) -> Result<(ip_record::Model, ip_record_group_membership::Model), AppError> {
-    let record = ip_record::Entity::find()
+    if let Some(record) = ip_record::Entity::find()
         .filter(ip_record::Column::TargetAddress.eq(address))
         .one(db)
         .await?
-        .ok_or(AppError::NotFound)?;
-    let membership = ip_record_group_membership::Entity::find()
-        .filter(ip_record_group_membership::Column::IpRecordId.eq(record.id))
-        .filter(ip_record_group_membership::Column::GroupId.eq(group.id))
-        .one(db)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    Ok((record, membership))
+        && let Some(membership) = ip_record_group_membership::Entity::find()
+            .filter(ip_record_group_membership::Column::IpRecordId.eq(record.id))
+            .filter(ip_record_group_membership::Column::GroupId.eq(group.id))
+            .one(db)
+            .await?
+    {
+        return Ok((record, membership));
+    }
+
+    if normalize_ipv6_to_48 && group.group_type != "whitelist" {
+        let addr_48 = normalize_ipv6_ban_storage(address, true);
+        if addr_48 != address
+            && let Some(record) = ip_record::Entity::find()
+                .filter(ip_record::Column::TargetAddress.eq(&addr_48))
+                .one(db)
+                .await?
+            && let Some(membership) = ip_record_group_membership::Entity::find()
+                .filter(ip_record_group_membership::Column::IpRecordId.eq(record.id))
+                .filter(ip_record_group_membership::Column::GroupId.eq(group.id))
+                .one(db)
+                .await?
+        {
+            return Ok((record, membership));
+        }
+    }
+
+    Err(AppError::NotFound)
 }
 
 /// Handles `DELETE /api/ips`: soft-deletes one address's membership in one group.
@@ -1324,7 +1361,14 @@ pub async fn delete_ip(
         })
         .await?;
 
-    let (record, membership) = find_membership(&txn, &target_address, &group).await?;
+    let (record, membership) = find_membership(
+        &txn,
+        &target_address,
+        &group,
+        state.is_ipv6_48_normalization_enabled(),
+    )
+    .await?;
+    let stored_address = record.target_address.clone();
     if membership.is_locked {
         return Err(AppError::Forbidden(
             "Protected records cannot be deleted".to_owned(),
@@ -1350,7 +1394,7 @@ pub async fn delete_ip(
             &key,
             client_ip.0,
             "IP_HARD_DELETE",
-            Some(target_address.clone()),
+            Some(stored_address.clone()),
             Some(group.name.clone()),
             Some("Permanently deleted".to_owned()),
         )
@@ -1366,7 +1410,7 @@ pub async fn delete_ip(
             &key,
             client_ip.0,
             "IP_SOFT_DELETE",
-            Some(target_address.clone()),
+            Some(stored_address.clone()),
             Some(group.name.clone()),
             Some(format!(
                 "Soft-deleted by key {}",
@@ -1385,7 +1429,7 @@ pub async fn delete_ip(
 
     state.enqueue_webhook(WebhookEvent {
         action: "IP_DELETE".to_owned(),
-        address: target_address,
+        address: stored_address,
         is_whitelist: group.group_type == "whitelist",
         group_id: Some(group.id),
         group_name: Some(group.name.clone()),
@@ -1433,7 +1477,14 @@ pub async fn restore_ip_record(
             ..Default::default()
         })
         .await?;
-    let (_record, membership) = find_membership(&txn, &target_address, &group).await?;
+    let (record, membership) = find_membership(
+        &txn,
+        &target_address,
+        &group,
+        state.is_ipv6_48_normalization_enabled(),
+    )
+    .await?;
+    let stored_address = record.target_address;
     if !membership.is_deleted {
         return Err(AppError::InvalidInput(
             "This IP membership is not deleted; nothing to restore".to_owned(),
@@ -1449,7 +1500,7 @@ pub async fn restore_ip_record(
         &key,
         client_ip.0,
         "IP_RESTORE",
-        Some(target_address.clone()),
+        Some(stored_address.clone()),
         Some(group.name.clone()),
         Some("Restored from soft delete".to_owned()),
     )
@@ -1457,7 +1508,7 @@ pub async fn restore_ip_record(
     txn.commit().await?;
 
     Ok(Json(serde_json::json!({
-        "target_address": target_address,
+        "target_address": stored_address,
         "group_name": group.name,
         "is_deleted": false,
         "restored": true,
@@ -1615,9 +1666,9 @@ pub async fn batch_records(
     }
 
     // Validate everything before taking the write lock.
-    let mut normalized: Vec<(String, &BatchRecordInput)> =
+    let mut parsed_inputs: Vec<(String, &BatchRecordInput)> =
         Vec::with_capacity(payload.records.len());
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_inputs: std::collections::HashSet<String> = std::collections::HashSet::new();
     for record in &payload.records {
         let _network: IpNet = super::support::parse_cidr_or_ip(&record.target_address).map_err(|_| {
             AppError::InvalidInput(format!(
@@ -1625,13 +1676,13 @@ pub async fn batch_records(
                 record.target_address
             ))
         })?;
-        let address = normalize_ip_or_cidr(&record.target_address);
-        if !seen.insert(address.clone()) {
+        let canonical_input = normalize_ip_or_cidr(&record.target_address);
+        if !seen_inputs.insert(canonical_input.clone()) {
             return Err(AppError::InvalidInput(format!(
-                "Duplicate target_address in batch after canonicalisation: {address}"
+                "Duplicate target_address in batch after canonicalisation: {canonical_input}"
             )));
         }
-        normalized.push((address, record));
+        parsed_inputs.push((canonical_input, record));
     }
 
     let existing = ip_group::Entity::find()
@@ -1686,13 +1737,25 @@ pub async fn batch_records(
         }
     };
 
-    if group.group_type != "whitelist" {
-        for (address, _) in &normalized {
+    let is_whitelist = group.group_type == "whitelist";
+    if !is_whitelist {
+        for (address, _) in &parsed_inputs {
             let network: IpNet = super::support::parse_cidr_or_ip(address).map_err(|_| {
                 AppError::InvalidInput(format!("Invalid IP or CIDR format: {address}"))
             })?;
             guard_bannable_address(&network)?;
         }
+    }
+
+    let normalize_v6_48 = !is_whitelist && state.is_ipv6_48_normalization_enabled();
+    let mut normalized: Vec<(String, String, &BatchRecordInput)> =
+        Vec::with_capacity(parsed_inputs.len());
+    let mut seen_stored: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (canonical_input, record) in parsed_inputs {
+        let stored_address =
+            normalize_ipv6_ban_storage(&record.target_address, normalize_v6_48);
+        seen_stored.insert(stored_address.clone());
+        normalized.push((stored_address, canonical_input, record));
     }
 
     let now = Utc::now().naive_utc();
@@ -1708,7 +1771,9 @@ pub async fn batch_records(
     let mut webhook_events: Vec<WebhookEvent> = Vec::new();
 
     for chunk in normalized.chunks(500) {
-        let chunk_addrs: Vec<String> = chunk.iter().map(|(addr, _)| addr.clone()).collect();
+        let mut chunk_addrs: Vec<String> = chunk.iter().map(|(addr, _, _)| addr.clone()).collect();
+        chunk_addrs.sort();
+        chunk_addrs.dedup();
         let mut prefetched_records: std::collections::HashMap<String, ip_record::Model> =
             ip_record::Entity::find()
                 .filter(ip_record::Column::TargetAddress.is_in(chunk_addrs))
@@ -1738,7 +1803,7 @@ pub async fn batch_records(
         // Bulk-insert canonical `ip_records` for addresses not yet present in the database,
         // avoiding hundreds of single-row INSERT statements inside the write lock.
         let mut new_records: Vec<ip_record::ActiveModel> = Vec::new();
-        for (address, input) in chunk {
+        for (address, _, input) in chunk {
             if !prefetched_records.contains_key(address) {
                 let id = Uuid::new_v4();
                 let created_at = input.created_at.unwrap_or(now);
@@ -1776,7 +1841,7 @@ pub async fn batch_records(
         > = std::collections::BTreeMap::new();
         let mut new_causes: Vec<ip_record_cause::ActiveModel> = Vec::new();
 
-        for (address, input) in chunk {
+        for (address, canonical_input, input) in chunk {
             let Some(record) = prefetched_records.get(address) else {
                 continue;
             };
@@ -1785,6 +1850,7 @@ pub async fn batch_records(
             let observed_at = input.last_seen_at.or(input.updated_at).unwrap_or(now);
             let (membership_id, action) = match existing {
                 Some(m) if m.is_locked => {
+                    prefetched_memberships.insert(record.id, m);
                     summary.locked_skipped += 1;
                     continue;
                 }
@@ -1804,40 +1870,74 @@ pub async fn batch_records(
                             }
                             _ => (false, m.deleted_at, m.deleted_by),
                         };
+                    for ids in updates_by_state.values_mut() {
+                        ids.retain(|&existing_id| existing_id != id);
+                    }
                     updates_by_state
                         .entry((
                             observed_at,
                             target_is_deleted,
                             target_deleted_at,
-                            target_deleted_by,
+                            target_deleted_by.clone(),
                         ))
                         .or_default()
                         .push(id);
+                    prefetched_memberships.insert(
+                        record.id,
+                        ip_record_group_membership::Model {
+                            id,
+                            ip_record_id: record.id,
+                            group_id: group.id,
+                            is_locked: false,
+                            created_at: m.created_at,
+                            last_seen_at: observed_at,
+                            is_deleted: target_is_deleted,
+                            deleted_at: target_deleted_at,
+                            deleted_by: target_deleted_by,
+                        },
+                    );
                     summary.updated += 1;
                     (id, "IP_UPDATE")
                 }
                 None => {
                     let id = Uuid::new_v4();
                     let deleted = input.is_deleted == Some(true);
+                    let created_at = input.created_at.unwrap_or(now);
+                    let deleted_at = if deleted {
+                        Some(input.deleted_at.unwrap_or(now))
+                    } else {
+                        None
+                    };
+                    let deleted_by = if deleted {
+                        Some(key.id.to_string())
+                    } else {
+                        None
+                    };
                     new_memberships.push(ip_record_group_membership::ActiveModel {
                         id: Set(id),
                         ip_record_id: Set(record.id),
                         group_id: Set(group.id),
                         is_locked: Set(false),
-                        created_at: Set(input.created_at.unwrap_or(now)),
+                        created_at: Set(created_at),
                         last_seen_at: Set(observed_at),
                         is_deleted: Set(deleted),
-                        deleted_at: Set(if deleted {
-                            Some(input.deleted_at.unwrap_or(now))
-                        } else {
-                            None
-                        }),
-                        deleted_by: Set(if deleted {
-                            Some(key.id.to_string())
-                        } else {
-                            None
-                        }),
+                        deleted_at: Set(deleted_at),
+                        deleted_by: Set(deleted_by.clone()),
                     });
+                    prefetched_memberships.insert(
+                        record.id,
+                        ip_record_group_membership::Model {
+                            id,
+                            ip_record_id: record.id,
+                            group_id: group.id,
+                            is_locked: false,
+                            created_at,
+                            last_seen_at: observed_at,
+                            is_deleted: deleted,
+                            deleted_at,
+                            deleted_by,
+                        },
+                    );
                     summary.linked += 1;
                     (id, "IP_ADD")
                 }
@@ -1860,8 +1960,8 @@ pub async fn batch_records(
             if !skip_webhooks {
                 webhook_events.push(WebhookEvent {
                     action: action.to_owned(),
-                    address: address.clone(),
-                    is_whitelist: group.group_type == "whitelist",
+                    address: canonical_input.clone(),
+                    is_whitelist,
                     group_id: Some(group.id),
                     group_name: Some(group.name.clone()),
                     cause: input.cause.clone(),
@@ -1876,6 +1976,9 @@ pub async fn batch_records(
         }
 
         for ((obs_at, is_del, del_at, del_by), ids) in updates_by_state {
+            if ids.is_empty() {
+                continue;
+            }
             ip_record_group_membership::Entity::update_many()
                 .col_expr(
                     ip_record_group_membership::Column::LastSeenAt,
@@ -1925,7 +2028,7 @@ pub async fn batch_records(
         let mut swept_ids: Vec<Uuid> = Vec::new();
         for (membership, record) in candidates {
             let Some(record) = record else { continue };
-            if seen.contains(&record.target_address) {
+            if seen_stored.contains(&record.target_address) {
                 continue;
             }
             let swept_address = record.target_address;

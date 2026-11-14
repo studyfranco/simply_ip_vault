@@ -125,6 +125,34 @@ pub fn normalize_ip_or_cidr(input: &str) -> String {
     }
 }
 
+/// Normalizes a target address for ban storage in `ip_records`.
+///
+/// When `normalize_ipv6_to_48` is `true`, any bare IPv6 host address (or `/128` CIDR) that is not
+/// an IPv4-mapped IPv6 address is truncated to its canonical `/48` subnet (`<48-bit-prefix>/48`).
+/// Explicit IPv6 CIDR prefixes other than `/128` (e.g. `/64`, `/56`, `/32`), IPv4 addresses/CIDRs,
+/// and all addresses when `normalize_ipv6_to_48` is `false` fall back to [`normalize_ip_or_cidr`].
+pub fn normalize_ipv6_ban_storage(input: &str, normalize_ipv6_to_48: bool) -> String {
+    if !normalize_ipv6_to_48 {
+        return normalize_ip_or_cidr(input);
+    }
+
+    let trimmed = input.trim();
+    if let Ok(IpNet::V6(net6)) = trimmed.parse::<IpNet>() {
+        if net6.prefix_len() == 128 && net6.addr().to_ipv4_mapped().is_none() {
+            return ipnet::Ipv6Net::new_assert(net6.addr(), 48).trunc().to_string();
+        }
+        return normalize_ip_or_cidr(input);
+    }
+
+    if let Ok(std::net::IpAddr::V6(v6)) = trimmed.parse::<std::net::IpAddr>()
+        && v6.to_ipv4_mapped().is_none()
+    {
+        return ipnet::Ipv6Net::new_assert(v6, 48).trunc().to_string();
+    }
+
+    normalize_ip_or_cidr(input)
+}
+
 // ─────────────────────────────────────────────────────────────
 // Audit trail
 // ─────────────────────────────────────────────────────────────
@@ -384,5 +412,51 @@ mod tests {
 
         // Invalid passthrough
         assert_eq!(normalize_ip_or_cidr("partial.address"), "partial.address");
+    }
+
+    #[test]
+    fn normalize_ipv6_ban_storage_truncates_host_ipv6_to_48_when_enabled() {
+        // Bare IPv6 host -> /48 when enabled
+        assert_eq!(
+            normalize_ipv6_ban_storage("2001:db8:1234:5678::1", true),
+            "2001:db8:1234::/48"
+        );
+        assert_eq!(
+            normalize_ipv6_ban_storage("2001:db8:1234:5678::1/128", true),
+            "2001:db8:1234::/48"
+        );
+        assert_eq!(
+            normalize_ipv6_ban_storage("2001:0db8:1234:9999:dead:beef:cafe:0002", true),
+            "2001:db8:1234::/48"
+        );
+
+        // Disabled -> preserves bare canonical host IPv6
+        assert_eq!(
+            normalize_ipv6_ban_storage("2001:db8:1234:5678::1", false),
+            "2001:db8:1234:5678::1"
+        );
+        assert_eq!(
+            normalize_ipv6_ban_storage("2001:db8:1234:5678::1/128", false),
+            "2001:db8:1234:5678::1"
+        );
+
+        // Explicit non-/128 IPv6 CIDRs keep their own prefix length
+        assert_eq!(
+            normalize_ipv6_ban_storage("2001:db8:1234:5678::1/64", true),
+            "2001:db8:1234:5678::/64"
+        );
+        assert_eq!(
+            normalize_ipv6_ban_storage("2001:db8::/32", true),
+            "2001:db8::/32"
+        );
+        assert_eq!(
+            normalize_ipv6_ban_storage("2001:db8:1234::/48", true),
+            "2001:db8:1234::/48"
+        );
+
+        // IPv4 addresses and CIDRs are unaffected
+        assert_eq!(normalize_ipv6_ban_storage("203.0.113.10", true), "203.0.113.10");
+        assert_eq!(normalize_ipv6_ban_storage("203.0.113.10/32", true), "203.0.113.10");
+        assert_eq!(normalize_ipv6_ban_storage("203.0.113.10/24", true), "203.0.113.0/24");
     }
 }
