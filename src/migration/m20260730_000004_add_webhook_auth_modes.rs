@@ -22,7 +22,7 @@ use sea_orm_migration::prelude::*;
 /// Identifiers this migration touches. `Table` and `SignatureMode` are re-declared locally rather
 /// than imported from the migrations that created them, so those modules can stay private
 /// (exporting them would leak a pile of undocumented public idens and trip the crate's
-/// `#![warn(missing_docs)]`). `DeriveIden` maps every variant to the same snake_case name the
+/// `#![warn(missing_docs)]`). `DeriveIden` maps every variant to the same `snake_case` name the
 /// earlier migrations used, so they address the same table and columns.
 #[derive(DeriveIden)]
 enum WebhookConfigs {

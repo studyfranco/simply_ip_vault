@@ -62,8 +62,8 @@
 //!
 //! | Pragma | Scope | Default already in force |
 //! | :--- | :--- | :--- |
-//! | `foreign_keys` | per-connection | **ON** (SQLx sets it) |
-//! | `busy_timeout` | per-connection | **10000 ms** (SQLx sets it) |
+//! | `foreign_keys` | per-connection | **ON** (`SQLx` sets it) |
+//! | `busy_timeout` | per-connection | **10000 ms** (`SQLx` sets it) |
 //! | `journal_mode=WAL` | **persistent** (file header) | `delete` |
 //! | `synchronous=NORMAL` | per-connection | `FULL` (2) |
 //! | `temp_store=MEMORY` | per-connection | `0` (engine's choice, usually a disk file) |
@@ -75,7 +75,7 @@
 //! per-connection are the same thing.
 //!
 //! [`connect`] still sets them through `SqliteConnectOptions` rather than relying on
-//! [`apply_sqlite_pragmas`] alone, for one narrow but real reason: SQLx reopens a connection that
+//! [`apply_sqlite_pragmas`] alone, for one narrow but real reason: `SQLx` reopens a connection that
 //! has been closed or invalidated, and a reopened connection gets its options replayed but not our
 //! `PRAGMA` statements. Declaring them at open time is what makes them survive a recycle.
 //!
@@ -83,21 +83,23 @@
 //! `scripts/verify_convergence.sh` diffs against the peer's, and it reads `journal_mode` back so the
 //! startup log reports what is actually in force rather than what was requested.
 //!
-//! URL query parameters were tried first and rejected outright — SQLx answers
+//! URL query parameters were tried first and rejected outright — `SQLx` answers
 //! `unknown query parameter 'synchronous' while parsing connection URL`.
 
+use sea_orm::sea_query::{Alias, Query};
+use sea_orm::sqlx::sqlite::{
+    SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
+};
+use sea_orm::sqlx::{ConnectOptions as _, Connection as _};
 use sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, DbErr,
-    SqlxSqliteConnector, Statement,
+    SqlxSqliteConnector,
 };
-use sea_orm::sqlx::sqlite::{
-    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
-};
-use sea_orm_migration::MigratorTrait;
+use sea_orm_migration::{MigratorTrait, SchemaManager};
 
 /// How long SQLite waits on a locked database before returning `SQLITE_BUSY`, in milliseconds.
 ///
-/// Was 5000 (SQLx's own default) until production logs under concurrent write load showed
+/// Was 5000 (`SQLx`'s own default) until production logs under concurrent write load showed
 /// `SQLITE_BUSY` surfacing as user-visible `500`s on simple single-row `INSERT`s — a writer that
 /// would have succeeded a few hundred milliseconds later was instead failing outright. Raised to
 /// 10000: still bounded (a genuinely stuck writer cannot hang a request forever), but wide enough
@@ -132,7 +134,8 @@ const DEFAULT_SQLITE_CACHE_SIZE_KIB: i64 = 128 * 1024;
 /// negative value. Read once per connection open, same as every other pragma here — not cached
 /// globally, so tests that set the env var per-case are not fighting a stale value.
 fn sqlite_mmap_size_bytes() -> i64 {
-    let value = crate::config::numeric_env(SQLITE_MMAP_SIZE_BYTES_ENV, DEFAULT_SQLITE_MMAP_SIZE_BYTES);
+    let value =
+        crate::config::numeric_env(SQLITE_MMAP_SIZE_BYTES_ENV, DEFAULT_SQLITE_MMAP_SIZE_BYTES);
     if value < 0 {
         tracing::warn!(
             "{SQLITE_MMAP_SIZE_BYTES_ENV}={value} must not be negative; using the default of \
@@ -147,7 +150,8 @@ fn sqlite_mmap_size_bytes() -> i64 {
 /// Reads [`SQLITE_CACHE_SIZE_KIB_ENV`], falling back to the default with a warning on a bad or
 /// non-positive value.
 fn sqlite_cache_size_kib() -> i64 {
-    let value = crate::config::numeric_env(SQLITE_CACHE_SIZE_KIB_ENV, DEFAULT_SQLITE_CACHE_SIZE_KIB);
+    let value =
+        crate::config::numeric_env(SQLITE_CACHE_SIZE_KIB_ENV, DEFAULT_SQLITE_CACHE_SIZE_KIB);
     if value <= 0 {
         tracing::warn!(
             "{SQLITE_CACHE_SIZE_KIB_ENV}={value} must be positive; using the default of \
@@ -176,10 +180,13 @@ const MIGRATION_POOL_MAX_CONNECTIONS: u32 = 1;
 /// between the two SQLite tiers described in the module header, and it has to be right before
 /// either tier's connection count is ever chosen. Recognises the plain form (`sqlite::memory:`,
 /// the only form this codebase's own tests use), the URL-authority form (`sqlite://:memory:`),
-/// and the `?mode=memory` query-parameter form SQLx itself also accepts.
+/// and the `?mode=memory` query-parameter form `SQLx` itself also accepts.
 fn is_in_memory_sqlite(db_url: &str) -> bool {
     let (path, query) = db_url.split_once('?').unwrap_or((db_url, ""));
-    path.ends_with(":memory:") || query.split('&').any(|param| param.eq_ignore_ascii_case("mode=memory"))
+    path.ends_with(":memory:")
+        || query
+            .split('&')
+            .any(|param| param.eq_ignore_ascii_case("mode=memory"))
 }
 
 /// Builds the `SqliteConnectOptions` every SQLite pool in this module opens with, whether that
@@ -192,7 +199,6 @@ fn is_in_memory_sqlite(db_url: &str) -> bool {
 /// which the module header explains must be set at open time because a reopened connection replays
 /// its `SqliteConnectOptions` but not hand-issued `PRAGMA` statements.
 fn build_sqlite_connect_options(db_url: &str) -> Result<SqliteConnectOptions, DbErr> {
-    use sea_orm::sqlx::ConnectOptions as _;
     use std::str::FromStr;
 
     Ok(SqliteConnectOptions::from_str(db_url)
@@ -201,6 +207,7 @@ fn build_sqlite_connect_options(db_url: &str) -> Result<SqliteConnectOptions, Db
         // Enforced rather than assumed. SQLx already defaults this to on — measured, not trusted —
         // so this is an assertion that survives a future SQLx default change, not a fix.
         .foreign_keys(true)
+        .auto_vacuum(SqliteAutoVacuum::Incremental)
         // Readers proceed against the last committed snapshot while a writer appends, instead of
         // blocking on a database-wide exclusive lock. Persistent in the file header, but set here
         // too so a fresh database gets it before the first write rather than after.
@@ -225,6 +232,7 @@ fn build_sqlite_connect_options(db_url: &str) -> Result<SqliteConnectOptions, Db
         .pragma("cache_size", format!("-{}", sqlite_cache_size_kib()))
         // Limits ANALYZE and PRAGMA optimize sampling so multi-million row databases do not block.
         .pragma("analysis_limit", "400")
+        .optimize_on_close(true, 400)
         .log_slow_statements(
             log::LevelFilter::Warn,
             crate::config::database_slow_threshold(),
@@ -244,6 +252,10 @@ fn build_sqlite_connect_options(db_url: &str) -> Result<SqliteConnectOptions, Db
 /// nothing in this codebase runs concurrent DDL against them — but it is applied uniformly rather
 /// than only where a failure has already been observed, so a future migration cannot depend on
 /// which backend happened to make a race visible.
+///
+/// # Errors
+///
+/// Returns a database error if the connection or database operation fails.
 pub async fn run_migrations_isolated(db_url: &str) -> Result<(), DbErr> {
     tracing::info!("Running database migrations on an isolated, single-connection pool...");
 
@@ -291,6 +303,10 @@ pub async fn run_migrations_isolated(db_url: &str) -> Result<(), DbErr> {
 /// called, the pool it is about to build may hold more than one connection, and it is
 /// [`run_migrations_isolated`]'s single-connection discipline, not anything here, that makes that
 /// safe.
+///
+/// # Errors
+///
+/// Returns a database error if the connection or database operation fails.
 pub async fn connect(db_url: &str) -> Result<DatabaseConnection, DbErr> {
     // Backend detection by URL scheme, which is the only signal available before a pool exists.
     // Everything downstream reads `get_database_backend()` instead; this is the one place that
@@ -348,104 +364,13 @@ pub async fn connect(db_url: &str) -> Result<DatabaseConnection, DbErr> {
     Ok(SqlxSqliteConnector::from_sqlx_sqlite_pool(pool))
 }
 
-/// Whether `index` exists on `table`, on any supported backend.
+/// Whether `index` exists on `table` on the connected backend.
 ///
-/// # Why this is not `SchemaManager::has_index`
+/// # Errors
 ///
-/// It was, and **the service could not start on PostgreSQL**. `sea-orm-migration`'s `has_index`
-/// selects a per-backend catalog query behind cargo feature gates:
-///
-/// ```text
-/// #[cfg(feature = "sqlx-postgres")] DbBackend::Postgres => …,
-/// other => return Err(DbErr::BackendNotSupported { ctx: "has_index" }),
-/// ```
-///
-/// and this crate depends on `sea-orm-migration` with **only** `sqlx-sqlite` enabled, while `sea-orm`
-/// itself enables all three. So the PostgreSQL arm is compiled out, control reaches the fallback, and
-/// the boot-time §5 index check fails with `BackendNotSupported` against a database whose index is
-/// present and correct.
-///
-/// Enabling the extra features on `sea-orm-migration` would also have worked. This is preferred for
-/// two reasons: the check is a *runtime* assertion about a live schema rather than a migration
-/// concern, so it belongs beside connection setup rather than in the migration harness; and it makes
-/// the behaviour independent of a feature-flag combination in another crate, which is what made the
-/// failure surface only on a backend no local suite starts.
-///
-/// # Why the queries live here
-///
-/// Catalog inspection has no representation in SeaORM's entity API — there is no `Entity` for
-/// `pg_indexes` — so it is necessarily raw SQL. `src/db.rs` is the module `tests/source_hygiene.rs`
-/// allowlists for exactly this: startup-only, unreachable from any request, and already the home of
-/// "how the database is opened and interrogated". Putting it in `master.rs` would have required
-/// widening that allowlist to a module the middleware can reach.
-///
-/// **Both parameters are bound, never interpolated.** They are compile-time constants today, and
-/// binding them costs nothing while removing the question entirely.
-///
-/// Returns `Ok(false)` when the index is absent — an absent index is an answer, not an error. Only a
-/// failure to *ask* is an error.
+/// Returns a database error if the backend cannot inspect its index catalog.
 pub async fn has_index(db: &DatabaseConnection, table: &str, index: &str) -> Result<bool, DbErr> {
-    let backend = db.get_database_backend();
-    let sql = index_catalog_query(backend)?;
-
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            backend,
-            sql,
-            [index.into(), table.into()],
-        ))
-        .await?
-        .ok_or_else(|| {
-            DbErr::Custom(format!(
-                "catalog query for index '{index}' on '{table}' returned no row"
-            ))
-        })?;
-
-    // `COUNT(*)` is `i64` on PostgreSQL and SQLite and narrower on some MySQL drivers, so the
-    // smaller type is tried second rather than assumed.
-    let hits: i64 = match row.try_get::<i64>("", "hits") {
-        Ok(n) => n,
-        Err(_) => i64::from(row.try_get::<i32>("", "hits")?),
-    };
-    Ok(hits > 0)
-}
-
-/// The catalog query for one backend, taking the index name first and the table name second.
-///
-/// Split out from [`has_index`] purely so it can be unit-tested. That matters more than it usually
-/// would: the defect this replaced was **PostgreSQL-only**, and no suite in this repository starts a
-/// PostgreSQL server — so a test that needs a live connection could not have caught it and cannot
-/// guard against its return. Selecting the statement is the part that was broken, and it is testable
-/// without a database.
-///
-/// Placeholder syntax is per-backend — PostgreSQL numbers them, the other two do not — which is one
-/// more reason each dialect gets its own statement rather than a shared string with substitutions.
-fn index_catalog_query(backend: DatabaseBackend) -> Result<&'static str, DbErr> {
-    Ok(match backend {
-        DatabaseBackend::Sqlite => {
-            "SELECT COUNT(*) AS hits FROM sqlite_master \
-             WHERE type = 'index' AND name = ? AND tbl_name = ?"
-        }
-        DatabaseBackend::Postgres => {
-            "SELECT COUNT(*) AS hits FROM pg_indexes WHERE indexname = $1 AND tablename = $2"
-        }
-        DatabaseBackend::MySql => {
-            // Scoped to the connected schema: `information_schema.statistics` spans every database on
-            // the server, so an identically named index elsewhere would otherwise be a false hit.
-            "SELECT COUNT(*) AS hits FROM information_schema.statistics \
-             WHERE index_name = ? AND table_name = ? AND table_schema = DATABASE()"
-        }
-        // `DatabaseBackend` is `#[non_exhaustive]`, so a future SeaORM release can add a variant this
-        // build has never heard of. Refusing is the only safe answer: the caller uses this to assert
-        // a §5 constraint, and inventing `true` for a backend whose catalog we cannot read would
-        // report the constraint as present without having looked — an unverified guarantee reported
-        // as verified, which is the exact failure this check exists to prevent.
-        other => {
-            return Err(DbErr::Custom(format!(
-                "no catalog query is known for backend {other:?}; refusing to assume an index exists"
-            )));
-        }
-    })
+    SchemaManager::new(db).has_index(table, index).await
 }
 
 /// Runs every pending migration against an already-open connection.
@@ -455,207 +380,162 @@ fn index_catalog_query(backend: DatabaseBackend) -> Result<&'static str, DbErr> 
 /// want migrations applied without going through [`connect`] at all. Production startup does not
 /// use this — it uses [`run_migrations_isolated`], which owns its own single-connection pool and
 /// closes it before returning, rather than running DDL on a connection the caller keeps.
+///
+/// # Errors
+///
+/// Returns a database error if the connection or database operation fails.
 pub async fn run_migrations(db: &DatabaseConnection) -> Result<(), DbErr> {
     tracing::info!("Running database migrations...");
     crate::migration::Migrator::up(db, None).await
 }
 
-/// Applies SQLite's session pragmas to the current connection, logging what actually took effect.
+/// Logs the active journal mode and the SQLite session settings configured by [`connect`].
 ///
-/// # What this adds over [`connect`]
+/// Journal mode inspection is non-fatal. In-memory databases report their own journal mode.
 ///
-/// Not the settings themselves — [`connect`] has already applied them to every connection, and on a
-/// pool built there this function will find them already in force. What it adds is **evidence**: it
-/// reads `journal_mode` back rather than inferring success from a clean return, so the startup log
-/// says which mode is genuinely active. It also covers pools this crate did not build, which is
-/// every pool in the test suite.
+/// # Errors
 ///
-/// # Failure handling
-///
-/// **Never fatal.** Every failure is logged and swallowed, and the function still returns `Ok`. Two
-/// reasons. The benign one: an in-memory database (`sqlite::memory:`, which the whole test suite
-/// uses) reports `journal_mode=memory` and cannot be switched to WAL, since there is no file to
-/// write a log beside — SQLite declines silently rather than erroring, which is why the mode is read
-/// back instead of inferred. The important one: refusing to boot over a concurrency setting that did
-/// not apply would trade a real outage for a theoretical slowdown, on a read-only mount or an exotic
-/// filesystem that is otherwise perfectly serviceable.
+/// Inspection failures are logged and this function returns `Ok(())`.
 pub async fn apply_sqlite_pragmas(db: &DatabaseConnection) -> Result<(), DbErr> {
     if db.get_database_backend() != DatabaseBackend::Sqlite {
         return Ok(());
     }
 
-    // `journal_mode` answers with the mode actually in force, which is the only trustworthy
-    // confirmation — SQLite silently declines the switch for in-memory and read-only databases
-    // rather than erroring, so assuming success from a clean return would be wrong.
-    match db
-        .query_one_raw(Statement::from_string(
-            DatabaseBackend::Sqlite,
-            "PRAGMA journal_mode=WAL;",
-        ))
-        .await
-    {
-        Ok(Some(row)) => match row.try_get::<String>("", "journal_mode") {
-            Ok(mode) if mode.eq_ignore_ascii_case("wal") => {
-                tracing::info!("SQLite journal mode: WAL (concurrent readers during writes).");
-            }
-            Ok(mode) => tracing::info!(
-                "SQLite journal mode is '{mode}' rather than WAL; this is normal for in-memory or \
-                 read-only databases."
-            ),
-            Err(e) => tracing::warn!("Could not read back the SQLite journal mode: {e}"),
-        },
-        Ok(None) => tracing::warn!("PRAGMA journal_mode returned no row; leaving the default."),
-        Err(e) => tracing::warn!("Could not enable SQLite WAL mode: {e}. Continuing without it."),
+    match sqlite_setting::<String>(db, "pragma_journal_mode", "journal_mode").await {
+        Ok(mode) if mode.eq_ignore_ascii_case("wal") => {
+            tracing::info!("SQLite journal mode: WAL (concurrent readers during writes).");
+        }
+        Ok(mode) => tracing::info!("SQLite journal mode: {mode}."),
+        Err(e) => tracing::warn!("Could not read back the SQLite journal mode: {e}"),
     }
 
-    // The remaining four are set-and-log. Each is per-connection, so on a pool this reaches
-    // whichever connection serves it — which is precisely why `connect` sets them at open time and
-    // why these calls are confirmation rather than mechanism.
     let busy_ms = crate::config::sqlite_busy_timeout().as_millis();
-    for (label, statement) in [
-        ("foreign key enforcement", "PRAGMA foreign_keys=ON;".to_owned()),
-        ("synchronous mode", "PRAGMA synchronous=NORMAL;".to_owned()),
-        ("busy timeout", format!("PRAGMA busy_timeout={busy_ms};")),
-        ("temp store", "PRAGMA temp_store=MEMORY;".to_owned()),
-        ("analysis limit", "PRAGMA analysis_limit=400;".to_owned()),
-    ] {
-        if let Err(e) =
-            db.execute_raw(Statement::from_string(DatabaseBackend::Sqlite, statement)).await
-        {
-            tracing::warn!("Could not set the SQLite {label}: {e}. Continuing with the default.");
-        }
-    }
-    let mmap_bytes = sqlite_mmap_size_bytes();
-    let cache_kib = sqlite_cache_size_kib();
-    for (label, statement) in [
-        ("mmap size", format!("PRAGMA mmap_size={mmap_bytes};")),
-        ("page cache size", format!("PRAGMA cache_size=-{cache_kib};")),
-    ] {
-        if let Err(e) =
-            db.execute_raw(Statement::from_string(DatabaseBackend::Sqlite, statement)).await
-        {
-            tracing::warn!("Could not set the SQLite {label}: {e}. Continuing with the default.");
-        }
-    }
     tracing::info!(
-        "SQLite session pragmas applied: foreign_keys=ON, synchronous=NORMAL, \
-         busy_timeout={busy_ms}ms, temp_store=MEMORY, \
-         mmap_size={}MiB, cache_size={}MiB.",
-        mmap_bytes / (1024 * 1024),
-        cache_kib / 1024,
+        "SQLite session pragmas configured: foreign_keys=ON, synchronous=NORMAL, \
+         busy_timeout={busy_ms}ms, temp_store=MEMORY, mmap_size={}MiB, cache_size={}MiB.",
+        sqlite_mmap_size_bytes() / (1024 * 1024),
+        sqlite_cache_size_kib() / 1024,
     );
 
     Ok(())
 }
 
-/// Runs `PRAGMA optimize`, which refreshes the planner's statistics for tables whose data has
-/// changed enough to matter — including giving a freshly-created index its first statistics.
-///
-/// Plain `PRAGMA optimize;` (without forcing bit `0x10000`, which forces an unconditional,
-/// full-database re-analysis that blocks multi-million-row databases for 15+ minutes) is very fast
-/// (< 1ms when tables are already analyzed) and safe to run in the background.
+async fn sqlite_setting<T: sea_orm::TryGetable>(
+    db: &DatabaseConnection,
+    table: &str,
+    column: &str,
+) -> Result<T, DbErr> {
+    db.query_one(
+        &*Query::select()
+            .column(Alias::new(column))
+            .from(Alias::new(table)),
+    )
+    .await?
+    .ok_or_else(|| DbErr::Custom(format!("SQLite setting {column} returned no row")))?
+    .try_get("", column)
+}
+
+/// Refreshes SQLite planner statistics after startup without delaying the listener.
 pub async fn optimize_in_background(db: DatabaseConnection) {
     if db.get_database_backend() != DatabaseBackend::Sqlite {
         return;
     }
-    tracing::info!("SQLite planner statistics refresh (PRAGMA optimize) started in the background.");
+    tracing::info!(
+        "SQLite planner statistics refresh (PRAGMA optimize) started in the background."
+    );
     let started = std::time::Instant::now();
     match run_sqlite_optimize(&db).await {
-        Ok(()) => tracing::info!("SQLite planner statistics refreshed (PRAGMA optimize) in {:?}.", started.elapsed()),
-        Err(e) => tracing::warn!("Could not run PRAGMA optimize after {:?}: {e}.", started.elapsed()),
+        Ok(()) => tracing::info!(
+            "SQLite planner statistics refreshed (PRAGMA optimize) in {:?}.",
+            started.elapsed()
+        ),
+        Err(e) => tracing::warn!(
+            "Could not run PRAGMA optimize after {:?}: {e}.",
+            started.elapsed()
+        ),
     }
 }
 
-/// Reads the database's `auto_vacuum` mode as SQLite reports it: `0` NONE, `1` FULL, `2` INCREMENTAL.
-async fn auto_vacuum_mode(db: &DatabaseConnection) -> Result<i64, DbErr> {
-    let row = db
-        .query_one_raw(Statement::from_string(DatabaseBackend::Sqlite, "PRAGMA auto_vacuum;".to_owned()))
-        .await?
-        .ok_or_else(|| DbErr::Custom("PRAGMA auto_vacuum returned no row".to_owned()))?;
-    row.try_get::<i64>("", "auto_vacuum").map_err(|e| DbErr::Custom(e.to_string()))
-}
-
-/// Converts a SQLite database still in `auto_vacuum = NONE` to `INCREMENTAL`, once, at startup.
-///
-/// SQLite only honours an `auto_vacuum` change for a database that is rewritten afterward, so the
-/// switch is followed by `VACUUM`. That rewrite is proportional to database size and holds the
-/// database for its duration — which is why this runs inside [`run_migrations_isolated`], on the
-/// single-connection pool, before the HTTP listener binds, rather than as a background task. A
-/// database already in any other mode is left alone.
+/// Checks the stored vacuum mode after migrations have created the database tables.
 async fn ensure_incremental_auto_vacuum(db: &DatabaseConnection) -> Result<(), DbErr> {
+    if db.get_database_backend() == DatabaseBackend::Sqlite
+        && sqlite_setting::<i32>(db, "pragma_auto_vacuum", "auto_vacuum").await? != 2
+    {
+        // SQLite requires a full VACUUM to switch an existing database from NONE.
+        tracing::warn!(
+            "SQLite incremental auto-vacuum requires an offline database vacuum to take effect."
+        );
+    }
+    Ok(())
+}
+
+/// Runs a maintenance pragma on a separate, short-lived connection to the same SQLite file.
+async fn run_sqlite_maintenance(
+    db: &DatabaseConnection,
+    name: &'static str,
+    value: String,
+) -> Result<(), DbErr> {
     if db.get_database_backend() != DatabaseBackend::Sqlite {
         return Ok(());
     }
-    match auto_vacuum_mode(db).await? {
-        0 => {
-            tracing::warn!(
-                "SQLite auto_vacuum is NONE; converting to INCREMENTAL and running VACUUM. This \
-                 rewrites the whole database and can take a while on a large one."
-            );
-            db.execute_unprepared("PRAGMA auto_vacuum = INCREMENTAL;").await?;
-            db.execute_unprepared("VACUUM;").await?;
-            tracing::info!("SQLite auto_vacuum converted to INCREMENTAL.");
-            Ok(())
-        }
-        mode => {
-            tracing::info!("SQLite auto_vacuum mode is {mode}; no conversion needed.");
-            Ok(())
-        }
+
+    // Reopening an in-memory URL could address an entirely different database.
+    let file: String = sqlite_setting(db, "pragma_database_list", "file").await?;
+    if file.is_empty() {
+        return Ok(());
     }
+
+    let options = db.get_sqlite_connection_pool().connect_options();
+    let connection = options
+        .as_ref()
+        .clone()
+        .create_if_missing(false)
+        .optimize_on_close(false, None)
+        .pragma(name, value)
+        .connect()
+        .await
+        .map_err(|e| DbErr::Conn(sea_orm::RuntimeErr::Internal(e.to_string())))?;
+    connection
+        .close()
+        .await
+        .map_err(|e| DbErr::Conn(sea_orm::RuntimeErr::Internal(e.to_string())))
 }
 
-/// Returns up to `pages` free pages to the operating system (`PRAGMA incremental_vacuum`).
+/// Returns up to `pages` free pages to the operating system for a file in incremental vacuum mode.
 ///
-/// Only meaningful on a database in `INCREMENTAL` mode (see [`ensure_incremental_auto_vacuum`]).
-/// Deletes leave free pages behind rather than shrinking the file; this is what gives them back,
-/// in bounded slices so no single call holds the write lock for long.
+/// # Errors
+///
+/// Returns a database error if SQLite cannot open or maintain the file.
 pub async fn run_incremental_vacuum(db: &DatabaseConnection, pages: u32) -> Result<(), DbErr> {
-    if db.get_database_backend() != DatabaseBackend::Sqlite {
+    if pages == 0 {
         return Ok(());
     }
-    db.execute_unprepared(&format!("PRAGMA incremental_vacuum({pages});")).await?;
-    Ok(())
+    run_sqlite_maintenance(db, "incremental_vacuum", pages.to_string()).await
 }
 
-/// Folds the write-ahead log back into the main database file and truncates it to zero bytes.
+/// Attempts to checkpoint and truncate the file-backed SQLite WAL.
 ///
-/// Without this the WAL grows with sustained writes until SQLite's automatic checkpoint (which
-/// does not truncate) lets it be reused, so an idle service can keep a large WAL file on disk.
+/// # Errors
+///
+/// Returns a database error if SQLite cannot open or maintain the file.
 pub async fn wal_checkpoint_truncate(db: &DatabaseConnection) -> Result<(), DbErr> {
-    if db.get_database_backend() != DatabaseBackend::Sqlite {
-        return Ok(());
-    }
-    db.execute_unprepared("PRAGMA wal_checkpoint(TRUNCATE);").await?;
-    Ok(())
+    run_sqlite_maintenance(db, "wal_checkpoint", "TRUNCATE".into()).await
 }
 
-/// Refreshes SQLite query planner statistics (`PRAGMA optimize`).
+/// Refreshes planner statistics on a file-backed SQLite database.
 ///
-/// Plain `PRAGMA optimize;` runs fast (< 1ms) because it only analyzes tables whose content has
-/// significantly changed and which were queried, without forcing a whole-database lock.
+/// # Errors
+///
+/// Returns a database error if SQLite cannot open or maintain the file.
 pub async fn run_sqlite_optimize(db: &DatabaseConnection) -> Result<(), DbErr> {
-    if db.get_database_backend() != DatabaseBackend::Sqlite {
-        return Ok(());
-    }
-    db.execute_unprepared("PRAGMA analysis_limit=400; PRAGMA optimize(0x0002);").await?;
-    Ok(())
+    // The maintenance connection has no query history. Consider all tables while keeping
+    // SQLite's usual checks for whether statistics are missing or stale.
+    run_sqlite_maintenance(db, "optimize", "0x10002".into()).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sea_orm::ConnectionTrait;
-
-    /// Reads one pragma back through the pool.
-    async fn pragma<T: sea_orm::TryGetable>(db: &DatabaseConnection, sql: &str, col: &str) -> T {
-        db.query_one_raw(Statement::from_string(DatabaseBackend::Sqlite, sql.to_owned()))
-            .await
-            .expect("the pragma query succeeds")
-            .expect("a row is returned")
-            .try_get("", col)
-            .expect("the column has the expected type")
-    }
-
     /// A temporary directory holding one database file, removed on drop.
     struct TempDb(std::path::PathBuf);
     impl TempDb {
@@ -674,30 +554,102 @@ mod tests {
         }
     }
 
-    /// All five pragmas are in force on a pool built by [`connect`].
-    ///
-    /// Note what this does **not** claim. An earlier version of this test sampled twenty-five times
-    /// and asserted the values were uniform, which sounds like a pool-wide guarantee and is not one:
-    /// the pool holds a single connection, so every sample necessarily hits it and uniformity is
-    /// tautological. The real pool-wide guarantee comes from
-    /// [`tests::the_sqlite_pool_holds_exactly_one_connection`]; this test's job is only that the five
-    /// settings actually took.
+    /// SQLite session settings are in force on a freshly created file-backed pool.
     #[tokio::test]
-    async fn connect_applies_all_five_pragmas() {
+    async fn connect_applies_sqlite_session_settings() {
         let tmp = TempDb::new();
-        let db = connect(&tmp.url()).await.expect("a file-backed sqlite pool opens");
+        let db = connect(&tmp.url())
+            .await
+            .expect("a file-backed sqlite pool opens");
 
-        assert_eq!(pragma::<String>(&db, "PRAGMA journal_mode;", "journal_mode").await, "wal");
-        assert_eq!(pragma::<i32>(&db, "PRAGMA synchronous;", "synchronous").await, 1, "NORMAL");
-        assert_eq!(pragma::<i32>(&db, "PRAGMA foreign_keys;", "foreign_keys").await, 1, "ON");
         assert_eq!(
-            pragma::<i32>(&db, "PRAGMA busy_timeout;", "timeout").await,
-            crate::config::sqlite_busy_timeout().as_millis() as i32
+            sqlite_setting::<String>(&db, "pragma_journal_mode", "journal_mode")
+                .await
+                .unwrap(),
+            "wal"
+        );
+        assert_eq!(
+            sqlite_setting::<i32>(&db, "pragma_synchronous", "synchronous")
+                .await
+                .unwrap(),
+            1,
+            "NORMAL"
+        );
+        assert_eq!(
+            sqlite_setting::<i32>(&db, "pragma_foreign_keys", "foreign_keys")
+                .await
+                .unwrap(),
+            1,
+            "ON"
+        );
+        assert_eq!(
+            sqlite_setting::<i32>(&db, "pragma_busy_timeout", "timeout")
+                .await
+                .unwrap(),
+            i32::try_from(crate::config::sqlite_busy_timeout().as_millis()).unwrap()
         );
         // `temp_store`: 0 = engine default (a disk file), 1 = FILE, 2 = MEMORY. `.pragma("temp_store",
         // "MEMORY")` at connect time must actually have taken, not merely been accepted as a
         // connection-string parameter and silently ignored.
-        assert_eq!(pragma::<i32>(&db, "PRAGMA temp_store;", "temp_store").await, 2, "MEMORY");
+        assert_eq!(
+            sqlite_setting::<i32>(&db, "pragma_temp_store", "temp_store")
+                .await
+                .unwrap(),
+            2,
+            "MEMORY"
+        );
+        assert_eq!(
+            sqlite_setting::<i32>(&db, "pragma_auto_vacuum", "auto_vacuum")
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            sqlite_setting::<i32>(&db, "pragma_analysis_limit", "analysis_limit")
+                .await
+                .unwrap(),
+            400
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_sqlite_maintenance_reclaims_pages_and_truncates_wal() {
+        use sea_orm::sea_query::{ColumnDef, Expr, Table};
+
+        let tmp = TempDb::new();
+        let db = connect(&tmp.url()).await.unwrap();
+        db.execute(
+            &Table::create()
+                .table("maintenance_fixture")
+                .col(ColumnDef::new("body").blob())
+                .to_owned(),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            &Query::insert()
+                .into_table("maintenance_fixture")
+                .columns(["body"])
+                .values_panic([Expr::val(vec![0_u8; 256 * 1024])])
+                .to_owned(),
+        )
+        .await
+        .unwrap();
+        db.execute(&Query::delete().from_table("maintenance_fixture").to_owned())
+            .await
+            .unwrap();
+        let free_pages = || sqlite_setting::<i32>(&db, "pragma_freelist_count", "freelist_count");
+        let before = free_pages().await.unwrap();
+        assert!(before >= 5);
+
+        run_incremental_vacuum(&db, 5).await.unwrap();
+        assert_eq!(free_pages().await.unwrap(), before - 5);
+
+        run_sqlite_optimize(&db).await.unwrap();
+        let wal = tmp.0.join("v.db-wal");
+        assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+        wal_checkpoint_truncate(&db).await.unwrap();
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
     }
 
     /// The in-memory SQLite tier holds exactly one connection, regardless of anything an operator
@@ -707,7 +659,9 @@ mod tests {
     async fn the_in_memory_sqlite_pool_holds_exactly_one_connection() {
         let db = connect("sqlite::memory:").await.expect("pool opens");
         assert_eq!(
-            db.get_sqlite_connection_pool().options().get_max_connections(),
+            db.get_sqlite_connection_pool()
+                .options()
+                .get_max_connections(),
             SQLITE_MEMORY_MAX_CONNECTIONS,
             "sqlite::memory: must never be pooled past one connection: a second connection is a \
              second, unrelated empty database, not a second reader"
@@ -724,7 +678,9 @@ mod tests {
         let tmp = TempDb::new();
         let db = connect(&tmp.url()).await.expect("pool opens");
         assert_eq!(
-            db.get_sqlite_connection_pool().options().get_max_connections(),
+            db.get_sqlite_connection_pool()
+                .options()
+                .get_max_connections(),
             crate::config::sqlite_file_max_connections(),
             "a file-backed pool must be sized by the file tier's config function, not left pinned \
              to one now that migrations are isolated from it"
@@ -737,7 +693,7 @@ mod tests {
     /// pool second.
     ///
     /// This is the regression test for a real break introduced while writing this module originally:
-    /// building the pool with SQLx's default of ten connections made `Migrator::up` fail with
+    /// building the pool with `SQLx`'s default of ten connections made `Migrator::up` fail with
     /// exactly this error, because `m20260808_000009` drops `master_marker` and re-adds it as a
     /// generated column, and at any pool size ≥ 2 the `ADD` can land on a connection whose schema is
     /// still the old one. Isolating migrations to their own single-connection pool — closed before
@@ -752,13 +708,17 @@ mod tests {
             .await
             .expect("every migration applies on the isolated single-connection pool");
 
-        let db = connect(&tmp.url()).await.expect("the application pool opens after migrations");
+        let db = connect(&tmp.url())
+            .await
+            .expect("the application pool opens after migrations");
 
         // The schema the isolated phase created is visible from a pool that never ran it — proof
         // the isolated pool's writes are durable (WAL + a clean close) rather than only locally
         // consistent within the connection that made them.
         assert!(
-            has_index(&db, "api_keys", "idx-api_keys-master_marker").await.unwrap(),
+            has_index(&db, "api_keys", "idx-api_keys-master_marker")
+                .await
+                .unwrap(),
             "the application pool must see the schema the isolated migration phase created"
         );
 
@@ -770,42 +730,6 @@ mod tests {
             .expect("a redundant migration pass against the wide pool is a no-op, not a failure");
     }
 
-    /// Every supported backend has a catalog query, and each speaks its own dialect.
-    ///
-    /// This is the regression test for a **PostgreSQL-only boot failure**: the previous
-    /// implementation used `SchemaManager::has_index`, whose PostgreSQL arm is behind a cargo feature
-    /// this crate does not enable for `sea-orm-migration`, so it answered `BackendNotSupported` and
-    /// the service refused to start against a perfectly good database.
-    ///
-    /// No suite here starts a PostgreSQL server, so no connection-based test could have caught that
-    /// or can guard its return. Selecting the statement is the part that broke, and it is checkable
-    /// without a database — which is the whole reason it is a separate function.
-    #[test]
-    fn every_backend_has_a_catalog_query_in_its_own_dialect() {
-        let sqlite = index_catalog_query(DatabaseBackend::Sqlite).expect("sqlite is supported");
-        let postgres = index_catalog_query(DatabaseBackend::Postgres).expect("postgres is supported");
-        let mysql = index_catalog_query(DatabaseBackend::MySql).expect("mysql is supported");
-
-        // Each reads the catalog its own engine actually exposes.
-        assert!(sqlite.contains("sqlite_master"), "{sqlite}");
-        assert!(postgres.contains("pg_indexes"), "{postgres}");
-        assert!(mysql.contains("information_schema.statistics"), "{mysql}");
-
-        // PostgreSQL numbers its placeholders; the other two do not. Getting this wrong is a runtime
-        // syntax error on one backend only.
-        assert!(postgres.contains("$1") && postgres.contains("$2"), "{postgres}");
-        assert!(!sqlite.contains("$1") && sqlite.matches('?').count() == 2, "{sqlite}");
-        assert!(!mysql.contains("$1") && mysql.matches('?').count() == 2, "{mysql}");
-
-        // MySQL's catalog spans every database on the server, so the query must scope itself.
-        assert!(mysql.contains("DATABASE()"), "an unscoped MySQL lookup matches other schemas: {mysql}");
-
-        // All three project the same column name, which `has_index` reads back positionally by name.
-        for q in [sqlite, postgres, mysql] {
-            assert!(q.contains("AS hits"), "{q}");
-        }
-    }
-
     /// The index check answers truthfully in both directions against a live schema.
     ///
     /// A checker that always returned `true` would satisfy the boot-time §5 assertion without ever
@@ -813,20 +737,30 @@ mod tests {
     #[tokio::test]
     async fn has_index_reports_presence_and_absence() {
         let tmp = TempDb::new();
-        run_migrations_isolated(&tmp.url()).await.expect("migrations run on the isolated pool");
-        let db = connect(&tmp.url()).await.expect("pool opens after migrations are complete");
+        run_migrations_isolated(&tmp.url())
+            .await
+            .expect("migrations run on the isolated pool");
+        let db = connect(&tmp.url())
+            .await
+            .expect("pool opens after migrations are complete");
 
         assert!(
-            has_index(&db, "api_keys", "idx-api_keys-master_marker").await.unwrap(),
+            has_index(&db, "api_keys", "idx-api_keys-master_marker")
+                .await
+                .unwrap(),
             "the §5 uniqueness index must be reported as present"
         );
         assert!(
-            !has_index(&db, "api_keys", "idx-api_keys-does-not-exist").await.unwrap(),
+            !has_index(&db, "api_keys", "idx-api_keys-does-not-exist")
+                .await
+                .unwrap(),
             "an absent index must be reported as absent, not as an error and not as present"
         );
         // Right index name, wrong table: the table predicate has to be doing work too.
         assert!(
-            !has_index(&db, "audit_logs", "idx-api_keys-master_marker").await.unwrap(),
+            !has_index(&db, "audit_logs", "idx-api_keys-master_marker")
+                .await
+                .unwrap(),
             "the table name must be part of the match"
         );
     }
@@ -840,8 +774,12 @@ mod tests {
     #[tokio::test]
     async fn foreign_keys_are_enforced_not_just_enabled() {
         let tmp = TempDb::new();
-        run_migrations_isolated(&tmp.url()).await.expect("migrations run on the isolated pool");
-        let db = connect(&tmp.url()).await.expect("pool opens after migrations are complete");
+        run_migrations_isolated(&tmp.url())
+            .await
+            .expect("migrations run on the isolated pool");
+        let db = connect(&tmp.url())
+            .await
+            .expect("pool opens after migrations are complete");
 
         let orphan = crate::entities::api_key_group_permission::ActiveModel {
             id: sea_orm::ActiveValue::Set(uuid::Uuid::new_v4()),
@@ -869,12 +807,23 @@ mod tests {
     /// would trade a real outage for a theoretical slowdown.
     #[tokio::test]
     async fn a_database_that_cannot_use_wal_still_starts_and_works() {
-        let db = Database::connect("sqlite::memory:").await.expect("in-memory sqlite opens");
-        assert!(apply_sqlite_pragmas(&db).await.is_ok(), "a declined pragma is never fatal");
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite opens");
+        assert!(
+            apply_sqlite_pragmas(&db).await.is_ok(),
+            "a declined pragma is never fatal"
+        );
 
         // WAL genuinely did not engage — so the assertion above is tolerance, not a silent success.
-        let mode = pragma::<String>(&db, "PRAGMA journal_mode;", "journal_mode").await;
-        assert_ne!(mode.to_ascii_lowercase(), "wal", "an in-memory database cannot use WAL");
+        let mode = sqlite_setting::<String>(&db, "pragma_journal_mode", "journal_mode")
+            .await
+            .unwrap();
+        assert_ne!(
+            mode.to_ascii_lowercase(),
+            "wal",
+            "an in-memory database cannot use WAL"
+        );
 
         // And the connection is still fully usable afterwards, which is the point of continuing.
         run_migrations(&db).await.expect("migrations still run");
@@ -887,12 +836,14 @@ mod tests {
     /// to get wrong once PostgreSQL is in play.
     #[tokio::test]
     async fn the_pragmas_are_scoped_to_sqlite_by_backend() {
-        let db = Database::connect("sqlite::memory:").await.expect("in-memory sqlite opens");
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite opens");
         assert_eq!(db.get_database_backend(), DatabaseBackend::Sqlite);
         assert!(apply_sqlite_pragmas(&db).await.is_ok());
     }
 
-    /// `is_in_memory_sqlite` classifies every URL form this codebase or SQLx itself recognises as
+    /// `is_in_memory_sqlite` classifies every URL form this codebase or `SQLx` itself recognises as
     /// in-memory, and does not false-positive on a file path that merely contains "memory".
     #[test]
     fn is_in_memory_sqlite_classifies_every_known_url_form() {
@@ -903,15 +854,21 @@ mod tests {
         // In-memory: SQLx's own query-parameter form, including alongside other parameters and in
         // mixed case.
         assert!(is_in_memory_sqlite("sqlite://file.db?mode=memory"));
-        assert!(is_in_memory_sqlite("sqlite://file.db?cache=shared&mode=memory"));
+        assert!(is_in_memory_sqlite(
+            "sqlite://file.db?cache=shared&mode=memory"
+        ));
         assert!(is_in_memory_sqlite("sqlite://file.db?MODE=Memory"));
 
         // File-backed: an ordinary path.
         assert!(!is_in_memory_sqlite("sqlite:///var/lib/vault/v.db"));
         // File-backed: `?mode=rwc`, this service's documented default query parameter.
-        assert!(!is_in_memory_sqlite("sqlite:///var/lib/vault/v.db?mode=rwc"));
+        assert!(!is_in_memory_sqlite(
+            "sqlite:///var/lib/vault/v.db?mode=rwc"
+        ));
         // File-backed: a path that merely contains "memory" as text must not trip the suffix check.
-        assert!(!is_in_memory_sqlite("sqlite:///var/lib/vault/in_memory_archive.db"));
+        assert!(!is_in_memory_sqlite(
+            "sqlite:///var/lib/vault/in_memory_archive.db"
+        ));
     }
 
     /// WAL is persistent: a *new* connection to the same file inherits it. This is what makes the
@@ -921,11 +878,20 @@ mod tests {
         let tmp = TempDb::new();
         {
             let db = connect(&tmp.url()).await.expect("pool opens");
-            assert_eq!(pragma::<String>(&db, "PRAGMA journal_mode;", "journal_mode").await, "wal");
+            assert_eq!(
+                sqlite_setting::<String>(&db, "pragma_journal_mode", "journal_mode")
+                    .await
+                    .unwrap(),
+                "wal"
+            );
         }
-        let reopened = Database::connect(tmp.url()).await.expect("plain reconnect succeeds");
+        let reopened = Database::connect(tmp.url())
+            .await
+            .expect("plain reconnect succeeds");
         assert_eq!(
-            pragma::<String>(&reopened, "PRAGMA journal_mode;", "journal_mode").await,
+            sqlite_setting::<String>(&reopened, "pragma_journal_mode", "journal_mode")
+                .await
+                .unwrap(),
             "wal",
             "WAL is recorded in the file header and survives a reconnect that sets no pragmas"
         );

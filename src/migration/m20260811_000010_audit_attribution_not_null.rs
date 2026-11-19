@@ -29,12 +29,12 @@
 //! creating the table afresh, copying the rows, dropping the original and renaming — the documented
 //! twelve-step procedure. PostgreSQL and MySQL take `ALTER COLUMN … SET NOT NULL` directly.
 //!
-//! The replacement table is built with SeaORM's schema builder rather than hand-written DDL, so its
+//! The replacement table is built with `SeaORM`'s schema builder rather than hand-written DDL, so its
 //! column types are byte-for-byte what the original migration produced. Hand-writing the `CREATE
-//! TABLE` would mean guessing how SeaORM renders `uuid` and `date_time` on each backend, and a near
+//! TABLE` would mean guessing how `SeaORM` renders `uuid` and `date_time` on each backend, and a near
 //! miss would silently change a column's affinity while every test still passed.
 
-use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+use sea_orm::DatabaseBackend;
 use sea_orm_migration::prelude::*;
 
 /// The value written where attribution was never recorded.
@@ -43,13 +43,17 @@ use sea_orm_migration::prelude::*;
 const UNRECORDED: &str = "(unknown)";
 
 /// The three columns this migration constrains.
-const ATTRIBUTION_COLUMNS: [&str; 3] = ["api_key_name", "api_key_prefix", "client_ip"];
+const ATTRIBUTION_COLUMNS: [AuditLogs; 3] = [
+    AuditLogs::ApiKeyName,
+    AuditLogs::ApiKeyPrefix,
+    AuditLogs::ClientIp,
+];
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
 /// `audit_logs`, and the transient name its SQLite rebuild lands in.
-#[derive(DeriveIden)]
+#[derive(Clone, Copy, DeriveIden)]
 enum AuditLogs {
     Table,
     Id,
@@ -87,12 +91,17 @@ fn table_definition(table: TableRef, attribution_not_null: bool) -> TableCreateS
         if attribution_not_null {
             col.not_null();
         }
-        col.to_owned()
+        col.clone()
     };
 
     let mut stmt = Table::create();
     stmt.table(table)
-        .col(ColumnDef::new(AuditLogs::Id).uuid().not_null().primary_key())
+        .col(
+            ColumnDef::new(AuditLogs::Id)
+                .uuid()
+                .not_null()
+                .primary_key(),
+        )
         .col(ColumnDef::new(AuditLogs::ApiKeyId).uuid())
         .col(attribution(AuditLogs::ApiKeyName))
         .col(attribution(AuditLogs::ApiKeyPrefix))
@@ -113,7 +122,7 @@ fn table_definition(table: TableRef, attribution_not_null: bool) -> TableCreateS
                 .on_delete(ForeignKeyAction::SetNull)
                 .on_update(ForeignKeyAction::NoAction),
         );
-    stmt.to_owned()
+    stmt.clone()
 }
 
 /// The two indexes the initial schema put on `audit_logs`, recreated after a rebuild.
@@ -147,34 +156,44 @@ async fn recreate_indexes(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 /// relying on `SELECT *`. Positional copying is what turns a future column reorder into silent data
 /// corruption — names moving into the address column, with every type still checking out.
 async fn rebuild(manager: &SchemaManager<'_>, attribution_not_null: bool) -> Result<(), DbErr> {
-    let db = manager.get_connection();
-    let backend = manager.get_database_backend();
-
     manager
-        .create_table(table_definition(AuditLogsRebuild::Table.into_table_ref(), attribution_not_null))
+        .create_table(table_definition(
+            AuditLogsRebuild::Table.into_table_ref(),
+            attribution_not_null,
+        ))
         .await?;
 
     let columns = [
-        "id",
-        "api_key_id",
-        "api_key_name",
-        "api_key_prefix",
-        "client_ip",
-        "action",
-        "target_address",
-        "group_names",
-        "details",
-        "timestamp",
-    ]
-    .join(", ");
+        AuditLogs::Id,
+        AuditLogs::ApiKeyId,
+        AuditLogs::ApiKeyName,
+        AuditLogs::ApiKeyPrefix,
+        AuditLogs::ClientIp,
+        AuditLogs::Action,
+        AuditLogs::TargetAddress,
+        AuditLogs::GroupNames,
+        AuditLogs::Details,
+        AuditLogs::Timestamp,
+    ];
+    manager
+        .exec_stmt(
+            Query::insert()
+                .into_table(AuditLogsRebuild::Table)
+                .columns(columns)
+                .select_from(
+                    Query::select()
+                        .columns(columns)
+                        .from(AuditLogs::Table)
+                        .to_owned(),
+                )
+                .map_err(|e| DbErr::Custom(e.to_string()))?
+                .to_owned(),
+        )
+        .await?;
 
-    db.execute_raw(Statement::from_string(
-        backend,
-        format!("INSERT INTO audit_logs_rebuild ({columns}) SELECT {columns} FROM audit_logs"),
-    ))
-    .await?;
-
-    manager.drop_table(Table::drop().table(AuditLogs::Table).to_owned()).await?;
+    manager
+        .drop_table(Table::drop().table(AuditLogs::Table).to_owned())
+        .await?;
     manager
         .rename_table(
             Table::rename()
@@ -188,14 +207,16 @@ async fn rebuild(manager: &SchemaManager<'_>, attribution_not_null: bool) -> Res
 
 /// Replaces NULL attribution with [`UNRECORDED`] so the constraint can be applied to old rows.
 async fn backfill(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
-    let db = manager.get_connection();
-    let backend = manager.get_database_backend();
     for column in ATTRIBUTION_COLUMNS {
-        db.execute_raw(Statement::from_string(
-            backend,
-            format!("UPDATE audit_logs SET {column} = '{UNRECORDED}' WHERE {column} IS NULL"),
-        ))
-        .await?;
+        manager
+            .exec_stmt(
+                Query::update()
+                    .table(AuditLogs::Table)
+                    .value(column, UNRECORDED)
+                    .and_where(Expr::col(column).is_null())
+                    .to_owned(),
+            )
+            .await?;
     }
     Ok(())
 }
@@ -211,7 +232,7 @@ impl MigrationTrait for Migration {
             return rebuild(manager, true).await;
         }
 
-        for column in [AuditLogs::ApiKeyName, AuditLogs::ApiKeyPrefix, AuditLogs::ClientIp] {
+        for column in ATTRIBUTION_COLUMNS {
             manager
                 .alter_table(
                     Table::alter()
@@ -230,7 +251,7 @@ impl MigrationTrait for Migration {
             return rebuild(manager, false).await;
         }
 
-        for column in [AuditLogs::ApiKeyName, AuditLogs::ApiKeyPrefix, AuditLogs::ClientIp] {
+        for column in ATTRIBUTION_COLUMNS {
             manager
                 .alter_table(
                     Table::alter()
@@ -255,9 +276,19 @@ mod tests {
     /// tell "not recorded" from "recorded as this".
     #[test]
     fn the_backfill_value_cannot_be_confused_with_a_real_one() {
-        assert!(UNRECORDED.starts_with('('), "{UNRECORDED} must not look like a key name or address");
-        assert!(!UNRECORDED.chars().any(|c| c.is_ascii_alphanumeric() && c.is_uppercase()));
-        assert!(UNRECORDED.parse::<std::net::IpAddr>().is_err(), "must not parse as an address");
+        assert!(
+            UNRECORDED.starts_with('('),
+            "{UNRECORDED} must not look like a key name or address"
+        );
+        assert!(
+            !UNRECORDED
+                .chars()
+                .any(|c| c.is_ascii_alphanumeric() && c.is_uppercase())
+        );
+        assert!(
+            UNRECORDED.parse::<std::net::IpAddr>().is_err(),
+            "must not parse as an address"
+        );
     }
 
     /// Both table definitions must agree on everything except the three columns under test.
@@ -278,10 +309,20 @@ mod tests {
             "exactly the three attribution columns gain NOT NULL:\n  {strict}\n  {loose}"
         );
         for column in ATTRIBUTION_COLUMNS {
-            assert!(strict.contains(column), "{column} missing from the strict definition");
-            assert!(loose.contains(column), "{column} missing from the loose definition");
+            let column = column.unquoted();
+            assert!(
+                strict.contains(column),
+                "{column} missing from the strict definition"
+            );
+            assert!(
+                loose.contains(column),
+                "{column} missing from the loose definition"
+            );
         }
         // The cascade that makes the denormalized columns necessary must survive a rebuild.
-        assert!(strict.contains("SET NULL"), "the ON DELETE SET NULL cascade is preserved");
+        assert!(
+            strict.contains("SET NULL"),
+            "the ON DELETE SET NULL cascade is preserved"
+        );
     }
 }

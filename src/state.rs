@@ -63,6 +63,13 @@ pub enum StartupConfigError {
     TrustedProxies(#[from] crate::config::InvalidTrustedProxies),
 }
 
+/// In-memory cache type for analytical statistics (`GET /api/stats/analytics`).
+pub type AnalyticsCache = Arc<
+    tokio::sync::RwLock<
+        std::collections::HashMap<Option<Vec<uuid::Uuid>>, (std::time::Instant, serde_json::Value)>,
+    >,
+>;
+
 /// Global application state shared across handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -102,12 +109,13 @@ pub struct AppState {
     pub master_pin: Arc<MasterPin>,
     /// In-memory cache for analytical statistics (`GET /api/stats/analytics`), TTL ~300s (5 minutes).
     /// Prevents repeated expensive full-table queries when multiple dashboard tabs or users refresh.
-    pub analytics_cache: Arc<tokio::sync::RwLock<std::collections::HashMap<Option<Vec<uuid::Uuid>>, (std::time::Instant, serde_json::Value)>>>,
+    pub analytics_cache: AnalyticsCache,
     /// Singleflight lock to prevent cache stampedes when computing analytical statistics.
     pub analytics_lock: Arc<tokio::sync::Mutex<()>>,
     /// In-memory cache for system settings and entity counts (`GET /api/settings`), TTL ~120s (2 minutes).
     /// Prevents repeated full-table count scans when multiple tabs or monitoring pollers refresh concurrently.
-    pub settings_cache: Arc<tokio::sync::RwLock<Option<(std::time::Instant, crate::api::SettingsResponse)>>>,
+    pub settings_cache:
+        Arc<tokio::sync::RwLock<Option<(std::time::Instant, crate::api::SettingsResponse)>>>,
     /// Singleflight lock to serialize concurrent settings count computations.
     pub settings_lock: Arc<tokio::sync::Mutex<()>>,
     /// Whether bare IPv6 host addresses on ban endpoints (`POST /api/ban`, `POST /api/records/batch`,
@@ -115,6 +123,9 @@ pub struct AppState {
     /// preserving the original full IPv6 host address in outbound `WebhookEvent` notifications.
     /// Seeded from `NORMALIZE_IPV6_TO_48` (default `true`) at startup and toggleable at runtime.
     pub normalize_ipv6_to_48: Arc<std::sync::atomic::AtomicBool>,
+    /// Optional per-instance override for outbound private-webhook SSRF checks (`None` uses the
+    /// live `ALLOW_PRIVATE_WEBHOOKS` environment variable; `Some(...)` is used by tests).
+    pub allow_private_webhooks: Option<bool>,
 }
 
 impl AppState {
@@ -129,6 +140,10 @@ impl AppState {
     /// - A bad `TRUSTED_PROXIES` entry — see [`crate::config::InvalidTrustedProxies`] — because
     ///   dropping it silently leaves the set of peers allowed to rewrite the client address
     ///   different from the set the operator wrote down.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configured cipher or trusted proxies cannot be initialized.
     pub fn new(
         db: DatabaseConnection,
         webhook_tx: mpsc::Sender<WebhookEvent>,
@@ -147,6 +162,7 @@ impl AppState {
             normalize_ipv6_to_48: Arc::new(std::sync::atomic::AtomicBool::new(
                 crate::config::normalize_ipv6_to_48_from_env(),
             )),
+            allow_private_webhooks: None,
         })
     }
 
@@ -155,6 +171,7 @@ impl AppState {
     /// Exists for tests, which need to exercise both the trusted and untrusted proxy paths — and
     /// both cipher modes — within one process, something process-wide environment variables cannot
     /// express.
+    #[must_use]
     pub fn with_parts(
         db: DatabaseConnection,
         webhook_tx: mpsc::Sender<WebhookEvent>,
@@ -175,10 +192,19 @@ impl AppState {
             normalize_ipv6_to_48: Arc::new(std::sync::atomic::AtomicBool::new(
                 crate::config::normalize_ipv6_to_48_from_env(),
             )),
+            allow_private_webhooks: None,
         }
     }
 
+    /// Overrides the private-network SSRF allowance on this state instance (for tests).
+    #[must_use]
+    pub fn with_allow_private_webhooks(mut self, allow: bool) -> Self {
+        self.allow_private_webhooks = Some(allow);
+        self
+    }
+
     /// Builds state with an explicit `normalize_ipv6_to_48` mode, bypassing the environment.
+    #[must_use]
     pub fn with_ipv6_48_normalization(self, enabled: bool) -> Self {
         self.normalize_ipv6_to_48
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
@@ -186,6 +212,7 @@ impl AppState {
     }
 
     /// Whether bare IPv6 host bans should be stored normalized to `/48` subnets.
+    #[must_use]
     pub fn is_ipv6_48_normalization_enabled(&self) -> bool {
         self.normalize_ipv6_to_48
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -204,6 +231,7 @@ impl AppState {
     /// only ever pins a row that really is the sole Master — so the alternative is dropping the §5
     /// index and writing a second master row, which exercises two failures at once and cannot
     /// distinguish them.
+    #[must_use]
     pub fn with_pinned_master(mut self, master_key_id: Uuid) -> Self {
         self.master_pin = Arc::new(MasterPin::pinned_to(master_key_id));
         self
@@ -251,6 +279,7 @@ impl AppState {
     /// Builds state with an explicit trusted-proxy list and the zero-config plaintext cipher.
     ///
     /// The common test constructor; prefer [`AppState::with_parts`] when the cipher matters.
+    #[must_use]
     pub fn with_trusted_proxies(
         db: DatabaseConnection,
         webhook_tx: mpsc::Sender<WebhookEvent>,

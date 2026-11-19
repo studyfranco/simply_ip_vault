@@ -7,7 +7,11 @@
 
 use std::time::{Duration, Instant};
 
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, Database, DatabaseConnection, DbBackend, EntityTrait, JoinType, QueryFilter, QueryOrder, QuerySelect, RelationTrait, Statement, sea_query::Expr, sea_query::Func};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, Database, DatabaseConnection,
+    DbBackend, EntityTrait, JoinType, QueryFilter, QueryOrder, QuerySelect, RelationTrait,
+    Statement, sea_query::Expr, sea_query::Func,
+};
 use sea_orm_migration::MigratorTrait;
 
 use simply_ip_vault::entities::{ip_group, ip_record, ip_record_group_membership};
@@ -133,7 +137,10 @@ async fn group_id(db: &DatabaseConnection, name: &str) -> uuid::Uuid {
 /// The exact page query the list endpoint issues for one group.
 async fn page_query(db: &DatabaseConnection, group: uuid::Uuid) -> usize {
     ip_record_group_membership::Entity::find()
-        .join(JoinType::InnerJoin, ip_record_group_membership::Relation::IpRecord.def())
+        .join(
+            JoinType::InnerJoin,
+            ip_record_group_membership::Relation::IpRecord.def(),
+        )
         .select_also(ip_record::Entity)
         .filter(ip_record_group_membership::Column::GroupId.eq(group))
         .filter(ip_record_group_membership::Column::IsDeleted.eq(false))
@@ -154,7 +161,10 @@ async fn count_query(db: &DatabaseConnection, group: uuid::Uuid) -> i64 {
         .filter(ip_record_group_membership::Column::GroupId.eq(group))
         .filter(ip_record_group_membership::Column::IsDeleted.eq(false))
         .select_only()
-        .expr_as(Func::count(Expr::col(sea_orm::sea_query::Asterisk)), "row_count")
+        .expr_as(
+            Func::count(Expr::col(sea_orm::sea_query::Asterisk)),
+            "row_count",
+        )
         .into_tuple::<i64>()
         .one(db)
         .await
@@ -170,7 +180,10 @@ async fn count_query_multi(db: &DatabaseConnection, groups: &[uuid::Uuid]) -> i6
         .filter(ip_record_group_membership::Column::GroupId.is_in(groups.iter().copied()))
         .filter(ip_record_group_membership::Column::IsDeleted.eq(false))
         .select_only()
-        .expr_as(Func::count(Expr::col(sea_orm::sea_query::Asterisk)), "row_count")
+        .expr_as(
+            Func::count(Expr::col(sea_orm::sea_query::Asterisk)),
+            "row_count",
+        )
         .into_tuple::<i64>()
         .one(db)
         .await
@@ -197,13 +210,16 @@ where
 }
 
 async fn explain(db: &DatabaseConnection, sql: &str) -> String {
-    db.query_all_raw(Statement::from_string(DbBackend::Sqlite, format!("EXPLAIN QUERY PLAN {sql}")))
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|row| row.try_get::<String>("", "detail").unwrap_or_default())
-        .collect::<Vec<_>>()
-        .join(" | ")
+    db.query_all_raw(Statement::from_string(
+        DbBackend::Sqlite,
+        format!("EXPLAIN QUERY PLAN {sql}"),
+    ))
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.try_get::<String>("", "detail").unwrap_or_default())
+    .collect::<Vec<_>>()
+    .join(" | ")
 }
 
 #[tokio::test]
@@ -216,8 +232,16 @@ async fn group_scoped_list_and_count_meet_the_10ms_budget_at_100k_rows() {
     let count = median(|| count_query(&db, g)).await;
     println!("100k rows: group-scoped page median = {page:?}, count median = {count:?}");
 
-    assert!(page < budget(), "group-scoped page query took {page:?}, budget is {:?}", budget());
-    assert!(count < budget(), "group-scoped count took {count:?}, budget is {:?}", budget());
+    assert!(
+        page < budget(),
+        "group-scoped page query took {page:?}, budget is {:?}",
+        budget()
+    );
+    assert!(
+        count < budget(),
+        "group-scoped count took {count:?}, budget is {:?}",
+        budget()
+    );
 }
 
 #[tokio::test]
@@ -232,9 +256,13 @@ async fn group_scoped_list_plan_has_no_temp_b_tree() {
     )
     .await;
     println!("list plan: {plan}");
-    assert!(!plan.contains("TEMP B-TREE"), "list query sorts through a temp b-tree: {plan}");
     assert!(
-        plan.contains("idx_memberships_active_last_seen") || plan.contains("idx_memberships_group_is_deleted_last_seen"),
+        !plan.contains("TEMP B-TREE"),
+        "list query sorts through a temp b-tree: {plan}"
+    );
+    assert!(
+        plan.contains("idx_memberships_active_last_seen")
+            || plan.contains("idx_memberships_group_is_deleted_last_seen"),
         "list query must use an active last seen index: {plan}"
     );
 }
@@ -269,7 +297,12 @@ async fn master_key(db: &DatabaseConnection) -> (String, String) {
     (key, secret)
 }
 
-fn signed_get(uri: &str, key: &str, secret: &str, offset: i64) -> axum::http::Request<axum::body::Body> {
+fn signed_get(
+    uri: &str,
+    key: &str,
+    secret: &str,
+    offset: i64,
+) -> axum::http::Request<axum::body::Body> {
     let ts = (chrono::Utc::now().timestamp() + offset).to_string();
     let sig = simply_ip_vault::crypto::compute_signature(secret, "GET", uri, &ts, b"").unwrap();
     axum::http::Request::builder()
@@ -278,18 +311,19 @@ fn signed_get(uri: &str, key: &str, secret: &str, offset: i64) -> axum::http::Re
         .header("X-API-Key", key)
         .header("X-Timestamp", ts)
         .header("X-Signature-256", sig)
-        .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 8080))))
+        .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            8080,
+        ))))
         .body(axum::body::Body::empty())
         .unwrap()
 }
 
 #[tokio::test]
 async fn multi_group_listing_meets_the_10ms_budget_at_100k_rows() {
+    use tower::ServiceExt as _;
+
     let _guard = bench_lock().lock().await;
-    use set::ServiceExt as _;
-    mod set {
-        pub use tower::ServiceExt;
-    }
 
     let db = fresh_db().await;
     let (key, secret) = master_key(&db).await;
@@ -301,18 +335,35 @@ async fn multi_group_listing_meets_the_10ms_budget_at_100k_rows() {
 
     // Warm-up, then timed runs spaced past the anti-replay window (whole-second signatures).
     let mut offset = 0i64;
-    let warm = app.clone().oneshot(signed_get(uri, &key, &secret, offset)).await.unwrap();
-    assert_eq!(warm.status(), axum::http::StatusCode::OK, "multi-group listing must succeed");
-    let body = axum::body::to_bytes(warm.into_body(), usize::MAX).await.unwrap();
+    let warm = app
+        .clone()
+        .oneshot(signed_get(uri, &key, &secret, offset))
+        .await
+        .unwrap();
+    assert_eq!(
+        warm.status(),
+        axum::http::StatusCode::OK,
+        "multi-group listing must succeed"
+    );
+    let body = axum::body::to_bytes(warm.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(parsed["total"].as_u64().unwrap() >= 30_000, "four of ten groups at roughly 10k rows each: {parsed}");
+    assert!(
+        parsed["total"].as_u64().unwrap() >= 30_000,
+        "four of ten groups at roughly 10k rows each: {parsed}"
+    );
     assert_eq!(parsed["data"].as_array().unwrap().len(), 50);
 
     let mut samples = Vec::new();
     for _ in 0..5 {
         offset += 2; // stay clear of the one-second replay window between requests
         let started = Instant::now();
-        let res = app.clone().oneshot(signed_get(uri, &key, &secret, offset)).await.unwrap();
+        let res = app
+            .clone()
+            .oneshot(signed_get(uri, &key, &secret, offset))
+            .await
+            .unwrap();
         let elapsed = started.elapsed();
         assert_eq!(res.status(), axum::http::StatusCode::OK);
         samples.push(elapsed);
@@ -320,7 +371,11 @@ async fn multi_group_listing_meets_the_10ms_budget_at_100k_rows() {
     samples.sort();
     let median = samples[samples.len() / 2];
     println!("multi-group (4 of 10 groups, 100k rows) handler median = {median:?}");
-    assert!(median < http_budget(), "multi-group listing took {median:?}, budget is {:?}", http_budget());
+    assert!(
+        median < http_budget(),
+        "multi-group listing took {median:?}, budget is {:?}",
+        http_budget()
+    );
 }
 
 /// The DB-only cost of the same multi-group listing: the four per-group page reads plus the one
@@ -342,9 +397,19 @@ async fn multi_group_db_queries_meet_the_10ms_budget_at_100k_rows() {
     })
     .await;
     let count = median(|| count_query_multi(&db, &group_ids)).await;
-    println!("multi-group (4 groups, 100k rows) DB-only: page median = {page:?}, count median = {count:?}");
-    assert!(page < budget(), "multi-group DB page reads took {page:?}, budget is {:?}", budget());
-    assert!(count < budget(), "multi-group DB count reads took {count:?}, budget is {:?}", budget());
+    println!(
+        "multi-group (4 groups, 100k rows) DB-only: page median = {page:?}, count median = {count:?}"
+    );
+    assert!(
+        page < budget(),
+        "multi-group DB page reads took {page:?}, budget is {:?}",
+        budget()
+    );
+    assert!(
+        count < budget(),
+        "multi-group DB count reads took {count:?}, budget is {:?}",
+        budget()
+    );
 }
 
 #[tokio::test]
@@ -398,7 +463,10 @@ async fn keyset_cursor_plan_uses_covering_index_with_no_temp_b_tree_and_stays_fa
     let cur_id = tail_boundary.id;
     let deep_seek = median(|| async {
         ip_record_group_membership::Entity::find()
-            .join(JoinType::InnerJoin, ip_record_group_membership::Relation::IpRecord.def())
+            .join(
+                JoinType::InnerJoin,
+                ip_record_group_membership::Relation::IpRecord.def(),
+            )
             .select_also(ip_record::Entity)
             .filter(ip_record_group_membership::Column::GroupId.eq(g))
             .filter(ip_record_group_membership::Column::IsDeleted.eq(false))
@@ -424,7 +492,8 @@ async fn keyset_cursor_plan_uses_covering_index_with_no_temp_b_tree_and_stays_fa
     println!("100k rows: deep cursor seek (near tail of group) median = {deep_seek:?}");
     assert!(
         deep_seek < budget(),
-        "deep keyset cursor seek took {deep_seek:?}, budget is {:?}", budget()
+        "deep keyset cursor seek took {deep_seek:?}, budget is {:?}",
+        budget()
     );
 }
 
@@ -433,10 +502,80 @@ async fn differential_sync_with_include_deleted_uses_multi_index_or_and_meets_10
     let _guard = bench_lock().lock().await;
     let db = fresh_db().await;
 
+    assert_differential_sync_query_plans(&db).await;
+    // 2. Measure the real SeaORM query execution time at 100k rows using `apply_group_and_since_scope`.
+    let g = bench_group_id(1);
+    let threshold = (chrono::Utc::now() + chrono::Duration::seconds(60)).naive_utc();
+    let cond = simply_ip_vault::api::apply_group_and_since_scope(
+        &sea_orm::Condition::all(),
+        Some(ip_record_group_membership::Column::GroupId.eq(g)),
+        Some(threshold),
+        true,
+    );
+
+    let diff_count = median(|| {
+        let cond = cond.clone();
+        let db = &db;
+        async move {
+            let n: Option<i64> = ip_record_group_membership::Entity::find()
+                .filter(cond)
+                .select_only()
+                .expr_as(
+                    Func::count(Expr::col(sea_orm::sea_query::Asterisk)),
+                    "row_count",
+                )
+                .into_tuple::<i64>()
+                .one(db)
+                .await
+                .unwrap();
+            n.unwrap_or(0)
+        }
+    })
+    .await;
+
+    let diff_page = median(|| {
+        let cond = cond.clone();
+        let db = &db;
+        async move {
+            ip_record_group_membership::Entity::find()
+                .join(
+                    JoinType::InnerJoin,
+                    ip_record_group_membership::Relation::IpRecord.def(),
+                )
+                .select_also(ip_record::Entity)
+                .filter(cond)
+                .order_by_desc(ip_record_group_membership::Column::LastSeenAt)
+                .order_by_asc(ip_record_group_membership::Column::Id)
+                .limit(1000)
+                .offset(0)
+                .all(db)
+                .await
+                .unwrap()
+                .len()
+        }
+    })
+    .await;
+
+    println!(
+        "100k rows: differential sync (since + include_deleted=true) page median = {diff_page:?}, count median = {diff_count:?}"
+    );
+    assert!(
+        diff_page < budget(),
+        "differential sync page query took {diff_page:?}, budget is {:?}",
+        budget()
+    );
+    assert!(
+        diff_count < budget(),
+        "differential sync count query took {diff_count:?}, budget is {:?}",
+        budget()
+    );
+}
+
+async fn assert_differential_sync_query_plans(db: &DatabaseConnection) {
     // 1. Verify the query plans of the exact two slow statements from production logs:
     //    `GET /api/ips?groups=<group>&since=<ts>&include_deleted=true&include_total=true`
     let count_plan = explain(
-        &db,
+        db,
         "SELECT COUNT(*) AS row_count FROM ip_record_group_memberships
          WHERE (group_id = x'00000000000000000000000000000001' AND last_seen_at >= '2099-01-01 00:00:00')
             OR (group_id = x'00000000000000000000000000000001' AND is_deleted = TRUE AND deleted_at >= '2099-01-01 00:00:00')",
@@ -457,7 +596,7 @@ async fn differential_sync_with_include_deleted_uses_multi_index_or_and_meets_10
     );
 
     let select_plan = explain(
-        &db,
+        db,
         "SELECT m.id, r.target_address FROM ip_record_group_memberships m
          INNER JOIN ip_records r ON m.ip_record_id = r.id
          WHERE (m.group_id = x'00000000000000000000000000000001' AND m.last_seen_at >= '2099-01-01 00:00:00')
@@ -478,65 +617,6 @@ async fn differential_sync_with_include_deleted_uses_multi_index_or_and_meets_10
     assert!(
         select_plan.contains("idx_memberships_group_deleted_at"),
         "differential sync select must seek on idx_memberships_group_deleted_at: {select_plan}"
-    );
-
-    // 2. Measure the real SeaORM query execution time at 100k rows using `apply_group_and_since_scope`.
-    let g = bench_group_id(1);
-    let threshold = (chrono::Utc::now() + chrono::Duration::seconds(60)).naive_utc();
-    let cond = simply_ip_vault::api::apply_group_and_since_scope(
-        &sea_orm::Condition::all(),
-        Some(ip_record_group_membership::Column::GroupId.eq(g)),
-        Some(threshold),
-        true,
-    );
-
-    let diff_count = median(|| {
-        let cond = cond.clone();
-        let db = &db;
-        async move {
-            let n: Option<i64> = ip_record_group_membership::Entity::find()
-                .filter(cond)
-                .select_only()
-                .expr_as(Func::count(Expr::col(sea_orm::sea_query::Asterisk)), "row_count")
-                .into_tuple::<i64>()
-                .one(db)
-                .await
-                .unwrap();
-            n.unwrap_or(0)
-        }
-    })
-    .await;
-
-    let diff_page = median(|| {
-        let cond = cond.clone();
-        let db = &db;
-        async move {
-            ip_record_group_membership::Entity::find()
-                .join(JoinType::InnerJoin, ip_record_group_membership::Relation::IpRecord.def())
-                .select_also(ip_record::Entity)
-                .filter(cond)
-                .order_by_desc(ip_record_group_membership::Column::LastSeenAt)
-                .order_by_asc(ip_record_group_membership::Column::Id)
-                .limit(1000)
-                .offset(0)
-                .all(db)
-                .await
-                .unwrap()
-                .len()
-        }
-    })
-    .await;
-
-    println!(
-        "100k rows: differential sync (since + include_deleted=true) page median = {diff_page:?}, count median = {diff_count:?}"
-    );
-    assert!(
-        diff_page < budget(),
-        "differential sync page query took {diff_page:?}, budget is {:?}", budget()
-    );
-    assert!(
-        diff_count < budget(),
-        "differential sync count query took {diff_count:?}, budget is {:?}", budget()
     );
 }
 
@@ -585,7 +665,10 @@ async fn global_listing_and_count_have_no_temp_b_tree_and_meet_10ms_budget_at_10
         let db = &db;
         async move {
             ip_record_group_membership::Entity::find()
-                .join(JoinType::InnerJoin, ip_record_group_membership::Relation::IpRecord.def())
+                .join(
+                    JoinType::InnerJoin,
+                    ip_record_group_membership::Relation::IpRecord.def(),
+                )
                 .select_also(ip_record::Entity)
                 .filter(ip_record_group_membership::Column::IsDeleted.eq(false))
                 .order_by_desc(ip_record_group_membership::Column::LastSeenAt)
@@ -606,7 +689,10 @@ async fn global_listing_and_count_have_no_temp_b_tree_and_meet_10ms_budget_at_10
             let n: Option<i64> = ip_record_group_membership::Entity::find()
                 .filter(ip_record_group_membership::Column::IsDeleted.eq(false))
                 .select_only()
-                .expr_as(Func::count(Expr::col(sea_orm::sea_query::Asterisk)), "row_count")
+                .expr_as(
+                    Func::count(Expr::col(sea_orm::sea_query::Asterisk)),
+                    "row_count",
+                )
                 .into_tuple::<i64>()
                 .one(db)
                 .await
@@ -621,12 +707,12 @@ async fn global_listing_and_count_have_no_temp_b_tree_and_meet_10ms_budget_at_10
     );
     assert!(
         global_page < budget(),
-        "global active page query took {global_page:?}, budget is {:?}", budget()
+        "global active page query took {global_page:?}, budget is {:?}",
+        budget()
     );
     assert!(
         global_count < global_count_budget(),
-        "global active count query took {global_count:?}, budget is {:?}", global_count_budget()
+        "global active count query took {global_count:?}, budget is {:?}",
+        global_count_budget()
     );
 }
-
-

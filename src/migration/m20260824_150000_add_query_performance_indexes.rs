@@ -128,7 +128,12 @@ impl MigrationTrait for Migration {
             )
             .await?;
         manager
-            .drop_index(Index::drop().name(DELETED_UPDATED_INDEX).table(IpRecords::Table).to_owned())
+            .drop_index(
+                Index::drop()
+                    .name(DELETED_UPDATED_INDEX)
+                    .table(IpRecords::Table)
+                    .to_owned(),
+            )
             .await
     }
 }

@@ -16,6 +16,9 @@ pub struct Model {
     pub name: String,
     /// The group's type: `"banlist"` or `"whitelist"`. Defaults to `"banlist"`.
     pub group_type: String,
+    /// Whether bans may cover RFC1918, CGNAT, or IPv6 ULA addresses.
+    #[serde(default)]
+    pub allow_private_ips: bool,
     /// Optional detailed description of the group's purpose.
     pub description: Option<String>,
     /// The key holding lifecycle authority over this group, or `None` when unassigned.
@@ -46,6 +49,9 @@ pub enum Relation {
     /// IP record memberships belonging to this group.
     #[sea_orm(has_many = "super::ip_record_group_membership::Entity")]
     IpRecordGroupMembership,
+    /// Exclusions configured on this banlist.
+    #[sea_orm(has_many = "super::ip_group_exclusion::Entity")]
+    IpGroupExclusion,
 }
 
 impl Related<super::webhook_config::Entity> for Entity {
@@ -71,7 +77,11 @@ impl Related<super::ip_record::Entity> for Entity {
         super::ip_record_group_membership::Relation::IpRecord.def()
     }
     fn via() -> Option<RelationDef> {
-        Some(super::ip_record_group_membership::Relation::IpGroup.def().rev())
+        Some(
+            super::ip_record_group_membership::Relation::IpGroup
+                .def()
+                .rev(),
+        )
     }
 }
 
@@ -80,7 +90,17 @@ impl Related<super::api_key::Entity> for Entity {
         super::api_key_group_permission::Relation::ApiKey.def()
     }
     fn via() -> Option<RelationDef> {
-        Some(super::api_key_group_permission::Relation::IpGroup.def().rev())
+        Some(
+            super::api_key_group_permission::Relation::IpGroup
+                .def()
+                .rev(),
+        )
+    }
+}
+
+impl Related<super::ip_group_exclusion::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::IpGroupExclusion.def()
     }
 }
 

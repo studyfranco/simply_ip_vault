@@ -83,22 +83,28 @@ async fn seed(db: &DatabaseConnection) {
 }
 
 async fn explain(db: &DatabaseConnection, sql: &str) -> String {
-    db.query_all_raw(Statement::from_string(DbBackend::Sqlite, format!("EXPLAIN QUERY PLAN {sql}")))
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|row| row.try_get::<String>("", "detail").unwrap_or_default())
-        .collect::<Vec<_>>()
-        .join(" | ")
+    db.query_all_raw(Statement::from_string(
+        DbBackend::Sqlite,
+        format!("EXPLAIN QUERY PLAN {sql}"),
+    ))
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.try_get::<String>("", "detail").unwrap_or_default())
+    .collect::<Vec<_>>()
+    .join(" | ")
 }
 
 async fn count_table(db: &DatabaseConnection, table: &str) -> i64 {
-    db.query_one_raw(Statement::from_string(DbBackend::Sqlite, format!("SELECT COUNT(*) AS n FROM {table}")))
-        .await
-        .unwrap()
-        .unwrap()
-        .try_get("", "n")
-        .unwrap()
+    db.query_one_raw(Statement::from_string(
+        DbBackend::Sqlite,
+        format!("SELECT COUNT(*) AS n FROM {table}"),
+    ))
+    .await
+    .unwrap()
+    .unwrap()
+    .try_get("", "n")
+    .unwrap()
 }
 
 /// The retention purge, run end to end against the seeded mix: correctness (the right rows go,
@@ -114,14 +120,19 @@ async fn orphan_and_soft_delete_purge_is_correct_fast_and_plans_as_an_anti_join(
     assert_eq!(before_memberships, RECORDS - ORPHANS);
 
     let started = Instant::now();
-    let purged = simply_ip_vault::retention::purge_expired_ip_records(&db, 92).await.unwrap();
+    let purged = simply_ip_vault::retention::purge_expired_ip_records(&db, 92)
+        .await
+        .unwrap();
     let elapsed = started.elapsed();
     println!(
         "purge over {RECORDS} records ({ORPHANS} orphans, {SOFT_DELETED_AGED} aged soft-deletes): \
          {elapsed:?}, purged={purged}"
     );
 
-    assert_eq!(purged, SOFT_DELETED_AGED as u64, "every aged soft-deleted membership must be purged, and only those");
+    assert_eq!(
+        purged, SOFT_DELETED_AGED as u64,
+        "every aged soft-deleted membership must be purged, and only those"
+    );
 
     let after_memberships = count_table(&db, "ip_record_group_memberships").await;
     assert_eq!(
@@ -140,7 +151,10 @@ async fn orphan_and_soft_delete_purge_is_correct_fast_and_plans_as_an_anti_join(
          purge) must be removed, and nothing else"
     );
 
-    assert!(elapsed < PURGE_BUDGET, "purge took {elapsed:?}, budget is {PURGE_BUDGET:?} at {RECORDS} records");
+    assert!(
+        elapsed < PURGE_BUDGET,
+        "purge took {elapsed:?}, budget is {PURGE_BUDGET:?} at {RECORDS} records"
+    );
 
     // The exact shape the orphan-cleanup delete's WHERE clause plans as, reproduced as a SELECT
     // (SQLite's EXPLAIN QUERY PLAN output is the same for the condition regardless of DELETE vs
@@ -156,7 +170,10 @@ async fn orphan_and_soft_delete_purge_is_correct_fast_and_plans_as_an_anti_join(
         plan.contains("idx-irgm-ip_record_id") || plan.contains("idx_memberships_ip_group"),
         "the anti-join must be driven by an index on ip_record_group_memberships.ip_record_id: {plan}"
     );
-    assert!(!plan.contains("TEMP B-TREE"), "an anti-join needs no sort: {plan}");
+    assert!(
+        !plan.contains("TEMP B-TREE"),
+        "an anti-join needs no sort: {plan}"
+    );
 }
 
 /// The other query that joins memberships to their group and address: the `full_replace` batch
@@ -175,7 +192,10 @@ async fn full_replace_sweep_query_plans_without_a_table_scan_at_scale() {
 
     let started = Instant::now();
     let candidates = ip_record_group_membership::Entity::find()
-        .join(JoinType::InnerJoin, ip_record_group_membership::Relation::IpRecord.def())
+        .join(
+            JoinType::InnerJoin,
+            ip_record_group_membership::Relation::IpRecord.def(),
+        )
         .select_also(ip_record::Entity)
         .filter(ip_record_group_membership::Column::GroupId.eq(group_id))
         .filter(ip_record_group_membership::Column::IsDeleted.eq(false))
@@ -184,7 +204,10 @@ async fn full_replace_sweep_query_plans_without_a_table_scan_at_scale() {
         .await
         .unwrap();
     let elapsed = started.elapsed();
-    println!("full_replace sweep over {RECORDS} records across {GROUPS} groups: {elapsed:?}, candidates={}", candidates.len());
+    println!(
+        "full_replace sweep over {RECORDS} records across {GROUPS} groups: {elapsed:?}, candidates={}",
+        candidates.len()
+    );
 
     let expected: i64 = db
         .query_one_raw(Statement::from_string(
@@ -199,7 +222,7 @@ async fn full_replace_sweep_query_plans_without_a_table_scan_at_scale() {
         .try_get("", "n")
         .unwrap();
     assert_eq!(
-        candidates.len() as i64,
+        i64::try_from(candidates.len()).unwrap(),
         expected,
         "every live, unlocked membership in the group must be a sweep candidate, and only those"
     );
@@ -212,10 +235,15 @@ async fn full_replace_sweep_query_plans_without_a_table_scan_at_scale() {
     .await;
     println!("full_replace sweep plan: {plan}");
     assert!(
-        !plan.contains("SCAN ip_record_group_memberships") || plan.contains("USING INDEX") || plan.contains("USING COVERING INDEX"),
+        !plan.contains("SCAN ip_record_group_memberships")
+            || plan.contains("USING INDEX")
+            || plan.contains("USING COVERING INDEX"),
         "the sweep must reach the membership table through an index, not a blind scan: {plan}"
     );
-    assert!(!plan.contains("TEMP B-TREE"), "no ORDER BY here, so no sort should appear: {plan}");
+    assert!(
+        !plan.contains("TEMP B-TREE"),
+        "no ORDER BY here, so no sort should appear: {plan}"
+    );
 
     // `group_id` alone (no `is_deleted`/`is_locked` literal match for a partial index) should still
     // land on one of the group_id-leading indexes, same property the schema-integrity suite checks
@@ -250,11 +278,17 @@ async fn group_name_resolution_and_scoped_listing_plan_cleanly() {
     let elapsed = started.elapsed();
     assert_eq!(resolved, vec![uid(1)]);
     println!("group name resolution: {elapsed:?}");
-    assert!(elapsed < BUDGET, "resolving one group by name took {elapsed:?}, budget is {BUDGET:?}");
+    assert!(
+        elapsed < BUDGET,
+        "resolving one group by name took {elapsed:?}, budget is {BUDGET:?}"
+    );
 
     let plan = explain(&db, "SELECT * FROM ip_groups WHERE name = 'audit-group-1'").await;
     println!("group name resolution plan: {plan}");
-    assert!(!plan.contains("SCAN ip_groups"), "group name lookup must not scan the groups table: {plan}");
+    assert!(
+        !plan.contains("SCAN ip_groups"),
+        "group name lookup must not scan the groups table: {plan}"
+    );
 
     // Verify single-group count and listing use idx_memberships_group_is_deleted_last_seen
     let count_plan = explain(
@@ -284,7 +318,10 @@ async fn group_name_resolution_and_scoped_listing_plan_cleanly() {
         list_plan.contains("idx_memberships_group_is_deleted_last_seen"),
         "single group list must use idx_memberships_group_is_deleted_last_seen: {list_plan}"
     );
-    assert!(!list_plan.contains("TEMP B-TREE"), "single group list must not sort through a temp b-tree: {list_plan}");
+    assert!(
+        !list_plan.contains("TEMP B-TREE"),
+        "single group list must not sort through a temp b-tree: {list_plan}"
+    );
 
     // Verify plans survive ANALYZE and table statistics without regressing to temp b-tree sorts.
     db.execute_unprepared("ANALYZE").await.unwrap();
@@ -304,7 +341,10 @@ async fn group_name_resolution_and_scoped_listing_plan_cleanly() {
         list_plan_analyzed.contains("idx_memberships_group_is_deleted_last_seen"),
         "post-ANALYZE group list must use idx_memberships_group_is_deleted_last_seen: {list_plan_analyzed}"
     );
-    assert!(!list_plan_analyzed.contains("TEMP B-TREE"), "post-ANALYZE group list must not sort through temp b-tree: {list_plan_analyzed}");
+    assert!(
+        !list_plan_analyzed.contains("TEMP B-TREE"),
+        "post-ANALYZE group list must not sort through temp b-tree: {list_plan_analyzed}"
+    );
 
     let global_plan_analyzed = explain(
         &db,
@@ -322,5 +362,8 @@ async fn group_name_resolution_and_scoped_listing_plan_cleanly() {
             || global_plan_analyzed.contains("idx_memberships_global_active_last_seen"),
         "post-ANALYZE global list must use covering index: {global_plan_analyzed}"
     );
-    assert!(!global_plan_analyzed.contains("TEMP B-TREE"), "post-ANALYZE global list must not sort through temp b-tree: {global_plan_analyzed}");
+    assert!(
+        !global_plan_analyzed.contains("TEMP B-TREE"),
+        "post-ANALYZE global list must not sort through temp b-tree: {global_plan_analyzed}"
+    );
 }

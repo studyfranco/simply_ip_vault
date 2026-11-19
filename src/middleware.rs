@@ -1,15 +1,9 @@
 //! Authentication middleware
 
-use axum::{
-    body::Body,
-    extract::State,
-    http::Request,
-    middleware::Next,
-    response::Response,
-};
+use axum::{body::Body, extract::State, http::Request, middleware::Next, response::Response};
+use ipnet::IpNet;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use sha2::{Digest, Sha256};
-use ipnet::IpNet;
 
 use crate::crypto::{self, MAX_TIMESTAMP_SKEW_SECS};
 use crate::entities::prelude::ApiKey;
@@ -72,7 +66,10 @@ fn validate_timestamp(headers: &axum::http::HeaderMap) -> Result<String, AppErro
         .parse()
         .map_err(|_| AppError::Unauthorized("Malformed X-Timestamp header".to_owned()))?;
 
-    let skew = chrono::Utc::now().timestamp().saturating_sub(supplied).abs();
+    let skew = chrono::Utc::now()
+        .timestamp()
+        .saturating_sub(supplied)
+        .abs();
     if skew > MAX_TIMESTAMP_SKEW_SECS {
         tracing::warn!(
             "Rejected request: X-Timestamp is {}s off the server clock (limit {}s)",
@@ -99,12 +96,51 @@ fn signed_target(parts: &axum::http::request::Parts) -> String {
     let uri = parts
         .extensions
         .get::<axum::extract::OriginalUri>()
-        .map(|original| &original.0)
-        .unwrap_or(&parts.uri);
+        .map_or(&parts.uri, |original| &original.0);
 
     uri.path_and_query()
-        .map(|pq| pq.as_str().to_owned())
-        .unwrap_or_else(|| uri.path().to_owned())
+        .map_or_else(|| uri.path().to_owned(), |pq| pq.as_str().to_owned())
+}
+
+fn authorize_source_network(
+    key_record: &crate::entities::api_key::Model,
+    client_ip: std::net::IpAddr,
+) -> Result<(), AppError> {
+    let bound_ips_str = key_record.bound_ips.as_deref().unwrap_or("");
+    let networks: Vec<IpNet> = bound_ips_str
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<IpNet>().or_else(|_| {
+                s.parse::<std::net::IpAddr>()
+                    .map(|ip| IpNet::from(crate::config::normalize_ip(ip)))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {
+            tracing::error!("Invalid CIDR in database: {:?}", key_record.bound_ips);
+            AppError::Internal
+        })?;
+
+    // An empty `bound_ips` means "unrestricted" and is how a key opts out; a *populated* one is
+    // enforced against every key, master included. Exempting master keys made the single most
+    // powerful credential in the system the only one whose network restriction was decorative —
+    // and it silently ignored a restriction an operator had explicitly configured, which is worse
+    // than never offering the field.
+    let is_allowed = networks.is_empty() || networks.iter().any(|net| net.contains(&client_ip));
+
+    if !is_allowed {
+        tracing::warn!(
+            "Access denied: Client IP {} not in bound networks {:?} for key {} (master={})",
+            client_ip,
+            key_record.bound_ips,
+            key_record.prefix,
+            key_record.is_master
+        );
+        return Err(AppError::Forbidden("Client IP not allowed".to_owned()));
+    }
+    Ok(())
 }
 
 /// Middleware enforcing HMAC-SHA256 request authentication, anti-replay, and CIDR restrictions.
@@ -141,6 +177,10 @@ fn signed_target(parts: &axum::http::request::Parts) -> String {
 /// alone, whether a key it merely guessed is bound to the caller's own network — an oracle that
 /// turns key guessing into key *mapping*. Both failures must be indistinguishable until the caller
 /// has proven it holds the secret.
+///
+/// # Errors
+///
+/// Returns an error if authentication or the source-network check fails.
 pub async fn auth_middleware(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -173,7 +213,7 @@ pub async fn auth_middleware(
     let provided_signature = headers
         .get("X-Signature-256")
         .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_owned())
+        .map(std::borrow::ToOwned::to_owned)
         .ok_or_else(|| AppError::Unauthorized("Missing X-Signature-256 header".to_owned()))?;
 
     // A malformed *shape* is worth naming, because the alternative is an operator staring at
@@ -184,7 +224,10 @@ pub async fn auth_middleware(
     //
     // Placed before the key lookup for the same reason `validate_timestamp` is: a request that
     // cannot be well-formed should not cost a database round-trip.
-    if !provided_signature.trim().starts_with(crypto::SIGNATURE_PREFIX) {
+    if !provided_signature
+        .trim()
+        .starts_with(crypto::SIGNATURE_PREFIX)
+    {
         return Err(AppError::Unauthorized(
             "X-Signature-256 must be formatted as sha256=<hex>".to_owned(),
         ));
@@ -252,7 +295,9 @@ pub async fn auth_middleware(
             method,
             target
         );
-        return Err(AppError::Unauthorized("Invalid request signature".to_owned()));
+        return Err(AppError::Unauthorized(
+            "Invalid request signature".to_owned(),
+        ));
     };
 
     // Freshness proves the request is *recent*; it does not prove it is *new*. An attacker who
@@ -277,41 +322,8 @@ pub async fn auth_middleware(
         ));
     }
 
-    // Now that the caller has proven it holds the signing secret, authorize its source network.
-    let bound_ips_str = key_record.bound_ips.as_deref().unwrap_or("");
-    let networks: Vec<IpNet> = bound_ips_str
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            s.parse::<IpNet>().or_else(|_| {
-                s.parse::<std::net::IpAddr>()
-                    .map(|ip| IpNet::from(crate::config::normalize_ip(ip)))
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| {
-            tracing::error!("Invalid CIDR in database: {:?}", key_record.bound_ips);
-            AppError::Internal
-        })?;
-
-    // An empty `bound_ips` means "unrestricted" and is how a key opts out; a *populated* one is
-    // enforced against every key, master included. Exempting master keys made the single most
-    // powerful credential in the system the only one whose network restriction was decorative —
-    // and it silently ignored a restriction an operator had explicitly configured, which is worse
-    // than never offering the field.
-    let is_allowed = networks.is_empty() || networks.iter().any(|net| net.contains(&client_ip));
-
-    if !is_allowed {
-        tracing::warn!(
-            "Access denied: Client IP {} not in bound networks {:?} for key {} (master={})",
-            client_ip,
-            key_record.bound_ips,
-            key_record.prefix,
-            key_record.is_master
-        );
-        return Err(AppError::Forbidden("Client IP not allowed".to_owned()));
-    }
+    // The caller has authenticated, so its source network can now be checked.
+    authorize_source_network(&key_record, client_ip)?;
 
     // The pinned-master check, applied at the one point a key model enters the request.
     //
@@ -323,7 +335,10 @@ pub async fn auth_middleware(
     // cooperation required. See [`crate::master::MasterPin::authenticate`] for why it demotes rather
     // than rejects, and for the §5 reasoning behind the whole mechanism.
     let mut key_record = key_record;
-    state.master_pin.authenticate(&state.db, &mut key_record).await;
+    state
+        .master_pin
+        .authenticate(&state.db, &mut key_record)
+        .await;
 
     let key_id = key_record.id;
     let mut req = Request::from_parts(parts, Body::from(body_bytes));

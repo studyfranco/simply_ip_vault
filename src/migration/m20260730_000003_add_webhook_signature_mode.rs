@@ -14,7 +14,7 @@ use sea_orm_migration::prelude::*;
 /// Identifiers this migration touches. `Table` is re-declared locally rather than imported from the
 /// initial-schema migration so that module can stay private (exporting it would leak a pile of
 /// undocumented public idens and trip the crate's `#![warn(missing_docs)]`). `DeriveIden` maps both
-/// variants to the same snake_case names the initial migration used, so they address the same table.
+/// variants to the same `snake_case` names the initial migration used, so they address the same table.
 #[derive(DeriveIden)]
 enum WebhookConfigs {
     /// The `webhook_configs` table.

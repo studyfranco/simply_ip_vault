@@ -15,7 +15,9 @@
 use chrono::Utc;
 use ipnet::IpNet;
 use rand::RngExt;
-use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, sea_query::OnConflict};
+use sea_orm::{
+    ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, sea_query::OnConflict,
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -43,12 +45,14 @@ pub(crate) const IP_EVENT_ACTIONS: [&str; 3] = ["IP_ADD", "IP_UPDATE", "IP_DELET
 // key whose secret the test already knows.
 
 /// Generates a random 32-byte hex key for API authentication
+#[must_use]
 pub fn generate_random_key() -> String {
     let bytes: [u8; 32] = rand::rng().random();
     hex::encode(bytes)
 }
 
 /// Hashes an API key using SHA-256 for secure storage
+#[must_use]
 pub fn hash_key(key: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(key.as_bytes());
@@ -108,6 +112,7 @@ pub fn parse_cidr_or_ip(raw: &str) -> Result<IpNet, ()> {
 
 /// Normalizes a bare IP address or CIDR subnet to a canonical string form (`/32`/`/128` singles
 /// stored without a prefix, everything else keeps its prefix length and masks host bits).
+#[must_use]
 pub fn normalize_ip_or_cidr(input: &str) -> String {
     let trimmed = input.trim();
     if let Ok(net) = trimmed.parse::<IpNet>() {
@@ -131,6 +136,7 @@ pub fn normalize_ip_or_cidr(input: &str) -> String {
 /// an IPv4-mapped IPv6 address is truncated to its canonical `/48` subnet (`<48-bit-prefix>/48`).
 /// Explicit IPv6 CIDR prefixes other than `/128` (e.g. `/64`, `/56`, `/32`), IPv4 addresses/CIDRs,
 /// and all addresses when `normalize_ipv6_to_48` is `false` fall back to [`normalize_ip_or_cidr`].
+#[must_use]
 pub fn normalize_ipv6_ban_storage(input: &str, normalize_ipv6_to_48: bool) -> String {
     if !normalize_ipv6_to_48 {
         return normalize_ip_or_cidr(input);
@@ -139,7 +145,9 @@ pub fn normalize_ipv6_ban_storage(input: &str, normalize_ipv6_to_48: bool) -> St
     let trimmed = input.trim();
     if let Ok(IpNet::V6(net6)) = trimmed.parse::<IpNet>() {
         if net6.prefix_len() == 128 && net6.addr().to_ipv4_mapped().is_none() {
-            return ipnet::Ipv6Net::new_assert(net6.addr(), 48).trunc().to_string();
+            return ipnet::Ipv6Net::new_assert(net6.addr(), 48)
+                .trunc()
+                .to_string();
         }
         return normalize_ip_or_cidr(input);
     }
@@ -247,6 +255,17 @@ pub(crate) async fn create_audit_log<C: sea_orm::ConnectionTrait>(
 // Group resolution
 // ─────────────────────────────────────────────────────────────
 
+/// Fetches or creates a group when the caller only needs the resulting row.
+pub(crate) async fn get_or_create_group(
+    db: &impl ConnectionTrait,
+    name: &str,
+    default_group_type: &str,
+    owner: Option<Uuid>,
+) -> Result<ip_group::Model, AppError> {
+    let (group, _) = get_or_create_group_with_status(db, name, default_group_type, owner).await?;
+    Ok(group)
+}
+
 /// Fetches an `IpGroup` by name, creating it with `default_group_type` if it doesn't exist yet.
 ///
 /// Concurrency-safe: naively doing a `find` followed by a plain `insert` races when two requests
@@ -259,30 +278,38 @@ pub(crate) async fn create_audit_log<C: sea_orm::ConnectionTrait>(
 /// `owner` becomes the group's `owner_key_id` when this call is the one that creates it, per §3.
 /// When a concurrent request wins the race the existing row's owner is left alone — ownership belongs
 /// to whoever actually created the resource, and the loser of a race did not.
-pub(crate) async fn get_or_create_group(
-    db: &sea_orm::DatabaseConnection,
+pub(crate) async fn get_or_create_group_with_status(
+    db: &impl ConnectionTrait,
     name: &str,
     default_group_type: &str,
     owner: Option<Uuid>,
-) -> Result<ip_group::Model, AppError> {
+) -> Result<(ip_group::Model, bool), AppError> {
+    let id = Uuid::new_v4();
     let new_group = ip_group::ActiveModel {
-        id: Set(Uuid::new_v4()),
+        id: Set(id),
         name: Set(name.to_owned()),
         group_type: Set(default_group_type.to_owned()),
+        allow_private_ips: Set(false),
         description: Set(None),
         owner_key_id: Set(owner),
         created_at: Set(Utc::now().naive_utc()),
     };
     ip_group::Entity::insert(new_group)
-        .on_conflict(OnConflict::column(ip_group::Column::Name).do_nothing().to_owned())
+        .on_conflict(
+            OnConflict::column(ip_group::Column::Name)
+                .do_nothing()
+                .to_owned(),
+        )
         .exec_without_returning(db)
         .await?;
 
-    ip_group::Entity::find()
+    let group = ip_group::Entity::find()
         .filter(ip_group::Column::Name.eq(name))
         .one(db)
         .await?
-        .ok_or(AppError::Internal)
+        .ok_or(AppError::Internal)?;
+    let created = group.id == id;
+    Ok((group, created))
 }
 
 /// Resolves a group given an optional `group_id` and/or `group_name`; exactly one must be
@@ -290,7 +317,7 @@ pub(crate) async fn get_or_create_group(
 /// decides whether that means "404" (for `group_id`, which is never client-inventable) or
 /// "auto-create it" (for `group_name`, the only identifier a client can pick with permission).
 pub(crate) async fn resolve_group_ref(
-    db: &sea_orm::DatabaseConnection,
+    db: &impl ConnectionTrait,
     group_id: Option<Uuid>,
     group_name: Option<&str>,
 ) -> Result<Option<ip_group::Model>, AppError> {
@@ -455,8 +482,17 @@ mod tests {
         );
 
         // IPv4 addresses and CIDRs are unaffected
-        assert_eq!(normalize_ipv6_ban_storage("203.0.113.10", true), "203.0.113.10");
-        assert_eq!(normalize_ipv6_ban_storage("203.0.113.10/32", true), "203.0.113.10");
-        assert_eq!(normalize_ipv6_ban_storage("203.0.113.10/24", true), "203.0.113.0/24");
+        assert_eq!(
+            normalize_ipv6_ban_storage("203.0.113.10", true),
+            "203.0.113.10"
+        );
+        assert_eq!(
+            normalize_ipv6_ban_storage("203.0.113.10/32", true),
+            "203.0.113.10"
+        );
+        assert_eq!(
+            normalize_ipv6_ban_storage("203.0.113.10/24", true),
+            "203.0.113.0/24"
+        );
     }
 }

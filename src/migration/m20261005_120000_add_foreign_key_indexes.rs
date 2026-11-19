@@ -61,10 +61,20 @@ impl MigrationTrait for Migration {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
-            .drop_index(Index::drop().name(AUDIT_LOGS_API_KEY_INDEX).table(AuditLogs::Table).to_owned())
+            .drop_index(
+                Index::drop()
+                    .name(AUDIT_LOGS_API_KEY_INDEX)
+                    .table(AuditLogs::Table)
+                    .to_owned(),
+            )
             .await?;
         manager
-            .drop_index(Index::drop().name(WEBHOOK_CONFIGS_GROUP_INDEX).table(WebhookConfigs::Table).to_owned())
+            .drop_index(
+                Index::drop()
+                    .name(WEBHOOK_CONFIGS_GROUP_INDEX)
+                    .table(WebhookConfigs::Table)
+                    .to_owned(),
+            )
             .await
     }
 }

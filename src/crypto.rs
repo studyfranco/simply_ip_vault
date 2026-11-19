@@ -4,7 +4,7 @@
 //!
 //! 1. **Request authentication** — every `/api/*` call carries `X-API-Key` (identity lookup),
 //!    `X-Timestamp` (anti-replay) and `X-Signature-256` (proof of possession). The signature is an
-//!    HMAC-SHA256 over the **CANONICAL_V1** string `METHOD\nTARGET\nTIMESTAMP\nRAW_BODY` using the
+//!    HMAC-SHA256 over the **`CANONICAL_V1`** string `METHOD\nTARGET\nTIMESTAMP\nRAW_BODY` using the
 //!    looked-up key's `signing_secret`, where `TARGET` is the **full request target including the
 //!    query string**. See [`compute_signature`] and [`verify_signature`].
 //!
@@ -56,12 +56,13 @@ const SEALED_PREFIX: &str = "v1.xchacha20poly1305.";
 ///
 /// Deliberately the same shape and entropy as [`crate::api::generate_random_key`] — but a wholly
 /// independent value: knowing a key's public `X-API-Key` must never reveal its signing secret.
+#[must_use]
 pub fn generate_signing_secret() -> String {
     let bytes: [u8; 32] = rand::rng().random();
     hex::encode(bytes)
 }
 
-/// Builds the **CANONICAL_V1** byte string that gets signed:
+/// Builds the **`CANONICAL_V1`** byte string that gets signed:
 /// `METHOD\nTARGET\nTIMESTAMP\nRAW_BODY`.
 ///
 /// The four fields are joined by a single `\n` (LF), with no trailing newline. `method` is expected
@@ -77,6 +78,7 @@ pub fn generate_signing_secret() -> String {
 ///
 /// Outbound webhook templates (`webhook_configs.hmac_template`) build their own string and pass
 /// whatever `{path}` resolves to; this function does not care which of the two it is handed.
+#[must_use]
 pub fn canonical_v1_payload(method: &str, target: &str, timestamp: &str, body: &[u8]) -> Vec<u8> {
     let mut message =
         Vec::with_capacity(method.len() + target.len() + timestamp.len() + body.len() + 3);
@@ -97,7 +99,7 @@ pub fn canonical_v1_payload(method: &str, target: &str, timestamp: &str, body: &
 pub const SIGNATURE_PREFIX: &str = "sha256=";
 
 /// Computes the `X-Signature-256` header value: [`SIGNATURE_PREFIX`] followed by the hex-encoded
-/// HMAC-SHA256 over the CANONICAL_V1 string.
+/// HMAC-SHA256 over the `CANONICAL_V1` string.
 ///
 /// Returns the **whole header value**, prefix included, rather than a bare digest. That is what
 /// makes "produce a signature" and "produce a valid header" the same operation, so a caller cannot
@@ -108,6 +110,10 @@ pub const SIGNATURE_PREFIX: &str = "sha256=";
 /// Infallible in practice: `Hmac` accepts keys of any length, so the only error path is a
 /// `secret` that cannot be used as HMAC key material at all, which is reported as
 /// [`AppError::Internal`] rather than panicking (`AGENT.MD` forbids `.unwrap()`/`.expect()`).
+///
+/// # Errors
+///
+/// Returns an internal error if the secret cannot initialize the HMAC key.
 pub fn compute_signature(
     secret: &str,
     method: &str,
@@ -120,7 +126,10 @@ pub fn compute_signature(
         AppError::Internal
     })?;
     mac.update(&canonical_v1_payload(method, target, timestamp, body));
-    Ok(format!("{SIGNATURE_PREFIX}{}", hex::encode(mac.finalize().into_bytes())))
+    Ok(format!(
+        "{SIGNATURE_PREFIX}{}",
+        hex::encode(mac.finalize().into_bytes())
+    ))
 }
 
 /// Verifies a caller-supplied `X-Signature-256` against the expected HMAC.
@@ -178,6 +187,7 @@ pub fn compute_signature(
 /// `sha256=AB…` and `sha256=ab…` are the same signature and decode to the same bytes, so they can
 /// never be recorded as two distinct single uses. The previous `bool` shape forced the middleware to
 /// re-derive a token from the header text, which upheld the same property only indirectly.
+#[must_use]
 pub fn verify_signature(
     secret: &str,
     method: &str,
@@ -188,7 +198,8 @@ pub fn verify_signature(
 ) -> Option<Vec<u8>> {
     // The prefix is required, not merely tolerated: `strip_prefix` returning `None` ends the
     // verification here rather than falling back to treating the whole value as hex.
-    let provided_bytes = hex::decode(provided.trim().strip_prefix(SIGNATURE_PREFIX)?.trim()).ok()?;
+    let provided_bytes =
+        hex::decode(provided.trim().strip_prefix(SIGNATURE_PREFIX)?.trim()).ok()?;
 
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).ok()?;
     mac.update(&canonical_v1_payload(method, target, timestamp, body));
@@ -266,12 +277,21 @@ impl SecretCipher {
     /// variable believes their secrets are encrypted, and silently writing them in the clear would
     /// betray that belief at exactly the wrong moment. `main` propagates this, so the daemon refuses
     /// to start rather than degrading quietly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when key material or encoded credential data is invalid.
     pub fn from_env() -> Result<Self, CryptoError> {
-        let configured = crate::config::get_secret_or_env(ENCRYPTION_KEY_ENV)
-            .or_else(|| crate::config::get_secret_or_env(ENCRYPTION_KEY_ENV_ALIAS));
+        let primary = crate::config::get_secret_or_env(ENCRYPTION_KEY_ENV);
+        let alias = crate::config::get_secret_or_env(ENCRYPTION_KEY_ENV_ALIAS);
+        Self::from_env_inputs(primary.as_deref(), alias.as_deref())
+    }
 
-        match configured {
-            Some(raw) => Self::from_hex_key(raw.trim()),
+    fn from_env_inputs(primary: Option<&str>, alias: Option<&str>) -> Result<Self, CryptoError> {
+        let primary = primary.map(str::trim).filter(|s| !s.is_empty());
+        let alias = alias.map(str::trim).filter(|s| !s.is_empty());
+        match primary.or(alias) {
+            Some(raw) => Self::from_hex_key(raw),
             None => Ok(Self::Plaintext),
         }
     }
@@ -282,6 +302,10 @@ impl SecretCipher {
     /// [`CryptoError::InvalidKey`] rather than stretched, which is the honest outcome: an earlier
     /// implementation ran whatever it was given through a single SHA-256, so it could not tell
     /// `openssl rand -hex 32` from `password` and reported neither.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when key material or encoded credential data is invalid.
     pub fn from_hex_key(hex_key: &str) -> Result<Self, CryptoError> {
         let bytes = hex::decode(hex_key).map_err(|_| CryptoError::InvalidKey)?;
         if bytes.len() != KEY_LEN {
@@ -294,6 +318,7 @@ impl SecretCipher {
     }
 
     /// Whether secrets are actually being encrypted.
+    #[must_use]
     pub fn is_encrypting(&self) -> bool {
         matches!(self, Self::Sealed(_))
     }
@@ -302,6 +327,10 @@ impl SecretCipher {
     ///
     /// Even the unencrypted mode hex-encodes, so the raw secret is never a substring of the stored
     /// column and a casual `grep` of a database dump does not surface it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if encryption or nonce generation fails.
     pub fn seal(&self, plaintext: &str) -> Result<String, CryptoError> {
         match self {
             Self::Plaintext => Ok(format!("{PLAINTEXT_PREFIX}{}", hex::encode(plaintext))),
@@ -367,6 +396,10 @@ impl SecretCipher {
     /// rotate that key (`POST /api/keys/{id}/rotate-secret`, master-only) before upgrading, or it
     /// stops authenticating with a `500`. `AGENT.MD` §1 and `SCHEMA.MD` §1 documented both shapes as
     /// readable and have been amended, including the query for finding stragglers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored value cannot be decoded or authenticated.
     pub fn open(&self, stored: &str) -> Result<String, CryptoError> {
         if let Some(encoded) = stored.strip_prefix(PLAINTEXT_PREFIX) {
             let bytes = hex::decode(encoded).map_err(|_| CryptoError::MalformedCiphertext)?;
@@ -374,8 +407,9 @@ impl SecretCipher {
         }
 
         if let Some(body) = stored.strip_prefix(SEALED_PREFIX) {
-            let (nonce_hex, ciphertext_hex) =
-                body.split_once('.').ok_or(CryptoError::MalformedCiphertext)?;
+            let (nonce_hex, ciphertext_hex) = body
+                .split_once('.')
+                .ok_or(CryptoError::MalformedCiphertext)?;
             let nonce_bytes =
                 hex::decode(nonce_hex).map_err(|_| CryptoError::MalformedCiphertext)?;
             if nonce_bytes.len() != NONCE_LEN {
@@ -391,8 +425,8 @@ impl SecretCipher {
                 // every request instead of the real misconfiguration.
                 return Err(CryptoError::DecryptionFailed);
             };
-            let nonce =
-                XNonce::try_from(nonce_bytes.as_slice()).map_err(|_| CryptoError::MalformedCiphertext)?;
+            let nonce = XNonce::try_from(nonce_bytes.as_slice())
+                .map_err(|_| CryptoError::MalformedCiphertext)?;
             let plaintext = cipher
                 .decrypt(&nonce, ciphertext.as_ref())
                 .map_err(|_| CryptoError::DecryptionFailed)?;
@@ -403,6 +437,22 @@ impl SecretCipher {
         // shape is not evidence of a pre-prefix row, and treating it as one turns a damaged column
         // into silently-wrong HMAC key material.
         Err(CryptoError::MalformedCiphertext)
+    }
+
+    /// Opens a stored credential for `webhook_configs` (`secret_token` / `api_key`), accepting
+    /// pre-encryption unprefixed plaintext rows transparently while enforcing full AEAD/envelope
+    /// verification on `v1.plain.` and `v1.xchacha20poly1305.` values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError`] if a `v1.*` envelope is malformed or fails decryption under the
+    /// active key.
+    pub fn open_legacy_or_sealed(&self, stored: &str) -> Result<String, CryptoError> {
+        if stored.starts_with(PLAINTEXT_PREFIX) || stored.starts_with(SEALED_PREFIX) {
+            self.open(stored)
+        } else {
+            Ok(stored.to_owned())
+        }
     }
 }
 
@@ -432,7 +482,14 @@ pub enum KeyCanary {
 /// row predates encryption. Deliberately a free function taking the sample by parameter, rather than
 /// a method that queries the database itself, so it stays testable without one — the boot wrapper in
 /// `main.rs` is the only caller that supplies a real row.
-pub fn check_key_canary(cipher: &SecretCipher, sample: Option<&str>) -> Result<KeyCanary, CryptoError> {
+///
+/// # Errors
+///
+/// Returns an error if the sample cannot be decoded or authenticated.
+pub fn check_key_canary(
+    cipher: &SecretCipher,
+    sample: Option<&str>,
+) -> Result<KeyCanary, CryptoError> {
     let Some(stored) = sample else {
         return Ok(KeyCanary::NoSealedSecrets);
     };
@@ -494,8 +551,13 @@ mod tests {
     #[test]
     fn the_query_string_is_covered_by_the_signature() {
         let bare = compute_signature("secret", "DELETE", "/api/ips/42", "1700000000", b"");
-        let escalated =
-            compute_signature("secret", "DELETE", "/api/ips/42?hard=true", "1700000000", b"");
+        let escalated = compute_signature(
+            "secret",
+            "DELETE",
+            "/api/ips/42?hard=true",
+            "1700000000",
+            b"",
+        );
         assert_ne!(bare.as_deref().ok(), escalated.as_deref().ok());
 
         // Reordering or adding a filter is equally covered.
@@ -515,21 +577,41 @@ mod tests {
         let sig = compute_signature("s3cret", "POST", "/api/ban", "1700000000", b"body")
             .expect("HMAC of a non-empty secret cannot fail");
 
-        assert!(sig.starts_with(SIGNATURE_PREFIX), "the computed value is a complete header value");
-        assert!(verify_signature("s3cret", "POST", "/api/ban", "1700000000", b"body", &sig).is_some());
+        assert!(
+            sig.starts_with(SIGNATURE_PREFIX),
+            "the computed value is a complete header value"
+        );
+        assert!(
+            verify_signature("s3cret", "POST", "/api/ban", "1700000000", b"body", &sig).is_some()
+        );
 
         // Surrounding whitespace is tolerated on either side of the tag: a header value that picked
         // up a stray space is a transport artefact, not a forgery attempt.
         assert!(
-            verify_signature("s3cret", "POST", "/api/ban", "1700000000", b"body", &format!("  {sig} "))
-                .is_some()
+            verify_signature(
+                "s3cret",
+                "POST",
+                "/api/ban",
+                "1700000000",
+                b"body",
+                &format!("  {sig} ")
+            )
+            .is_some()
         );
 
         // Wrong secret, mutated body, and non-hex garbage must all fail closed.
-        assert!(verify_signature("other", "POST", "/api/ban", "1700000000", b"body", &sig).is_none());
-        assert!(verify_signature("s3cret", "POST", "/api/ban", "1700000000", b"body!", &sig).is_none());
-        assert!(verify_signature("s3cret", "POST", "/api/ban", "1700000000", b"body", "zzz").is_none());
-        assert!(verify_signature("s3cret", "POST", "/api/ban", "1700000000", b"body", "").is_none());
+        assert!(
+            verify_signature("other", "POST", "/api/ban", "1700000000", b"body", &sig).is_none()
+        );
+        assert!(
+            verify_signature("s3cret", "POST", "/api/ban", "1700000000", b"body!", &sig).is_none()
+        );
+        assert!(
+            verify_signature("s3cret", "POST", "/api/ban", "1700000000", b"body", "zzz").is_none()
+        );
+        assert!(
+            verify_signature("s3cret", "POST", "/api/ban", "1700000000", b"body", "").is_none()
+        );
     }
 
     /// A tag of the wrong width must be rejected outright rather than compared against a truncated
@@ -541,7 +623,9 @@ mod tests {
     fn tags_of_the_wrong_length_are_rejected() {
         let sig = compute_signature("s3cret", "GET", "/api/ips", "1700000000", b"")
             .expect("HMAC of a non-empty secret cannot fail");
-        let digest = sig.strip_prefix(SIGNATURE_PREFIX).expect("compute_signature emits the tag");
+        let digest = sig
+            .strip_prefix(SIGNATURE_PREFIX)
+            .expect("compute_signature emits the tag");
 
         for wrong in [&digest[..62], &digest[..2], "", &format!("{digest}00")] {
             assert!(
@@ -570,9 +654,15 @@ mod tests {
     fn a_correct_digest_without_the_mandatory_tag_does_not_verify() {
         let sig = compute_signature("s3cret", "POST", "/api/ban", "1700000000", b"body")
             .expect("HMAC of a non-empty secret cannot fail");
-        let digest = sig.strip_prefix(SIGNATURE_PREFIX).expect("compute_signature emits the tag");
+        let digest = sig
+            .strip_prefix(SIGNATURE_PREFIX)
+            .expect("compute_signature emits the tag");
 
-        assert_eq!(digest.len(), 64, "the bare form is a full-width, otherwise-valid digest");
+        assert_eq!(
+            digest.len(),
+            64,
+            "the bare form is a full-width, otherwise-valid digest"
+        );
         assert!(
             verify_signature("s3cret", "POST", "/api/ban", "1700000000", b"body", digest).is_none(),
             "a bare hex digest must be refused no matter how correct it is"
@@ -588,8 +678,15 @@ mod tests {
             format!("sha256 {digest}"),
         ] {
             assert!(
-                verify_signature("s3cret", "POST", "/api/ban", "1700000000", b"body", &framing)
-                    .is_none(),
+                verify_signature(
+                    "s3cret",
+                    "POST",
+                    "/api/ban",
+                    "1700000000",
+                    b"body",
+                    &framing
+                )
+                .is_none(),
                 "{framing:?} must not be accepted as a signature"
             );
         }
@@ -623,8 +720,14 @@ mod tests {
         let cipher = SecretCipher::from_hex_key(TEST_KEY).expect("valid key");
         let first = cipher.seal("same-input").expect("sealing succeeds");
         let second = cipher.seal("same-input").expect("sealing succeeds");
-        assert_ne!(first, second, "identical plaintexts must not seal identically");
-        assert_eq!(cipher.open(&first).expect("opens"), cipher.open(&second).expect("opens"));
+        assert_ne!(
+            first, second,
+            "identical plaintexts must not seal identically"
+        );
+        assert_eq!(
+            cipher.open(&first).expect("opens"),
+            cipher.open(&second).expect("opens")
+        );
     }
 
     #[test]
@@ -636,7 +739,10 @@ mod tests {
         .expect("valid key");
 
         let sealed = writer.seal("s3cr3t").expect("sealing succeeds");
-        assert!(matches!(other.open(&sealed), Err(CryptoError::DecryptionFailed)));
+        assert!(matches!(
+            other.open(&sealed),
+            Err(CryptoError::DecryptionFailed)
+        ));
         // Nor can a daemon that lost its key entirely.
         assert!(matches!(
             SecretCipher::Plaintext.open(&sealed),
@@ -655,7 +761,10 @@ mod tests {
         chars[last] = if chars[last] == 'a' { 'b' } else { 'a' };
         let tampered: String = chars.into_iter().collect();
 
-        assert!(matches!(cipher.open(&tampered), Err(CryptoError::DecryptionFailed)));
+        assert!(matches!(
+            cipher.open(&tampered),
+            Err(CryptoError::DecryptionFailed)
+        ));
     }
 
     /// Fail closed at startup: a key that is not exactly 32 bytes of hex is an error, never a
@@ -664,13 +773,16 @@ mod tests {
     fn malformed_keys_are_rejected_rather_than_falling_back() {
         for bad in [
             "not-hex",
-            "00ff",                                                               // too short
-            "",                                                                   // empty
-            &format!("{TEST_KEY}00"),                                             // too long
-            "zz0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",   // bad nibble
+            "00ff",                                                             // too short
+            "",                                                                 // empty
+            &format!("{TEST_KEY}00"),                                           // too long
+            "zz0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", // bad nibble
         ] {
             assert!(
-                matches!(SecretCipher::from_hex_key(bad), Err(CryptoError::InvalidKey)),
+                matches!(
+                    SecretCipher::from_hex_key(bad),
+                    Err(CryptoError::InvalidKey)
+                ),
                 "{bad:?} must be rejected"
             );
         }
@@ -682,74 +794,28 @@ mod tests {
     /// They are process-global and this suite runs in parallel, so without this two tests setting
     /// different keys would interleave and each would occasionally observe the other's. Poisoning is
     /// recovered from rather than propagated: one failing test must not cascade into four.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Runs `body` with both key variables set as given (`None` meaning unset), restoring whatever
-    /// was there before.
-    fn with_key_env<T>(
-        primary: Option<&str>,
-        alias: Option<&str>,
-        body: impl FnOnce() -> T,
-    ) -> T {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let saved: Vec<(&str, Option<String>)> = [ENCRYPTION_KEY_ENV, ENCRYPTION_KEY_ENV_ALIAS]
-            .into_iter()
-            .map(|name| (name, std::env::var(name).ok()))
-            .collect();
-
-        // SAFETY: `ENV_LOCK` is held across the whole body, and every test touching these two
-        // variables goes through this helper, so no other thread reads or writes them meanwhile.
-        unsafe {
-            for (name, value) in [(ENCRYPTION_KEY_ENV, primary), (ENCRYPTION_KEY_ENV_ALIAS, alias)] {
-                match value {
-                    Some(raw) => std::env::set_var(name, raw),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
-
-        let outcome = body();
-
-        // SAFETY: as above — still under `ENV_LOCK`.
-        unsafe {
-            for (name, value) in saved {
-                match value {
-                    Some(raw) => std::env::set_var(name, raw),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
-        outcome
-    }
-
-    /// The same fail-closed rule as [`malformed_keys_are_rejected_rather_than_falling_back`], but
-    /// through `from_env` — the call `AppState::new` actually makes at startup.
-    ///
-    /// Testing `from_hex_key` proves the *parser* refuses a bad key. It says nothing about whether
-    /// the environment reader propagates that refusal, and the reader is where the dangerous
-    /// alternative lives: a `.unwrap_or(Plaintext)` or an `.ok()` there would turn every rejection
-    /// above into a silent downgrade, with all of those tests still green. Both variable names are
-    /// exercised, because the alias exists precisely so one provisioning system can feed both
-    /// services and an alias that failed open would be a hole in the less-travelled path.
     #[test]
     fn a_malformed_key_in_either_variable_refuses_to_build_the_cipher() {
         for bad in ["not-hex", "00ff", &format!("{TEST_KEY}00"), "password"] {
             assert!(
-                matches!(with_key_env(Some(bad), None, SecretCipher::from_env), Err(CryptoError::InvalidKey)),
+                matches!(
+                    SecretCipher::from_env_inputs(Some(bad), None),
+                    Err(CryptoError::InvalidKey)
+                ),
                 "{ENCRYPTION_KEY_ENV}={bad:?} must abort rather than degrade to plaintext"
             );
             assert!(
-                matches!(with_key_env(None, Some(bad), SecretCipher::from_env), Err(CryptoError::InvalidKey)),
+                matches!(
+                    SecretCipher::from_env_inputs(None, Some(bad)),
+                    Err(CryptoError::InvalidKey)
+                ),
                 "{ENCRYPTION_KEY_ENV_ALIAS}={bad:?} must abort rather than degrade to plaintext"
             );
         }
 
-        // A bad *primary* must not be rescued by a good alias: the primary wins when both are set,
-        // and "wins" has to mean its failure wins too. Falling through to the alias here would let a
-        // typo in the documented variable be masked by a stale value in the compatibility one.
         assert!(
             matches!(
-                with_key_env(Some("not-hex"), Some(TEST_KEY), SecretCipher::from_env),
+                SecretCipher::from_env_inputs(Some("not-hex"), Some(TEST_KEY)),
                 Err(CryptoError::InvalidKey)
             ),
             "a malformed primary key must not fall through to the alias"
@@ -760,27 +826,35 @@ mod tests {
     /// everything.
     #[test]
     fn from_env_resolves_the_primary_the_alias_and_the_unset_case() {
-        let sealed = with_key_env(Some(TEST_KEY), None, SecretCipher::from_env)
+        let sealed = SecretCipher::from_env_inputs(Some(TEST_KEY), None)
             .expect("a valid primary key builds");
-        assert!(sealed.is_encrypting(), "a configured key means secrets are encrypted");
+        assert!(
+            sealed.is_encrypting(),
+            "a configured key means secrets are encrypted"
+        );
 
-        let via_alias = with_key_env(None, Some(TEST_KEY), SecretCipher::from_env)
-            .expect("a valid alias key builds");
-        assert!(via_alias.is_encrypting(), "the alias is a full equivalent, not a partial one");
+        let via_alias =
+            SecretCipher::from_env_inputs(None, Some(TEST_KEY)).expect("a valid alias key builds");
+        assert!(
+            via_alias.is_encrypting(),
+            "the alias is a full equivalent, not a partial one"
+        );
 
-        // Unset — and set-but-blank, which is what an unpopulated `.env` template or a
-        // `VAULT_ENCRYPTION_KEY=` line produces — is the zero-configuration case, not an error.
         for blank in [None, Some(""), Some("   ")] {
-            let plaintext = with_key_env(blank, None, SecretCipher::from_env)
+            let plaintext = SecretCipher::from_env_inputs(blank, None)
                 .expect("no key configured is not an error");
-            assert!(!plaintext.is_encrypting(), "{blank:?} must mean plaintext, not a failure");
+            assert!(
+                !plaintext.is_encrypting(),
+                "{blank:?} must mean plaintext, not a failure"
+            );
         }
 
-        // A blank primary alongside a real alias must use the alias rather than being treated as
-        // "the primary is set", which is the bug the `.filter(|raw| !raw.trim().is_empty())` guards.
-        let fallback = with_key_env(Some(""), Some(TEST_KEY), SecretCipher::from_env)
+        let fallback = SecretCipher::from_env_inputs(Some(""), Some(TEST_KEY))
             .expect("a blank primary falls through to the alias");
-        assert!(fallback.is_encrypting(), "a blank primary must not mask a configured alias");
+        assert!(
+            fallback.is_encrypting(),
+            "a blank primary must not mask a configured alias"
+        );
     }
 
     #[test]
@@ -792,7 +866,10 @@ mod tests {
             "v1.xchacha20poly1305.00ff.aabb", // nonce too short
             "v1.plain.zz",
         ] {
-            assert!(cipher.open(malformed).is_err(), "{malformed:?} should not open");
+            assert!(
+                cipher.open(malformed).is_err(),
+                "{malformed:?} should not open"
+            );
         }
     }
 
@@ -809,14 +886,23 @@ mod tests {
     /// before upgrading; `AGENT.MD` §1 and `SCHEMA.MD` §1 record that.
     #[test]
     fn an_unprefixed_row_is_refused_rather_than_read_verbatim() {
-        for cipher in [SecretCipher::Plaintext, SecretCipher::from_hex_key(TEST_KEY).expect("valid key")] {
+        for cipher in [
+            SecretCipher::Plaintext,
+            SecretCipher::from_hex_key(TEST_KEY).expect("valid key"),
+        ] {
             assert!(
-                matches!(cipher.open("bare-legacy-secret"), Err(CryptoError::MalformedCiphertext)),
+                matches!(
+                    cipher.open("bare-legacy-secret"),
+                    Err(CryptoError::MalformedCiphertext)
+                ),
                 "an unprefixed value must not be accepted as a signing secret"
             );
             // The empty column — the shape a failed write leaves behind — is refused on the same path
             // rather than becoming an empty HMAC key, which would verify forgeable signatures.
-            assert!(matches!(cipher.open(""), Err(CryptoError::MalformedCiphertext)));
+            assert!(matches!(
+                cipher.open(""),
+                Err(CryptoError::MalformedCiphertext)
+            ));
         }
     }
 
@@ -833,7 +919,10 @@ mod tests {
             hex::encode([7u8; 12]),
             hex::encode([9u8; 32])
         );
-        for cipher in [SecretCipher::Plaintext, SecretCipher::from_hex_key(TEST_KEY).expect("valid key")] {
+        for cipher in [
+            SecretCipher::Plaintext,
+            SecretCipher::from_hex_key(TEST_KEY).expect("valid key"),
+        ] {
             assert!(
                 matches!(cipher.open(&stored), Err(CryptoError::MalformedCiphertext)),
                 "an aesgcm256: row must be refused as malformed, not decrypted"
@@ -851,7 +940,9 @@ mod tests {
             .expect("sealing succeeds");
         assert!(sealed.starts_with(SEALED_PREFIX));
 
-        let stored = SecretCipher::Plaintext.seal("s3cr3t").expect("sealing succeeds");
+        let stored = SecretCipher::Plaintext
+            .seal("s3cr3t")
+            .expect("sealing succeeds");
         assert!(stored.starts_with(PLAINTEXT_PREFIX));
     }
 
@@ -862,7 +953,10 @@ mod tests {
         let rendered = format!("{cipher:?}");
         assert!(rendered.contains("redacted"));
         assert!(!rendered.contains(TEST_KEY));
-        assert_eq!(format!("{:?}", SecretCipher::Plaintext), "SecretCipher::Plaintext");
+        assert_eq!(
+            format!("{:?}", SecretCipher::Plaintext),
+            "SecretCipher::Plaintext"
+        );
     }
 
     /// A second, distinct valid-format key — the canary's whole reason to exist is telling this
@@ -873,14 +967,22 @@ mod tests {
     #[test]
     fn no_stored_secret_is_not_a_failure() {
         let cipher = SecretCipher::from_hex_key(TEST_KEY).expect("valid key");
-        assert_eq!(check_key_canary(&cipher, None), Ok(KeyCanary::NoSealedSecrets));
+        assert_eq!(
+            check_key_canary(&cipher, None),
+            Ok(KeyCanary::NoSealedSecrets)
+        );
     }
 
     #[test]
     fn the_configured_key_opens_the_stored_secret() {
         let cipher = SecretCipher::from_hex_key(TEST_KEY).expect("valid key");
-        let stored = cipher.seal("real-signing-secret").expect("sealing succeeds");
-        assert_eq!(check_key_canary(&cipher, Some(&stored)), Ok(KeyCanary::Verified));
+        let stored = cipher
+            .seal("real-signing-secret")
+            .expect("sealing succeeds");
+        assert_eq!(
+            check_key_canary(&cipher, Some(&stored)),
+            Ok(KeyCanary::Verified)
+        );
     }
 
     /// The property this whole module exists for: a syntactically valid but *wrong* key must be
@@ -888,7 +990,9 @@ mod tests {
     #[test]
     fn a_wrong_but_well_formed_key_fails_the_canary() {
         let written_with = SecretCipher::from_hex_key(TEST_KEY).expect("valid key");
-        let stored = written_with.seal("real-signing-secret").expect("sealing succeeds");
+        let stored = written_with
+            .seal("real-signing-secret")
+            .expect("sealing succeeds");
 
         let configured_with = SecretCipher::from_hex_key(OTHER_KEY).expect("valid key");
         assert_eq!(
@@ -902,7 +1006,9 @@ mod tests {
     #[test]
     fn a_sealed_row_with_no_key_configured_fails_the_canary() {
         let written_with = SecretCipher::from_hex_key(TEST_KEY).expect("valid key");
-        let stored = written_with.seal("real-signing-secret").expect("sealing succeeds");
+        let stored = written_with
+            .seal("real-signing-secret")
+            .expect("sealing succeeds");
 
         assert_eq!(
             check_key_canary(&SecretCipher::Plaintext, Some(&stored)),

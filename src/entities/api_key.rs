@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 
 /// A single API key: its identity, global RBAC scopes, and network binding rule.
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "SeaORM DeriveEntityModel requires flat 1:1 fields for SQL BOOLEAN columns"
+)]
 #[sea_orm(table_name = "api_keys")]
 pub struct Model {
     /// Unique identifier for the API key.
@@ -112,7 +116,11 @@ impl Related<super::ip_group::Entity> for Entity {
         super::api_key_group_permission::Relation::IpGroup.def()
     }
     fn via() -> Option<RelationDef> {
-        Some(super::api_key_group_permission::Relation::ApiKey.def().rev())
+        Some(
+            super::api_key_group_permission::Relation::ApiKey
+                .def()
+                .rev(),
+        )
     }
 }
 

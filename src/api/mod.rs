@@ -57,19 +57,22 @@ mod webhooks;
 pub(crate) use guards::*;
 pub(crate) use support::*;
 
-pub use audit::*;
-pub use groups::*;
-pub use health::*;
-pub use keys::*;
-pub use records::*;
-pub use settings::*;
-pub use stats::*;
-pub use webhooks::*;
+pub(crate) use audit::*;
+pub(crate) use groups::*;
+pub(crate) use health::*;
+pub(crate) use keys::*;
+pub(crate) use records::*;
+pub(crate) use settings::*;
+pub(crate) use stats::*;
+pub(crate) use webhooks::*;
 
-// The credential primitives and the shared owner payload are public because the integration suites
-// mint keys directly against the database — a test hashes a plaintext exactly as the service would,
-// which is the only way to seed a key whose secret the test already knows. Named explicitly rather
-// than left to the glob above, which caps them at `pub(crate)`.
+// The credential primitives, shared owner payload, and read/benchmark helpers are public because the
+// integration suites seed keys directly against the DB and benchmark query plans.
+pub use keys::{
+    AdminScopes, ApiKeySummary, GroupCapabilities, MePermission, batch_key_group_permissions,
+    build_full_api_key_summary, key_group_permissions,
+};
+pub use records::apply_group_and_since_scope;
 pub use support::{
     ReassignOwnerPayload, generate_random_key, hash_key, normalize_ip_or_cidr,
     normalize_ipv6_ban_storage,

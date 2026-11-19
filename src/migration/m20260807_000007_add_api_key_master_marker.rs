@@ -24,9 +24,7 @@
 //! let the engine derive the marker from `is_master` — see `m20260808_000009_derive_master_marker`,
 //! which drops this column and re-adds it as `GENERATED ALWAYS AS (…)`.
 //!
-//! This migration is retained unmodified because it has already been applied to real databases;
-//! `sea-orm` records migrations by name and would not re-run an edited one. Only its documentation
-//! is corrected.
+//! The historical behavior is preserved for databases that have yet to run this migration.
 //!
 //! # Why a marker column and not a partial unique index
 //!
@@ -49,7 +47,7 @@
 //! which one to run. A single master (the overwhelmingly common case) backfills silently.
 
 use sea_orm_migration::prelude::*;
-use sea_orm_migration::sea_orm::{ConnectionTrait, Statement};
+use sea_orm_migration::sea_orm::ConnectionTrait;
 
 /// The one non-null value this migration's `master_marker` ever carried. Local to this module: the
 /// API-side constant it once mirrored has been deleted along with every write path, because the
@@ -60,11 +58,13 @@ const MASTER_MARKER: &str = "master";
 
 /// Identifiers this migration touches. `Table` is re-declared locally rather than imported from the
 /// initial-schema migration so that module can stay private; `DeriveIden` maps the variants to the
-/// same snake_case names, so they address the same table.
+/// same `snake_case` names, so they address the same table.
 #[derive(DeriveIden)]
 enum ApiKeys {
     /// The `api_keys` table.
     Table,
+    Id,
+    IsMaster,
     /// The uniqueness marker: `'master'` on the Master key, `NULL` on every other key.
     MasterMarker,
 }
@@ -76,31 +76,30 @@ pub struct Migration;
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
-        let backend = db.get_database_backend();
 
         // Checked *before* the column is added, so a database with two masters is left exactly as it
         // was found rather than half-migrated. `is_master` is a boolean on every backend, and
         // comparing against `true` rather than `1` keeps PostgreSQL happy without a cast.
         let duplicates = db
-            .query_all_raw(Statement::from_string(
-                backend,
-                "SELECT id FROM api_keys WHERE is_master = true".to_owned(),
-            ))
+            .query_all(
+                &*Query::select()
+                    .columns([ApiKeys::Id])
+                    .from(ApiKeys::Table)
+                    .and_where(Expr::col(ApiKeys::IsMaster).eq(true)),
+            )
             .await?;
         if duplicates.len() > 1 {
             let ids: Vec<String> = duplicates
                 .iter()
                 .map(|row| {
                     row.try_get::<uuid::Uuid>("", "id")
-                        .map(|id| id.to_string())
-                        .unwrap_or_else(|_| "<unreadable id>".to_owned())
+                        .map_or_else(|_| "<unreadable id>".to_owned(), |id| id.to_string())
                 })
                 .collect();
             return Err(DbErr::Custom(format!(
                 "Refusing to migrate: {} keys have is_master = true ({}), but RBAC_MODEL.md §5 \
-                 requires exactly one. Decide which key is the Master and demote the others with \
-                 `UPDATE api_keys SET is_master = false WHERE id IN (...);`, then restart. This \
-                 migration will not choose for you.",
+                 requires exactly one. Decide which key is the Master and set is_master to false \
+                 on the others, then restart.",
                 duplicates.len(),
                 ids.join(", ")
             )));
@@ -119,11 +118,15 @@ impl MigrationTrait for Migration {
             .await?;
 
         // Backfill before the index exists. Guaranteed to touch at most one row by the check above.
-        db.execute_raw(Statement::from_string(
-            backend,
-            format!("UPDATE api_keys SET master_marker = '{MASTER_MARKER}' WHERE is_master = true"),
-        ))
-        .await?;
+        manager
+            .exec_stmt(
+                Query::update()
+                    .table(ApiKeys::Table)
+                    .value(ApiKeys::MasterMarker, MASTER_MARKER)
+                    .and_where(Expr::col(ApiKeys::IsMaster).eq(true))
+                    .to_owned(),
+            )
+            .await?;
 
         manager
             .create_index(

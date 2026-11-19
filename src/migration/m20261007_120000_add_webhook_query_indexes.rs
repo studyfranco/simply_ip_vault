@@ -80,7 +80,13 @@ impl MigrationTrait for Migration {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Restores the single-column indexes this migration superseded.
         manager
-            .drop_index(SqIndex::drop().if_exists().name("idx_webhook_exec_lookup").table(WebhookExecutions::Table).to_owned())
+            .drop_index(
+                SqIndex::drop()
+                    .if_exists()
+                    .name("idx_webhook_exec_lookup")
+                    .table(WebhookExecutions::Table)
+                    .to_owned(),
+            )
             .await?;
         manager
             .create_index(
@@ -93,7 +99,13 @@ impl MigrationTrait for Migration {
             )
             .await?;
         manager
-            .drop_index(SqIndex::drop().if_exists().name("idx_webhooks_group_active").table(WebhookConfigs::Table).to_owned())
+            .drop_index(
+                SqIndex::drop()
+                    .if_exists()
+                    .name("idx_webhooks_group_active")
+                    .table(WebhookConfigs::Table)
+                    .to_owned(),
+            )
             .await?;
         manager
             .create_index(

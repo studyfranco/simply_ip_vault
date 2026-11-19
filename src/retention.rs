@@ -14,11 +14,12 @@ use std::time::Duration;
 use chrono::Utc;
 use sea_orm::{
     ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, SqliteTransactionMode,
-    TransactionOptions, TransactionTrait, sea_query::{Expr, ExprTrait, Query},
+    TransactionOptions, TransactionTrait,
+    sea_query::{Expr, ExprTrait, Query},
 };
 use tokio::sync::mpsc;
 
-use crate::entities::{ip_record, ip_record_group_membership, webhook_execution};
+use crate::entities::{audit_log, ip_record, ip_record_group_membership, webhook_execution};
 
 /// Days a soft-deleted record is kept before the purge removes it for good.
 pub const DEFAULT_RETENTION_DAYS: i64 = 92;
@@ -56,7 +57,10 @@ pub fn retention_days_from_env() -> i64 {
 /// Reads the configured sweep interval, clamped to at least one second.
 fn sweep_seconds_from_env() -> u64 {
     match std::env::var(RETENTION_SWEEP_ENV) {
-        Ok(raw) => std::cmp::max(raw.trim().parse::<u64>().unwrap_or(DEFAULT_SWEEP_SECONDS), 1),
+        Ok(raw) => std::cmp::max(
+            raw.trim().parse::<u64>().unwrap_or(DEFAULT_SWEEP_SECONDS),
+            1,
+        ),
         Err(_) => DEFAULT_SWEEP_SECONDS,
     }
 }
@@ -75,6 +79,10 @@ fn sweep_seconds_from_env() -> u64 {
 /// membership via `ON DELETE CASCADE`. An address still held by another group keeps its row. The
 /// orphan scan itself is skipped entirely when this sweep purged zero memberships — see the
 /// comment at that check for why that is always safe, not just an optimistic optimization.
+///
+/// # Errors
+///
+/// Returns a database error if the retention sweep cannot finish.
 pub async fn purge_expired_ip_records(
     db: &DatabaseConnection,
     retention_days: i64,
@@ -123,8 +131,11 @@ pub async fn purge_expired_ip_records(
                 .expr(Expr::val(1))
                 .from(ip_record_group_membership::Entity)
                 .and_where(
-                    Expr::col((ip_record_group_membership::Entity, ip_record_group_membership::Column::IpRecordId))
-                        .equals((ip_record::Entity, ip_record::Column::Id)),
+                    Expr::col((
+                        ip_record_group_membership::Entity,
+                        ip_record_group_membership::Column::IpRecordId,
+                    ))
+                    .equals((ip_record::Entity, ip_record::Column::Id)),
                 )
                 .to_owned(),
         ))
@@ -233,6 +244,10 @@ fn execution_retention_hours_from_env(env_var: &str, default: i64) -> i64 {
 /// Returns the number of rows removed. Each threshold is independently disable-able (a non-positive
 /// value keeps that outcome's rows forever) — an operator who wants to keep every failure but not
 /// every success can express that directly, rather than the two being coupled to one knob.
+///
+/// # Errors
+///
+/// Returns a database error if the retention sweep cannot finish.
 pub async fn purge_expired_webhook_executions(
     db: &DatabaseConnection,
     success_retention_hours: i64,
@@ -320,4 +335,137 @@ pub async fn run_webhook_execution_retention_worker(
     }
 
     tracing::info!("Webhook execution retention worker shut down.");
+}
+
+// ─────────────────────────────────────────────────────────────
+// Audit log retention
+// ─────────────────────────────────────────────────────────────
+
+/// Default retention window for `audit_logs`, in days (1 year).
+pub const DEFAULT_AUDIT_LOG_RETENTION_DAYS: i64 = 365;
+
+/// Overrides [`DEFAULT_AUDIT_LOG_RETENTION_DAYS`]. `0` disables purging `audit_logs`.
+pub const AUDIT_LOG_RETENTION_DAYS_ENV: &str = "AUDIT_LOG_RETENTION_DAYS";
+
+/// Reads [`AUDIT_LOG_RETENTION_DAYS_ENV`] (or returns [`DEFAULT_AUDIT_LOG_RETENTION_DAYS`]).
+#[must_use]
+pub fn audit_log_retention_days_from_env() -> i64 {
+    execution_retention_hours_from_env(
+        AUDIT_LOG_RETENTION_DAYS_ENV,
+        DEFAULT_AUDIT_LOG_RETENTION_DAYS,
+    )
+}
+
+/// Permanently deletes `audit_logs` rows older than `retention_days`. A non-positive value keeps
+/// all rows indefinitely.
+///
+/// # Errors
+///
+/// Returns [`DbErr`] if deleting expired audit rows fails.
+pub async fn purge_expired_audit_logs(
+    db: &DatabaseConnection,
+    retention_days: i64,
+) -> Result<u64, DbErr> {
+    if retention_days <= 0 {
+        return Ok(0);
+    }
+
+    let threshold = (Utc::now() - chrono::Duration::days(retention_days)).naive_utc();
+    let result = audit_log::Entity::delete_many()
+        .filter(audit_log::Column::Timestamp.lt(threshold))
+        .exec(db)
+        .await?;
+    Ok(result.rows_affected)
+}
+
+/// Runs the periodic `audit_logs` retention purge until `shutdown` closes.
+pub async fn run_audit_log_retention_worker(
+    db: DatabaseConnection,
+    mut shutdown: mpsc::Receiver<()>,
+) {
+    let retention_days = audit_log_retention_days_from_env();
+    if retention_days <= 0 {
+        tracing::info!(
+            "Audit log retention purge is disabled ({AUDIT_LOG_RETENTION_DAYS_ENV}=0): \
+             audit logs are kept indefinitely."
+        );
+        return;
+    }
+
+    let sweep_seconds = sweep_seconds_from_env();
+    tracing::info!(
+        retention_days,
+        sweep_seconds,
+        "Audit log retention worker started — logs older than {retention_days} days are purged."
+    );
+
+    // Staggered past IP and webhook-execution sweeps to avoid SQLite write-lock collisions.
+    let initial_delay = Duration::from_secs(std::cmp::min(180, sweep_seconds));
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + initial_delay,
+        Duration::from_secs(sweep_seconds),
+    );
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                match purge_expired_audit_logs(&db, retention_days).await {
+                    Ok(0) => tracing::debug!("Audit retention sweep: nothing to purge."),
+                    Ok(n) => tracing::info!("Audit retention sweep: purged {n} audit log(s)."),
+                    Err(e) => tracing::error!("Audit retention sweep failed: {e}"),
+                }
+            }
+            _ = shutdown.recv() => break,
+        }
+    }
+
+    tracing::info!("Audit log retention worker shut down.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set, Database};
+
+    #[tokio::test]
+    async fn purge_expired_audit_logs_removes_only_rows_older_than_cutoff() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("sqlite memory");
+        crate::db::run_migrations(&db).await.expect("migrations");
+
+        let old_ts = (Utc::now() - chrono::Duration::days(400)).naive_utc();
+        let fresh_ts = (Utc::now() - chrono::Duration::days(10)).naive_utc();
+
+        for (id_byte, ts) in [(1u8, old_ts), (2u8, fresh_ts)] {
+            audit_log::ActiveModel {
+                id: Set(uuid::Uuid::from_bytes([id_byte; 16])),
+                api_key_id: Set(None),
+                api_key_name: Set("Master".to_owned()),
+                api_key_prefix: Set("00000000".to_owned()),
+                client_ip: Set("127.0.0.1".to_owned()),
+                action: Set("TEST".to_owned()),
+                target_address: Set(None),
+                group_names: Set(None),
+                details: Set(None),
+                timestamp: Set(ts),
+            }
+            .insert(&db)
+            .await
+            .expect("insert audit row");
+        }
+
+        assert_eq!(purge_expired_audit_logs(&db, 0).await.expect("disabled"), 0);
+        assert_eq!(
+            purge_expired_audit_logs(&db, DEFAULT_AUDIT_LOG_RETENTION_DAYS)
+                .await
+                .expect("purge"),
+            1
+        );
+
+        let remaining = audit_log::Entity::find().all(&db).await.expect("query");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, uuid::Uuid::from_bytes([2u8; 16]));
+    }
 }

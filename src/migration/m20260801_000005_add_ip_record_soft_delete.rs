@@ -18,7 +18,7 @@ use sea_orm_migration::prelude::*;
 
 /// Identifiers this migration touches. `Table` is re-declared locally rather than imported from the
 /// initial-schema migration so that module can stay private; `DeriveIden` maps the variants to the
-/// same snake_case names, so they address the same table.
+/// same `snake_case` names, so they address the same table.
 #[derive(DeriveIden)]
 enum IpRecords {
     /// The `ip_records` table.
@@ -98,15 +98,34 @@ impl MigrationTrait for Migration {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
-            .drop_index(Index::drop().name("idx_ip_records_deleted_at").table(IpRecords::Table).to_owned())
+            .drop_index(
+                Index::drop()
+                    .name("idx_ip_records_deleted_at")
+                    .table(IpRecords::Table)
+                    .to_owned(),
+            )
             .await?;
         manager
-            .drop_index(Index::drop().name("idx_ip_records_is_deleted").table(IpRecords::Table).to_owned())
+            .drop_index(
+                Index::drop()
+                    .name("idx_ip_records_is_deleted")
+                    .table(IpRecords::Table)
+                    .to_owned(),
+            )
             .await?;
 
-        for column in [IpRecords::DeletedBy, IpRecords::DeletedAt, IpRecords::IsDeleted] {
+        for column in [
+            IpRecords::DeletedBy,
+            IpRecords::DeletedAt,
+            IpRecords::IsDeleted,
+        ] {
             manager
-                .alter_table(Table::alter().table(IpRecords::Table).drop_column(column).to_owned())
+                .alter_table(
+                    Table::alter()
+                        .table(IpRecords::Table)
+                        .drop_column(column)
+                        .to_owned(),
+                )
                 .await?;
         }
         Ok(())

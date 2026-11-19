@@ -57,23 +57,22 @@
 //! explicit check exists to fail with an actionable message instead of a driver's constraint error.)
 
 use sea_orm_migration::prelude::*;
-use sea_orm_migration::sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
-
-/// The derived marker column. Deliberately **absent from `api_key::Model`**: SeaORM builds explicit
-/// column lists from the entity, so an undeclared column can never appear in an `INSERT` — which is
-/// required, since the engine rejects any write to a generated column.
-const MARKER_COLUMN: &str = "master_marker";
+use sea_orm_migration::sea_orm::{ConnectionTrait, DatabaseBackend};
 
 /// The unique index that does the enforcing. Same name `m20260807_000007…` used, so operators and
 /// the §7 schema assertions keep looking at one index across the two migrations.
 const MARKER_INDEX: &str = "idx-api_keys-master_marker";
 
 /// Identifiers this migration touches, re-declared locally so the initial-schema module stays
-/// private. `DeriveIden` maps the variants to the same snake_case names.
+/// private. `DeriveIden` maps the variants to the same `snake_case` names.
 #[derive(DeriveIden)]
 enum ApiKeys {
     /// The `api_keys` table.
     Table,
+    Id,
+    Name,
+    Prefix,
+    IsMaster,
     /// The marker column — dropped as a plain column here, re-added as a generated one.
     MasterMarker,
 }
@@ -82,26 +81,21 @@ enum ApiKeys {
 pub struct Migration;
 
 impl Migration {
-    /// The `ALTER TABLE` that adds the derived marker, in this backend's dialect.
-    ///
-    /// Raw SQL rather than a `ColumnDef`: generated columns are the one piece of DDL where the three
-    /// engines disagree on a keyword that changes whether the statement is accepted at all, and
-    /// spelling it out keeps the dialect choice visible to the test below rather than buried in a
-    /// query builder's backend dispatch.
-    fn add_marker_column(backend: DatabaseBackend) -> String {
-        // `CASE WHEN is_master THEN 1 ELSE NULL END` reads identically on all three engines:
-        // PostgreSQL evaluates a native boolean, MySQL and SQLite a truthy integer. The `ELSE NULL`
-        // is the load-bearing half — it is what lets every non-master row coexist under a unique
-        // index, since NULLs do not collide.
-        let expression = "CASE WHEN is_master THEN 1 ELSE NULL END";
+    fn add_marker_column(backend: DatabaseBackend) -> TableAlterStatement {
         let storage = match backend {
             DatabaseBackend::Postgres => "STORED",
             _ => "VIRTUAL",
         };
-        format!(
-            "ALTER TABLE api_keys ADD COLUMN {MARKER_COLUMN} INTEGER \
-             GENERATED ALWAYS AS ({expression}) {storage}"
-        )
+        Table::alter()
+            .table(ApiKeys::Table)
+            .add_column(
+                ColumnDef::new(ApiKeys::MasterMarker)
+                    .integer()
+                    .extra(format!(
+                        "GENERATED ALWAYS AS (CASE WHEN is_master THEN 1 ELSE NULL END) {storage}"
+                    )),
+            )
+            .to_owned()
     }
 }
 
@@ -113,10 +107,12 @@ impl MigrationTrait for Migration {
 
         // Before any DDL: refuse to migrate a database that already holds more than one master.
         let masters = db
-            .query_all_raw(Statement::from_string(
-                backend,
-                "SELECT id, name, prefix FROM api_keys WHERE is_master = true".to_owned(),
-            ))
+            .query_all(
+                &*Query::select()
+                    .columns([ApiKeys::Id, ApiKeys::Name, ApiKeys::Prefix])
+                    .from(ApiKeys::Table)
+                    .and_where(Expr::col(ApiKeys::IsMaster).eq(true)),
+            )
             .await?;
         if masters.len() > 1 {
             let rows: Vec<String> = masters
@@ -125,8 +121,9 @@ impl MigrationTrait for Migration {
                     let id = row
                         .try_get::<uuid::Uuid>("", "id")
                         .map_or_else(|_| "<unreadable id>".to_owned(), |id| id.to_string());
-                    let name =
-                        row.try_get::<String>("", "name").unwrap_or_else(|_| "<unreadable>".into());
+                    let name = row
+                        .try_get::<String>("", "name")
+                        .unwrap_or_else(|_| "<unreadable>".into());
                     let prefix = row
                         .try_get::<String>("", "prefix")
                         .unwrap_or_else(|_| "<unreadable>".into());
@@ -137,9 +134,8 @@ impl MigrationTrait for Migration {
                 "Refusing to migrate: {} rows have is_master = true, but RBAC_MODEL.md §5 requires \
                  exactly one. This migration makes the marker engine-derived, so the unique index \
                  would reject the extra rows and leave the schema half-applied. Offending rows:\n  \
-                 {}\nDecide which key is the Master and demote the others with `UPDATE api_keys SET \
-                 is_master = false WHERE id IN (...);`, then restart. This migration will not choose \
-                 for you.",
+                 {}\nDecide which key is the Master and set is_master to false on the \
+                 others, then restart.",
                 masters.len(),
                 rows.join("\n  ")
             )));
@@ -148,15 +144,24 @@ impl MigrationTrait for Migration {
         // Index first: SQLite refuses `DROP COLUMN` on a column that participates in an index, and
         // the ordering is correct on the other two engines regardless.
         manager
-            .drop_index(Index::drop().name(MARKER_INDEX).table(ApiKeys::Table).to_owned())
+            .drop_index(
+                Index::drop()
+                    .name(MARKER_INDEX)
+                    .table(ApiKeys::Table)
+                    .to_owned(),
+            )
             .await?;
         manager
             .alter_table(
-                Table::alter().table(ApiKeys::Table).drop_column(ApiKeys::MasterMarker).to_owned(),
+                Table::alter()
+                    .table(ApiKeys::Table)
+                    .drop_column(ApiKeys::MasterMarker)
+                    .to_owned(),
             )
             .await?;
 
-        db.execute_raw(Statement::from_string(backend, Migration::add_marker_column(backend)))
+        manager
+            .alter_table(Self::add_marker_column(backend))
             .await?;
 
         // No backfill: the engine evaluates the expression for every existing row the moment the
@@ -175,15 +180,20 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let db = manager.get_connection();
-        let backend = db.get_database_backend();
-
         manager
-            .drop_index(Index::drop().name(MARKER_INDEX).table(ApiKeys::Table).to_owned())
+            .drop_index(
+                Index::drop()
+                    .name(MARKER_INDEX)
+                    .table(ApiKeys::Table)
+                    .to_owned(),
+            )
             .await?;
         manager
             .alter_table(
-                Table::alter().table(ApiKeys::Table).drop_column(ApiKeys::MasterMarker).to_owned(),
+                Table::alter()
+                    .table(ApiKeys::Table)
+                    .drop_column(ApiKeys::MasterMarker)
+                    .to_owned(),
             )
             .await?;
 
@@ -198,11 +208,15 @@ impl MigrationTrait for Migration {
                     .to_owned(),
             )
             .await?;
-        db.execute_raw(Statement::from_string(
-            backend,
-            "UPDATE api_keys SET master_marker = 'master' WHERE is_master = true".to_owned(),
-        ))
-        .await?;
+        manager
+            .exec_stmt(
+                Query::update()
+                    .table(ApiKeys::Table)
+                    .value(ApiKeys::MasterMarker, "master")
+                    .and_where(Expr::col(ApiKeys::IsMaster).eq(true))
+                    .to_owned(),
+            )
+            .await?;
         manager
             .create_index(
                 Index::create()
@@ -227,15 +241,21 @@ mod tests {
     #[test]
     fn each_backend_gets_the_only_storage_class_it_accepts() {
         assert!(
-            Migration::add_marker_column(DatabaseBackend::Postgres).ends_with("STORED"),
+            Migration::add_marker_column(DatabaseBackend::Postgres)
+                .to_string(PostgresQueryBuilder)
+                .ends_with("STORED"),
             "PostgreSQL supports only STORED generated columns before version 18"
         );
         assert!(
-            Migration::add_marker_column(DatabaseBackend::Sqlite).ends_with("VIRTUAL"),
+            Migration::add_marker_column(DatabaseBackend::Sqlite)
+                .to_string(SqliteQueryBuilder)
+                .ends_with("VIRTUAL"),
             "SQLite supports only VIRTUAL for a generated column added via ALTER TABLE"
         );
         assert!(
-            Migration::add_marker_column(DatabaseBackend::MySql).ends_with("VIRTUAL"),
+            Migration::add_marker_column(DatabaseBackend::MySql)
+                .to_string(MysqlQueryBuilder)
+                .ends_with("VIRTUAL"),
             "MySQL accepts both; VIRTUAL avoids rewriting the table"
         );
     }
@@ -244,8 +264,14 @@ mod tests {
     /// not read `is_master`, reintroduces exactly the bypass this migration exists to close.
     #[test]
     fn the_marker_is_generated_from_is_master_on_every_backend() {
-        for backend in [DatabaseBackend::Postgres, DatabaseBackend::Sqlite, DatabaseBackend::MySql] {
-            let ddl = Migration::add_marker_column(backend);
+        for backend in [
+            DatabaseBackend::Postgres,
+            DatabaseBackend::Sqlite,
+            DatabaseBackend::MySql,
+        ] {
+            let ddl =
+                sea_orm::StatementBuilder::build(&Migration::add_marker_column(backend), &backend)
+                    .sql;
             assert!(
                 ddl.contains("GENERATED ALWAYS AS") && ddl.contains("is_master"),
                 "{backend:?} marker must be generated from is_master, got: {ddl}"

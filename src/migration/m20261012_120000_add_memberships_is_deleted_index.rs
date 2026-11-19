@@ -4,7 +4,7 @@
 //! # Root cause of slow statements on global active/trash counts and listings
 //!
 //! When global counts are requested (e.g. `GET /api/ips?include_total=true` without a group filter,
-//! or trash view counts), SeaORM issues:
+//! or trash view counts), `SeaORM` issues:
 //! `SELECT COUNT(*) AS row_count FROM ip_record_group_memberships WHERE is_deleted = ?`
 //!
 //! In SQLite, partial indexes (`WHERE is_deleted = FALSE`) cannot be used when `is_deleted = ?` is

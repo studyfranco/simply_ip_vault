@@ -35,7 +35,10 @@ impl MigrationTrait for Migration {
             .alter_table(
                 Table::alter()
                     .table(WebhookExecutions::Table)
-                    .rename_column(WebhookExecutions::ErrorMessage, WebhookExecutions::ResponseBody)
+                    .rename_column(
+                        WebhookExecutions::ErrorMessage,
+                        WebhookExecutions::ResponseBody,
+                    )
                     .to_owned(),
             )
             .await
@@ -46,7 +49,10 @@ impl MigrationTrait for Migration {
             .alter_table(
                 Table::alter()
                     .table(WebhookExecutions::Table)
-                    .rename_column(WebhookExecutions::ResponseBody, WebhookExecutions::ErrorMessage)
+                    .rename_column(
+                        WebhookExecutions::ResponseBody,
+                        WebhookExecutions::ErrorMessage,
+                    )
                     .to_owned(),
             )
             .await

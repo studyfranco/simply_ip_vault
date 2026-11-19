@@ -37,6 +37,28 @@ use super::{
 // Auth Handlers
 // ─────────────────────────────────────────────────────────────
 
+/// Group-level read/write/delete capability triad.
+#[derive(Clone, Copy, Serialize)]
+pub struct GroupCapabilities {
+    /// Can read
+    pub can_read: bool,
+    /// Can write
+    pub can_write: bool,
+    /// Can delete
+    pub can_delete: bool,
+}
+
+/// Global delegated administrative scopes (shared across `/auth/me` and key summaries).
+#[derive(Clone, Copy, Default, Serialize)]
+pub struct AdminScopes {
+    /// Global key management
+    pub can_manage_keys: bool,
+    /// Global webhook management
+    pub can_manage_webhooks: bool,
+    /// Global group creation
+    pub can_create_groups: bool,
+}
+
 /// Permission payload for a group
 #[derive(Serialize)]
 pub struct MePermission {
@@ -44,12 +66,9 @@ pub struct MePermission {
     pub group_id: Uuid,
     /// Group Name
     pub group_name: String,
-    /// Can read
-    pub can_read: bool,
-    /// Can write
-    pub can_write: bool,
-    /// Can delete
-    pub can_delete: bool,
+    /// Read/write/delete capabilities
+    #[serde(flatten)]
+    pub capabilities: GroupCapabilities,
     /// May administer this group's permission rows (revoke-only authority; see `AGENT.MD` §2)
     pub can_manage: bool,
 }
@@ -65,12 +84,9 @@ pub struct MeResponse {
     pub bound_ips: Option<String>,
     /// Master status
     pub is_master: bool,
-    /// Global key management
-    pub can_manage_keys: bool,
-    /// Global webhook management
-    pub can_manage_webhooks: bool,
-    /// Global group creation
-    pub can_create_groups: bool,
+    /// Global access scopes
+    #[serde(flatten)]
+    pub scopes: AdminScopes,
     /// Granular permissions
     pub group_permissions: Vec<MePermission>,
 }
@@ -92,9 +108,11 @@ pub async fn get_me(
             group_permissions.push(MePermission {
                 group_id: p.group_id,
                 group_name: group.name,
-                can_read: p.can_read,
-                can_write: p.can_write,
-                can_delete: p.can_delete,
+                capabilities: GroupCapabilities {
+                    can_read: p.can_read,
+                    can_write: p.can_write,
+                    can_delete: p.can_delete,
+                },
                 can_manage: p.can_manage,
             });
         }
@@ -105,9 +123,11 @@ pub async fn get_me(
         name: key.name,
         bound_ips: key.bound_ips,
         is_master: key.is_master,
-        can_manage_keys: key.can_manage_keys,
-        can_manage_webhooks: key.can_manage_webhooks,
-        can_create_groups: key.can_create_groups,
+        scopes: AdminScopes {
+            can_manage_keys: key.can_manage_keys,
+            can_manage_webhooks: key.can_manage_webhooks,
+            can_create_groups: key.can_create_groups,
+        },
         group_permissions,
     }))
 }
@@ -117,8 +137,6 @@ pub async fn get_me(
 // ─────────────────────────────────────────────────────────────
 
 /// Input to update group permissions
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct GroupPermInput {
     /// Target group, by ID *or* by name (a plain string, not a strictly-typed UUID, so passing a
     /// name here doesn't trip Axum's deserialization). Provide this or `group_name`, not both.
@@ -128,18 +146,150 @@ pub struct GroupPermInput {
     /// doesn't exist yet may be auto-created (permission allowing); an unresolvable `group_id`
     /// (whether UUID- or name-shaped) is a `404` instead — an identifier is never auto-created.
     pub group_name: Option<String>,
-    /// Can read
-    pub can_read: bool,
-    /// Can write. Requires `can_read` (AGENT.MD least-privilege rule).
-    pub can_write: bool,
-    /// Can delete. Requires `can_read` (AGENT.MD least-privilege rule).
-    pub can_delete: bool,
+    /// Read/write/delete capabilities (`can_write`/`can_delete` require `can_read`).
+    pub capabilities: GroupCapabilities,
     /// May administer this group's permission rows — the resource-scoped revoke authority.
     ///
     /// Defaulted rather than required, so every client written before the column existed keeps
     /// working and its payloads mean exactly what they meant before: no administrative right.
-    #[serde(default)]
     pub can_manage: bool,
+}
+
+const GROUP_PERMISSION_FIELDS: &[&str] = &[
+    "group_id",
+    "group_name",
+    "can_read",
+    "can_write",
+    "can_delete",
+    "can_manage",
+];
+
+enum GroupPermissionField {
+    GroupId,
+    GroupName,
+    CanRead,
+    CanWrite,
+    CanDelete,
+    CanManage,
+}
+
+impl<'de> Deserialize<'de> for GroupPermissionField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct FieldVisitor;
+        impl serde::de::Visitor<'_> for FieldVisitor {
+            type Value = GroupPermissionField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a valid group permission field name")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<GroupPermissionField, E>
+            where
+                E: serde::de::Error,
+            {
+                match value {
+                    "group_id" => Ok(GroupPermissionField::GroupId),
+                    "group_name" => Ok(GroupPermissionField::GroupName),
+                    "can_read" => Ok(GroupPermissionField::CanRead),
+                    "can_write" => Ok(GroupPermissionField::CanWrite),
+                    "can_delete" => Ok(GroupPermissionField::CanDelete),
+                    "can_manage" => Ok(GroupPermissionField::CanManage),
+                    _ => Err(serde::de::Error::unknown_field(
+                        value,
+                        GROUP_PERMISSION_FIELDS,
+                    )),
+                }
+            }
+        }
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+struct GroupPermVisitor;
+
+impl<'de> serde::de::Visitor<'de> for GroupPermVisitor {
+    type Value = GroupPermInput;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("struct GroupPermInput")
+    }
+
+    fn visit_map<V>(self, mut map: V) -> Result<GroupPermInput, V::Error>
+    where
+        V: serde::de::MapAccess<'de>,
+    {
+        let mut group_id: Option<Option<String>> = None;
+        let mut group_name: Option<Option<String>> = None;
+        let mut can_read: Option<bool> = None;
+        let mut can_write: Option<bool> = None;
+        let mut can_delete: Option<bool> = None;
+        let mut can_manage: Option<bool> = None;
+
+        while let Some(field) = map.next_key()? {
+            match field {
+                GroupPermissionField::GroupId => {
+                    if group_id.is_some() {
+                        return Err(serde::de::Error::duplicate_field("group_id"));
+                    }
+                    group_id = Some(map.next_value()?);
+                }
+                GroupPermissionField::GroupName => {
+                    if group_name.is_some() {
+                        return Err(serde::de::Error::duplicate_field("group_name"));
+                    }
+                    group_name = Some(map.next_value()?);
+                }
+                GroupPermissionField::CanRead => {
+                    if can_read.is_some() {
+                        return Err(serde::de::Error::duplicate_field("can_read"));
+                    }
+                    can_read = Some(map.next_value()?);
+                }
+                GroupPermissionField::CanWrite => {
+                    if can_write.is_some() {
+                        return Err(serde::de::Error::duplicate_field("can_write"));
+                    }
+                    can_write = Some(map.next_value()?);
+                }
+                GroupPermissionField::CanDelete => {
+                    if can_delete.is_some() {
+                        return Err(serde::de::Error::duplicate_field("can_delete"));
+                    }
+                    can_delete = Some(map.next_value()?);
+                }
+                GroupPermissionField::CanManage => {
+                    if can_manage.is_some() {
+                        return Err(serde::de::Error::duplicate_field("can_manage"));
+                    }
+                    can_manage = Some(map.next_value()?);
+                }
+            }
+        }
+
+        Ok(GroupPermInput {
+            group_id: group_id.flatten(),
+            group_name: group_name.flatten(),
+            capabilities: GroupCapabilities {
+                can_read: can_read.ok_or_else(|| serde::de::Error::missing_field("can_read"))?,
+                can_write: can_write.ok_or_else(|| serde::de::Error::missing_field("can_write"))?,
+                can_delete: can_delete
+                    .ok_or_else(|| serde::de::Error::missing_field("can_delete"))?,
+            },
+            can_manage: can_manage.unwrap_or(false),
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for GroupPermInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_struct("GroupPermInput", GROUP_PERMISSION_FIELDS, GroupPermVisitor)
+    }
 }
 
 /// Payload for creating an API Key.
@@ -221,7 +371,7 @@ pub async fn create_api_key(
     if let Some(bips) = &payload.bound_ips {
         for cidr in bips.split(',') {
             let _: IpNet = super::support::parse_cidr_or_ip(cidr)
-                .map_err(|_| AppError::InvalidInput(format!("Invalid CIDR: {}", cidr)))?;
+                .map_err(|()| AppError::InvalidInput(format!("Invalid CIDR: {cidr}")))?;
         }
     }
 
@@ -317,15 +467,9 @@ pub struct ApiKeySummary {
     /// Master flag. Full view only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_master: Option<bool>,
-    /// Global key management scope. Full view only.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub can_manage_keys: Option<bool>,
-    /// Global webhook management scope. Full view only.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub can_manage_webhooks: Option<bool>,
-    /// Global group creation scope. Full view only.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub can_create_groups: Option<bool>,
+    /// Delegated scopes, present only in the full view.
+    #[serde(flatten)]
+    pub scopes: Option<AdminScopes>,
     /// The key that created this one. Full view only, and carries no authority (R3).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_key_id: Option<Uuid>,
@@ -338,6 +482,7 @@ pub struct ApiKeySummary {
 }
 
 /// The `"full"` view: everything about a key except its secrets.
+#[must_use]
 pub fn build_full_api_key_summary(
     k: api_key::Model,
     group_permissions: Vec<MePermission>,
@@ -349,9 +494,11 @@ pub fn build_full_api_key_summary(
         prefix: Some(k.prefix),
         bound_ips: k.bound_ips,
         is_master: Some(k.is_master),
-        can_manage_keys: Some(k.can_manage_keys),
-        can_manage_webhooks: Some(k.can_manage_webhooks),
-        can_create_groups: Some(k.can_create_groups),
+        scopes: Some(AdminScopes {
+            can_manage_keys: k.can_manage_keys,
+            can_manage_webhooks: k.can_manage_webhooks,
+            can_create_groups: k.can_create_groups,
+        }),
         parent_key_id: k.parent_key_id,
         created_at: Some(k.created_at),
         group_permissions,
@@ -370,9 +517,7 @@ pub(crate) fn build_minimal_api_key_summary(
         prefix: None,
         bound_ips: None,
         is_master: None,
-        can_manage_keys: None,
-        can_manage_webhooks: None,
-        can_create_groups: None,
+        scopes: None,
         parent_key_id: None,
         created_at: None,
         group_permissions,
@@ -388,21 +533,14 @@ pub(crate) async fn full_api_key_summary(
     Ok(build_full_api_key_summary(k, group_permissions))
 }
 
-/// The `"minimal"` view: id, name, and this key's rights on `visible_groups` and nothing else.
-#[allow(dead_code)]
-pub(crate) async fn minimal_api_key_summary(
-    db: &sea_orm::DatabaseConnection,
-    k: api_key::Model,
-    visible_groups: &[Uuid],
-) -> Result<ApiKeySummary, AppError> {
-    let group_permissions = key_group_permissions(db, k.id, Some(visible_groups)).await?;
-    Ok(build_minimal_api_key_summary(k, group_permissions))
-}
-
 /// One key's permission rows, optionally narrowed to a set of groups.
 ///
 /// `Some(&[])` is a meaningful argument and returns nothing — a caller that manages no groups sees no
 /// shared rows, which is different from `None` ("no filter, return everything").
+///
+/// # Errors
+///
+/// Returns [`AppError`] if the database query fails.
 pub async fn key_group_permissions(
     db: &sea_orm::DatabaseConnection,
     key_id: Uuid,
@@ -413,6 +551,10 @@ pub async fn key_group_permissions(
 }
 
 /// Batch-fetches permission rows for multiple keys, eliminating N+1 queries.
+///
+/// # Errors
+///
+/// Returns [`AppError`] if the database query fails.
 pub async fn batch_key_group_permissions(
     db: &sea_orm::DatabaseConnection,
     key_ids: &[Uuid],
@@ -441,9 +583,11 @@ pub async fn batch_key_group_permissions(
             map.entry(p.api_key_id).or_default().push(MePermission {
                 group_id: p.group_id,
                 group_name: group.name,
-                can_read: p.can_read,
-                can_write: p.can_write,
-                can_delete: p.can_delete,
+                capabilities: GroupCapabilities {
+                    can_read: p.can_read,
+                    can_write: p.can_write,
+                    can_delete: p.can_delete,
+                },
                 can_manage: p.can_manage,
             });
         }
@@ -824,51 +968,19 @@ pub(crate) async fn inventory_owned_entities(
 /// The subtree is resolved through [`find_administrable_key`], so a caller can only ever delete inside
 /// its own subtree (§4). The caller itself, and the master, are refused explicitly rather than left to
 /// the subtree walk: a caller is the root of its own subtree, and the master is in nobody's.
-pub async fn delete_api_key(
-    State(state): State<AppState>,
-    Extension(key): Extension<api_key::Model>,
-    Extension(client_ip): Extension<ClientIp>,
-    StrictPath(id): StrictPath<Uuid>,
-    // `OptionalStrictJson` rather than `Json<T>`: `DELETE` has always been callable with no body at
-    // all, and every existing client calls it that way — an empty body means "no resolutions", which
-    // is exactly the request that gets the inventory back. See [`crate::extract::OptionalStrictJson`]
-    // for why this is a type rather than a `Bytes` parameter parsed by hand, which is what it
-    // replaced.
-    OptionalStrictJson(payload): OptionalStrictJson<DeleteKeyPayload>,
-) -> Result<impl IntoResponse, AppError> {
-    if !key.is_master && !key.can_manage_keys {
-        return Err(AppError::Forbidden("Permission denied".to_owned()));
-    }
-
-    if id == key.id {
-        return Err(AppError::Forbidden("Cannot delete yourself".to_owned()));
-    }
-
-    let target = find_administrable_key(&state.db, &key, id).await?;
-    guard_master_target(&key, &target)?;
-    guard_master_immutable(&target, "deleted")?;
-    let target_ref = format_key_reference(&target.name, id);
-
-    let subtree: Vec<Uuid> = collect_key_subtree(&state.db, id)
-        .await?
-        .into_iter()
-        .collect();
-    // A cycle in `parent_key_id` (only reachable through direct database edits — the API always sets
-    // the parent to a key that already exists) could otherwise put the caller inside the subtree of a
-    // key it is deleting, and take its own credential with it.
-    if subtree.contains(&key.id) {
-        return Err(AppError::Conflict(
-            "Refusing to delete: the subtree of this key contains your own key, which indicates a              cycle in parent_key_id. Resolve it directly in the database."
-                .to_owned(),
-        ));
-    }
-
-    let inventory = inventory_owned_entities(&state.db, &subtree).await?;
-
-    if !inventory.is_empty() && payload.resolutions.is_empty() {
+async fn resolve_delete_resolutions<'a>(
+    db: &sea_orm::DatabaseConnection,
+    target_ref: &str,
+    subtree: &[Uuid],
+    inventory: &[OwnedEntity],
+    entries: &'a [ResolutionEntry],
+) -> Result<std::collections::HashMap<(String, Uuid), &'a Resolution>, AppError> {
+    if !inventory.is_empty() && entries.is_empty() {
         return Err(AppError::ConflictWithDetails {
             message: format!(
-                "Refusing to delete {target_ref}: {} owned entit{} in its subtree need an explicit                  resolution. Resubmit this request with a `resolutions` array assigning each one                  either {{\"action\":\"delete\"}} or {{\"action\":\"reassign\",\"owner_key_id\":\"…\"}}.",
+                "Refusing to delete {target_ref}: {} owned entit{} in its subtree need an explicit \
+                 resolution. Resubmit this request with a `resolutions` array assigning each one \
+                 either {{\"action\":\"delete\"}} or {{\"action\":\"reassign\",\"owner_key_id\":\"…\"}}.",
                 inventory.len(),
                 if inventory.len() == 1 { "y" } else { "ies" }
             ),
@@ -879,11 +991,9 @@ pub async fn delete_api_key(
         });
     }
 
-    // Every inventoried entity, exactly once, and nothing else. Checked before a single write, so a
-    // rejected map leaves the installation untouched.
     let mut resolutions: std::collections::HashMap<(String, Uuid), &Resolution> =
         std::collections::HashMap::new();
-    for entry in &payload.resolutions {
+    for entry in entries {
         if resolutions
             .insert((entry.entity_type.clone(), entry.id), &entry.resolution)
             .is_some()
@@ -902,7 +1012,8 @@ pub async fn delete_api_key(
     if !missing.is_empty() {
         return Err(AppError::ConflictWithDetails {
             message: format!(
-                "Refusing to delete {target_ref}: the resolution map is incomplete — {} entit{}                  unresolved. Partial maps are not applied.",
+                "Refusing to delete {target_ref}: the resolution map is incomplete — {} entit{} \
+                 unresolved. Partial maps are not applied.",
                 missing.len(),
                 if missing.len() == 1 {
                     "y is"
@@ -925,34 +1036,38 @@ pub async fn delete_api_key(
         )));
     }
 
-    // Validate every reassignment target before applying any of them. Reassigning to a key inside the
-    // doomed subtree is refused specifically: it looks like a rescue and is a delayed deletion.
     let doomed: std::collections::HashSet<Uuid> = subtree.iter().copied().collect();
     for resolution in resolutions.values() {
         if let Resolution::Reassign { owner_key_id } = resolution {
-            resolve_owner_assignment(&state.db, Some(*owner_key_id)).await?;
+            resolve_owner_assignment(db, Some(*owner_key_id)).await?;
             if doomed.contains(owner_key_id) {
                 return Err(AppError::InvalidInput(format!(
-                    "Cannot reassign to key {owner_key_id}: it is itself inside the subtree being                      deleted, so the entity would be orphaned the moment this request completes"
+                    "Cannot reassign to key {owner_key_id}: it is itself inside the subtree being \
+                     deleted, so the entity would be orphaned the moment this request completes"
                 )));
             }
         }
     }
 
-    // Everything below this line writes. Every validation is above it.
+    Ok(resolutions)
+}
+
+async fn apply_delete_resolutions(
+    db: &sea_orm::DatabaseConnection,
+    inventory: &[OwnedEntity],
+    resolutions: &std::collections::HashMap<(String, Uuid), &Resolution>,
+) -> Result<(usize, usize), AppError> {
     let mut deleted_entities = 0usize;
     let mut reassigned_entities = 0usize;
-    for entity in &inventory {
+    for entity in inventory {
         let resolution = resolutions[&(entity.entity_type.to_owned(), entity.id)];
         match (entity.entity_type, resolution) {
             ("group", Resolution::Delete) => {
-                IpGroup::delete_by_id(entity.id).exec(&state.db).await?;
+                IpGroup::delete_by_id(entity.id).exec(db).await?;
                 deleted_entities += 1;
             }
             ("webhook", Resolution::Delete) => {
-                WebhookConfig::delete_by_id(entity.id)
-                    .exec(&state.db)
-                    .await?;
+                WebhookConfig::delete_by_id(entity.id).exec(db).await?;
                 deleted_entities += 1;
             }
             ("group", Resolution::Reassign { owner_key_id }) => {
@@ -962,7 +1077,7 @@ pub async fn delete_api_key(
                         sea_orm::sea_query::Expr::value(Some(*owner_key_id)),
                     )
                     .filter(ip_group::Column::Id.eq(entity.id))
-                    .exec(&state.db)
+                    .exec(db)
                     .await?;
                 reassigned_entities += 1;
             }
@@ -973,20 +1088,63 @@ pub async fn delete_api_key(
                         sea_orm::sea_query::Expr::value(Some(*owner_key_id)),
                     )
                     .filter(webhook_config::Column::Id.eq(entity.id))
-                    .exec(&state.db)
+                    .exec(db)
                     .await?;
                 reassigned_entities += 1;
             }
-            // `entity_type` is set by `inventory_owned_entities` from a closed set of two literals.
             (other, _) => {
                 tracing::error!("Unhandled inventory entity type {other:?}");
                 return Err(AppError::Internal);
             }
         }
     }
+    Ok((deleted_entities, reassigned_entities))
+}
 
-    // The cascade itself. `api_key_group_permissions` rows follow by foreign key; nothing else does,
-    // which is the point.
+pub async fn delete_api_key(
+    State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
+    StrictPath(id): StrictPath<Uuid>,
+    OptionalStrictJson(payload): OptionalStrictJson<DeleteKeyPayload>,
+) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master && !key.can_manage_keys {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
+    }
+
+    if id == key.id {
+        return Err(AppError::Forbidden("Cannot delete yourself".to_owned()));
+    }
+
+    let target = find_administrable_key(&state.db, &key, id).await?;
+    guard_master_target(&key, &target)?;
+    guard_master_immutable(&target, "deleted")?;
+    let target_ref = format_key_reference(&target.name, id);
+
+    let subtree: Vec<Uuid> = collect_key_subtree(&state.db, id)
+        .await?
+        .into_iter()
+        .collect();
+    if subtree.contains(&key.id) {
+        return Err(AppError::Conflict(
+            "Refusing to delete: the subtree of this key contains your own key, which indicates a \
+             cycle in parent_key_id. Resolve it directly in the database."
+                .to_owned(),
+        ));
+    }
+
+    let inventory = inventory_owned_entities(&state.db, &subtree).await?;
+    let resolutions = resolve_delete_resolutions(
+        &state.db,
+        &target_ref,
+        &subtree,
+        &inventory,
+        &payload.resolutions,
+    )
+    .await?;
+    let (deleted_entities, reassigned_entities) =
+        apply_delete_resolutions(&state.db, &inventory, &resolutions).await?;
+
     let result = ApiKey::delete_many()
         .filter(api_key::Column::Id.is_in(subtree.clone()))
         .exec(&state.db)
@@ -1098,7 +1256,7 @@ pub async fn update_api_key(
     if let Some(bips) = &payload.bound_ips {
         for cidr in bips.split(',') {
             let _: IpNet = super::support::parse_cidr_or_ip(cidr)
-                .map_err(|_| AppError::InvalidInput(format!("Invalid CIDR: {cidr}")))?;
+                .map_err(|()| AppError::InvalidInput(format!("Invalid CIDR: {cidr}")))?;
         }
     }
 
@@ -1308,7 +1466,9 @@ pub async fn update_key_group_permissions(
     // exactly what the per-verb check refuses — so the block only stopped a manager from dropping
     // its own access, which is the one self-directed change nobody needs protecting from.
 
-    if (payload.can_write || payload.can_delete) && !payload.can_read {
+    if (payload.capabilities.can_write || payload.capabilities.can_delete)
+        && !payload.capabilities.can_read
+    {
         return Err(AppError::InvalidInput(
             "can_write or can_delete require can_read to be true".to_owned(),
         ));
@@ -1380,9 +1540,9 @@ pub async fn update_key_group_permissions(
         id: Set(Uuid::new_v4()),
         api_key_id: Set(id),
         group_id: Set(target_group_id),
-        can_read: Set(payload.can_read),
-        can_write: Set(payload.can_write),
-        can_delete: Set(payload.can_delete),
+        can_read: Set(payload.capabilities.can_read),
+        can_write: Set(payload.capabilities.can_write),
+        can_delete: Set(payload.capabilities.can_delete),
         can_manage: Set(payload.can_manage),
         created_at: Set(now),
     };
@@ -1421,7 +1581,7 @@ pub async fn update_key_group_permissions(
     Ok(axum::http::StatusCode::OK)
 }
 
-/// Handles DELETE /api/v1/keys/:id/permissions/:group_identifier — removes a key's permission
+/// Handles `DELETE /api/v1/keys/:id/permissions/:group_identifier` — removes a key's permission
 /// mapping for a specific group. `group_identifier` may be either the group's UUID or its name.
 ///
 /// # Managing the group is the whole authority test

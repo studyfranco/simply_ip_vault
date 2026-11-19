@@ -1,9 +1,9 @@
 //! Application errors
 
 use axum::{
+    Json,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde_json::json;
 use thiserror::Error;
@@ -87,7 +87,7 @@ pub enum AppError {
 /// `deadlock_detected`. SQLite's side is not a fixed string: `sqlx`'s SQLite driver reports the
 /// *extended* result code, not the primary one — a stale-snapshot write conflict under WAL (the
 /// shape [`crate::api::handle_ip_upsert`]'s own `Immediate`-transaction comment describes) comes
-/// back as `"517"` (`SQLITE_BUSY_SNAPSHOT`), not `"5"` (plain `SQLITE_BUSY`); a busy_timeout
+/// back as `"517"` (`SQLITE_BUSY_SNAPSHOT`), not `"5"` (plain `SQLITE_BUSY`); a `busy_timeout`
 /// exhausted while waiting on the write lock is `"773"` (`SQLITE_BUSY_TIMEOUT`). All of them share
 /// the same low byte as their primary code — SQLite's extended codes are always
 /// `primary | (variant << 8)` — so masking with `& 0xFF` and checking for `5`
@@ -98,15 +98,19 @@ fn is_transient_lock_error(err: &sea_orm::DbErr) -> bool {
     if matches!(err, sea_orm::DbErr::ConnectionAcquire(_)) {
         return true;
     }
-    let runtime_err = match err {
-        sea_orm::DbErr::Conn(e) | sea_orm::DbErr::Exec(e) | sea_orm::DbErr::Query(e) => e,
-        _ => return false,
+    let (sea_orm::DbErr::Conn(runtime_err)
+    | sea_orm::DbErr::Exec(runtime_err)
+    | sea_orm::DbErr::Query(runtime_err)) = err
+    else {
+        return false;
     };
-    let sea_orm::RuntimeErr::SqlxError(sqlx_err) = runtime_err else { return false };
+    let sea_orm::RuntimeErr::SqlxError(sqlx_err) = runtime_err else {
+        return false;
+    };
     match sqlx_err.as_ref() {
         sea_orm::SqlxError::PoolTimedOut => true,
         sea_orm::SqlxError::Database(db_err) => match db_err.code().as_deref() {
-            Some("55P03") | Some("40001") | Some("40P01") => true,
+            Some("55P03" | "40001" | "40P01") => true,
             Some(code) => code.parse::<u32>().is_ok_and(|n| matches!(n & 0xFF, 5 | 6)),
             None => false,
         },
@@ -138,7 +142,10 @@ impl IntoResponse for AppError {
                         "Database busy or query timeout, please retry".to_string(),
                     )
                 } else {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "Internal database error".to_string())
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Internal database error".to_string(),
+                    )
                 }
             }
             AppError::InvalidInput(msg) => (StatusCode::BAD_REQUEST, msg),
@@ -149,7 +156,10 @@ impl IntoResponse for AppError {
             // Returned above; repeated here only because the match must stay exhaustive.
             AppError::ConflictWithDetails { message, .. } => (StatusCode::CONFLICT, message),
             AppError::BodyRejected(status, msg) => (status, msg),
-            AppError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "An internal server error occurred".to_string()),
+            AppError::Internal => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "An internal server error occurred".to_string(),
+            ),
         };
 
         let body = Json(json!({
@@ -177,7 +187,7 @@ mod tests {
     ///
     /// Deliberately built from the same production helpers ([`crate::db::run_migrations_isolated`],
     /// [`crate::db::connect`]) every other concurrency test in this suite uses, rather than
-    /// hand-rolled connection options — this is the busy_timeout/WAL configuration a real deployment
+    /// hand-rolled connection options — this is the `busy_timeout/WAL` configuration a real deployment
     /// actually runs with, not a synthetic stand-in for it.
     #[tokio::test]
     async fn genuine_sqlite_busy_is_recognized_as_transient_and_maps_to_503() {
@@ -190,13 +200,17 @@ mod tests {
         // A plain (deferred) transaction; the SELECT below is its first statement and pins the
         // snapshot it will see for the rest of its life.
         let txn = db.begin().await.unwrap();
-        let _ = crate::entities::ip_group::Entity::find().all(&txn).await.unwrap();
+        let _ = crate::entities::ip_group::Entity::find()
+            .all(&txn)
+            .await
+            .unwrap();
 
         // A concurrent commit on a *different* pooled connection, advancing the database past the
         // snapshot `txn` already pinned.
         crate::entities::ip_group::ActiveModel {
             id: Set(uuid::Uuid::new_v4()),
             name: Set("busy-test-outside".to_owned()),
+            allow_private_ips: Set(false),
             group_type: Set("banlist".to_owned()),
             owner_key_id: Set(None),
             description: Set(None),
@@ -210,6 +224,7 @@ mod tests {
         let result = crate::entities::ip_group::ActiveModel {
             id: Set(uuid::Uuid::new_v4()),
             name: Set("busy-test-inside".to_owned()),
+            allow_private_ips: Set(false),
             group_type: Set("banlist".to_owned()),
             owner_key_id: Set(None),
             description: Set(None),
@@ -219,7 +234,10 @@ mod tests {
         .await;
 
         let err = result.expect_err("txn must be refused — its snapshot went stale under it");
-        assert!(is_transient_lock_error(&err), "expected a recognized transient lock error, got: {err:?}");
+        assert!(
+            is_transient_lock_error(&err),
+            "expected a recognized transient lock error, got: {err:?}"
+        );
 
         let app_err = AppError::from(err);
         let response = app_err.into_response();
@@ -241,15 +259,22 @@ mod tests {
         let make = || crate::entities::ip_group::ActiveModel {
             id: Set(id),
             name: Set("dup-name-test".to_owned()),
+            allow_private_ips: Set(false),
             group_type: Set("banlist".to_owned()),
             owner_key_id: Set(None),
             description: Set(None),
             created_at: Set(chrono::Utc::now().naive_utc()),
         };
         make().insert(&db).await.unwrap();
-        let err = make().insert(&db).await.expect_err("inserting the same id twice must violate the primary key");
+        let err = make()
+            .insert(&db)
+            .await
+            .expect_err("inserting the same id twice must violate the primary key");
 
-        assert!(!is_transient_lock_error(&err), "a unique-constraint violation must not be classified as transient: {err:?}");
+        assert!(
+            !is_transient_lock_error(&err),
+            "a unique-constraint violation must not be classified as transient: {err:?}"
+        );
         let response = AppError::from(err).into_response();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }

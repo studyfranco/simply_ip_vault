@@ -8,6 +8,33 @@
 > compile at the start of this session (see Finding 0 below), and several real gaps existed. This
 > file replaces the previous notes with an honest, current record of what was found and fixed.
 
+## 2026-11-19 — Chantiers 3 and 5A
+
+- Moved group, webhook, and group-rights forms into dialogs above their tables. Group editing uses the
+  existing PUT contract, which keeps the group type fixed. Banlist controls expose private ranges
+  and whitelist exclusions. Group ownership changes use the Master-only owner endpoint.
+- Audited the single and batch ban fixtures. Existing success cases already use public ranges.
+  Section 39 covers private-range policy, whitelist validation, overlap, batch skipping, and
+  soft-delete and group-delete behavior through the live API.
+
+## 2026-11-18 — Zero-allow Clippy and Wave 3A verification
+
+- Split request validation, database query stages, migrations, and integration-test fixtures into
+  smaller functions. Kept the order of authorization checks and database operations. Flattened
+  the optional administrative scopes in key summaries to preserve their JSON shape.
+- Matched the migration crate's database drivers to SeaORM's enabled drivers. The manifest
+  enables Pedantic and forbids unsafe Rust. The two SeaORM models with four Boolean fields
+  retain the documented Clippy expectation.
+- Extended `tests/source_hygiene.rs` using the firewall rules manager and IP exporter suites as
+  references. The vault-specific checks cover bound index catalog queries, browser request and
+  signing bases, and key writes through `apiFetch`.
+- Verified webhook credential storage and legacy reads, JSON placeholder escaping, address
+  filtering, and audit-log retention through the Rust tests. Updated the toast position and the
+  signing-secret modal label. The working copy of `scripts/test_e2e.sh` retained its original
+  SHA-256 checksum.
+- Warmed both key-listing benchmark paths and alternated measurements before comparing their
+  medians. The benchmark still requires batched loading to beat per-key queries.
+
 ## 2026-07-26 — Audit Plan (written before any fix was applied)
 
 ### Confirmed via direct code inspection
@@ -10100,3 +10127,27 @@ pin fix is.
     skipping the `ip_groups` and `ip_record_causes` queries when projecting a page.
 
 
+## Chantier 1 — typed database statements
+
+- The source-hygiene test scans all Rust sources under `src/`, including migrations and inline tests.
+  Startup index checks use SeaORM's schema manager, and the historical backfills use SeaQuery
+  identifiers for the schemas they actually run against.
+- SQLx sets SQLite session options on every connection. Scheduled maintenance opens a short-lived
+  connection to the same file and uses SQLx's pragma options. Legacy files created in auto-vacuum
+  mode NONE keep that mode until the operator performs an offline vacuum. Fresh files use
+  INCREMENTAL.
+- The additive migration widens the remaining VARCHAR columns to TEXT on PostgreSQL and MySQL.
+  SQLite keeps its existing tables and data. Rolling back the widening preserves the wider types
+  so values written after the upgrade keep fitting.
+- Verification passed with `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, and
+  `cargo test`. The test run had 422 passes, zero failures, and one ignored large backfill benchmark.
+  It covered fresh and populated SQLite migrations, WAL reconnection, and scheduled maintenance.
+  The existing MySQL migration history includes conditional index drops that SeaQuery rejects.
+
+## Chantier 2 — Banlist group policy
+
+Added the private-range opt-in and banlist-to-whitelist exclusion links in an additive SeaORM
+migration. Group updates apply metadata, exclusion replacement, and auditing in one transaction.
+Ban, batch, and restore check policy within their write transactions and compare protected CIDRs
+with both input and stored CIDRs. SQLite uses immediate transactions for these read-before-write
+operations. Batch full replacement treats excluded entries as omissions under its existing lock rules.

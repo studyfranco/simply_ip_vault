@@ -2,7 +2,7 @@
 //! `$target_address` and `$ip` expand to the `/48`-normalized IPv6 subnet or keep the full original
 //! address.
 //!
-//! Default is `false` (full address preserved) so reporting/sync receivers such as AbuseIPDB
+//! Default is `false` (full address preserved) so reporting/sync receivers such as `AbuseIPDB`
 //! continue receiving exact host IPv6 addresses without breaking existing configurations, while
 //! firewall execution webhooks (e.g., `launch.block.ip`) can explicitly opt in to receiving the
 //! `/48`-normalized network for bare host IPv6 bans.

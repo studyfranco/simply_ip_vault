@@ -54,7 +54,6 @@ pub(crate) async fn caller_group_permission(
         .map_err(AppError::DbError)
 }
 
-
 /// The `owner_key_id` to record when `creator` creates a resource.
 ///
 /// `None` for a master, matching what `create_ip_group` already did for permission rows: a master is
@@ -65,7 +64,6 @@ pub(crate) async fn caller_group_permission(
 pub(crate) fn resource_owner(creator: &api_key::Model) -> Option<Uuid> {
     (!creator.is_master).then_some(creator.id)
 }
-
 
 /// **§3 — lifecycle authority.** Deleting or renaming a resource is restricted to the Master and the
 /// designated `owner_key_id`, and to nobody else.
@@ -103,7 +101,6 @@ pub(crate) fn guard_resource_lifecycle(
     )))
 }
 
-
 /// Validates an `owner_key_id` a caller asked to assign, and returns it ready to store.
 ///
 /// No database-level foreign key backs these columns (SQLite has no `ALTER TABLE … ADD CONSTRAINT`;
@@ -134,7 +131,6 @@ pub(crate) async fn resolve_owner_assignment(
 
     Ok(Some(owner_id))
 }
-
 
 /// **R2 — management of a resource is a conjunction.** The single authority test for touching *any*
 /// key's permissions on one group, in either direction.
@@ -189,7 +185,6 @@ pub(crate) fn guard_group_manage(
     )))
 }
 
-
 /// Whether the caller holds a `can_manage` row on **any** group.
 ///
 /// A cheap pre-gate, run before any group is resolved so that a caller with no administrative
@@ -213,7 +208,6 @@ pub(crate) async fn holds_any_group_manage(
         .map_err(AppError::DbError)
 }
 
-
 /// The pre-gate both permission-administration endpoints run before touching any group.
 ///
 /// Both halves of R2 are checked here in their group-independent form — `can_manage_keys` costs
@@ -235,7 +229,6 @@ pub(crate) async fn guard_may_administer_any_group(
     Err(AppError::Forbidden("Permission denied".to_owned()))
 }
 
-
 /// Whether `requested` would give the target any verb it does not already hold.
 ///
 /// This is the question that decides **which gate applies** to an update, and it is deliberately
@@ -253,12 +246,11 @@ pub(crate) fn widens_permissions(
     let Some(held) = target_perm else {
         return true;
     };
-    (requested.can_read && !held.can_read)
-        || (requested.can_write && !held.can_write)
-        || (requested.can_delete && !held.can_delete)
+    (requested.capabilities.can_read && !held.can_read)
+        || (requested.capabilities.can_write && !held.can_write)
+        || (requested.capabilities.can_delete && !held.can_delete)
         || (requested.can_manage && !held.can_manage)
 }
-
 
 /// **R1 + R7 — granting is bounded by non-amplification on top of the R2 conjunction.**
 ///
@@ -300,9 +292,9 @@ pub(crate) fn guard_delegated_group_grant(
         )));
     };
 
-    let over_grants = (requested.can_read && !held.can_read)
-        || (requested.can_write && !held.can_write)
-        || (requested.can_delete && !held.can_delete)
+    let over_grants = (requested.capabilities.can_read && !held.can_read)
+        || (requested.capabilities.can_write && !held.can_write)
+        || (requested.capabilities.can_delete && !held.can_delete)
         // `can_manage` is a verb like any other here: a caller may only confer the administrative
         // right over a group if it holds that right itself. Redundant against the R2 gate as written
         // — a non-master reaching this line necessarily holds `can_manage` — and kept because R1
@@ -330,7 +322,6 @@ pub(crate) fn guard_delegated_group_grant(
 
     Ok(())
 }
-
 
 /// **R4 — only Master creates parents.** Every global scope, and only a master key may hand any of
 /// them out.
@@ -361,9 +352,11 @@ pub(crate) fn guard_delegated_group_grant(
 ///
 /// Because every global scope is now master-only, R1's "may only grant rights it currently holds"
 /// is satisfied for globals by the strictly stronger R4: a non-master grants none of them at all.
-pub(crate) const MASTER_ONLY_SCOPES: [&str; 3] =
-    ["can_manage_keys", "can_create_groups", "can_manage_webhooks"];
-
+pub(crate) const MASTER_ONLY_SCOPES: [&str; 3] = [
+    "can_manage_keys",
+    "can_create_groups",
+    "can_manage_webhooks",
+];
 
 /// Rejects any attempt by a non-master to grant one of [`MASTER_ONLY_SCOPES`].
 ///
@@ -379,8 +372,10 @@ pub(crate) fn guard_scope_elevation(
         return Ok(());
     }
 
-    for ((request, current), name) in
-        requested.iter().zip(held.iter()).zip(MASTER_ONLY_SCOPES.iter())
+    for ((request, current), name) in requested
+        .iter()
+        .zip(held.iter())
+        .zip(MASTER_ONLY_SCOPES.iter())
     {
         if *request == Some(true) && !*current {
             tracing::warn!(
@@ -396,8 +391,10 @@ pub(crate) fn guard_scope_elevation(
     Ok(())
 }
 
-
-pub(crate) fn guard_master_target(caller: &api_key::Model, target: &api_key::Model) -> Result<(), AppError> {
+pub(crate) fn guard_master_target(
+    caller: &api_key::Model,
+    target: &api_key::Model,
+) -> Result<(), AppError> {
     if target.is_master && !caller.is_master {
         tracing::warn!(
             "Blocked privilege escalation: key {} (master=false) attempted to operate on master key {}",
@@ -410,7 +407,6 @@ pub(crate) fn guard_master_target(caller: &api_key::Model, target: &api_key::Mod
     }
     Ok(())
 }
-
 
 /// The refusal `RBAC_MODEL.md` §5 requires for every API operation on the Master key that is not an
 /// edit of its own `bound_ips`.
@@ -439,7 +435,10 @@ pub(crate) fn guard_master_target(caller: &api_key::Model, target: &api_key::Mod
 /// entirely: delete the row directly in the database and the service re-mints at next boot
 /// (`bootstrap_master_key`). That is a deliberate trade of convenience for a smaller blast radius,
 /// and it requires database access, which an HTTP-only compromise does not have.
-pub(crate) fn guard_master_immutable(target: &api_key::Model, operation: &str) -> Result<(), AppError> {
+pub(crate) fn guard_master_immutable(
+    target: &api_key::Model,
+    operation: &str,
+) -> Result<(), AppError> {
     if !target.is_master {
         return Ok(());
     }

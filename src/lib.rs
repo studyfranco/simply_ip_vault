@@ -1,4 +1,3 @@
-#![warn(missing_docs)]
 //! Simply IP Vault Library
 //! This module provides the core API router, state, and webhook logic.
 
@@ -86,17 +85,28 @@ pub fn create_app(state: AppState) -> Router {
         .route("/keys/{id}/groups", post(api::update_key_group_permissions))
         // `/permissions` is the same assignment handler as `/groups` under a name that matches
         // the new revoke route below; `/groups` is kept working for backward compatibility.
-        .route("/keys/{id}/permissions", post(api::update_key_group_permissions))
-        .route("/keys/{id}/permissions/{group_identifier}", delete(api::revoke_key_group_permission))
+        .route(
+            "/keys/{id}/permissions",
+            post(api::update_key_group_permissions),
+        )
+        .route(
+            "/keys/{id}/permissions/{group_identifier}",
+            delete(api::revoke_key_group_permission),
+        )
         .route("/groups", post(api::create_ip_group))
         .route("/groups", get(api::list_ip_groups))
-        .route("/groups/{id}", delete(api::delete_ip_group))
+        .route(
+            "/groups/{id}",
+            put(api::update_ip_group).delete(api::delete_ip_group),
+        )
         .route("/ip_groups", post(api::create_ip_group))
         .route("/ip_groups", get(api::list_ip_groups))
-        .route("/ip_groups/{id}", delete(api::delete_ip_group))
+        .route(
+            "/ip_groups/{id}",
+            put(api::update_ip_group).delete(api::delete_ip_group),
+        )
         // Ownership reassignment, master-only (RBAC_MODEL.md §3). Separate routes rather than a
-        // field on the update payloads: `ip_groups` has no update endpoint at all, and folding a
-        // master-only field into a delegable one invites a guard that checks the wrong thing.
+        // field on the group update payload, which the group owner can submit.
         .route("/groups/{id}/owner", put(api::reassign_group_owner))
         .route("/ip_groups/{id}/owner", put(api::reassign_group_owner))
         .route("/webhooks", post(api::create_webhook))
@@ -105,13 +115,19 @@ pub fn create_app(state: AppState) -> Router {
         // already prefers a literal segment over a path parameter at the same position regardless
         // of registration order, so `executions` can never be swallowed by `{id}`.
         .route("/webhooks/executions", get(api::list_webhook_executions))
-        .route("/webhooks/executions/{id}", delete(api::delete_webhook_execution))
+        .route(
+            "/webhooks/executions/{id}",
+            delete(api::delete_webhook_execution),
+        )
         .route("/webhooks/{id}", put(api::update_webhook))
         .route("/webhooks/{id}", delete(api::delete_webhook))
         .route("/webhooks/{id}/owner", put(api::reassign_webhook_owner))
         .route("/webhooks/{id}/test", post(api::test_webhook))
         .route("/webhooks/{id}/clone", post(api::clone_webhook))
-        .route("/settings", get(api::get_settings).put(api::update_settings))
+        .route(
+            "/settings",
+            get(api::get_settings).put(api::update_settings),
+        )
         .route("/audit-logs", get(api::list_audit_logs))
         .route("/stats/analytics", get(api::get_analytics))
         .route("/stats/intersection", get(api::get_intersection))
@@ -154,26 +170,34 @@ pub fn create_app(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Helper to create AppState and background worker.
+/// Helper to create `AppState` and background worker.
 ///
 /// Fails when a security-relevant environment variable is malformed — a bad `VAULT_ENCRYPTION_KEY`
 /// (see [`crypto::SecretCipher::from_env`]) or a bad `TRUSTED_PROXIES` entry (see
 /// [`config::TrustedProxies::from_env`]). Neither is recoverable: the first would write signing
 /// secrets in the clear for an operator who believes they are encrypted, and the second would apply
 /// a trust boundary different from the one they configured.
+///
+/// # Errors
+///
+/// Returns an error if the runtime security configuration is invalid.
 pub fn setup_state(
     db: DatabaseConnection,
 ) -> Result<
-    (AppState, mpsc::Sender<WebhookEvent>, tokio::task::JoinHandle<()>),
+    (
+        AppState,
+        mpsc::Sender<WebhookEvent>,
+        tokio::task::JoinHandle<()>,
+    ),
     state::StartupConfigError,
 > {
     let (tx, rx) = mpsc::channel::<WebhookEvent>(config::webhook_queue_capacity());
     let db_worker = db.clone();
-    let worker_handle = tokio::spawn(async move {
-        dispatch::run_webhook_worker(db_worker, rx).await;
-    });
-
     let state = AppState::new(db, tx.clone())?;
+    let worker_cipher = state.cipher.clone();
+    let worker_handle = tokio::spawn(async move {
+        dispatch::run_webhook_worker_with_cipher(db_worker, worker_cipher, rx).await;
+    });
 
     Ok((state, tx, worker_handle))
 }

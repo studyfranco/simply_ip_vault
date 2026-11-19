@@ -3,7 +3,11 @@
 //! The specification's *creator-private entity* — visible only to its `owner_key_id` and Master,
 //! never exposed by the shared-resource visibility rule (§4).
 
-use axum::{Extension, extract::{Json, State}, response::IntoResponse};
+use axum::{
+    Extension,
+    extract::{Json, State},
+    response::IntoResponse,
+};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryFilter,
     QueryOrder, QuerySelect,
@@ -19,8 +23,8 @@ use crate::middleware::ClientIp;
 use crate::state::AppState;
 
 use super::{
-    caller_group_permission, create_audit_log, normalize_ip_or_cidr, IP_EVENT_ACTIONS,
-    ReassignOwnerPayload, resolve_owner_assignment, resource_owner,
+    IP_EVENT_ACTIONS, ReassignOwnerPayload, caller_group_permission, create_audit_log,
+    normalize_ip_or_cidr, resolve_owner_assignment, resource_owner,
 };
 
 /// Handles PUT /api/v1/webhooks/:id/owner — the dispatch-target counterpart to
@@ -39,7 +43,10 @@ pub async fn reassign_webhook_owner(
         ));
     }
 
-    let webhook = WebhookConfig::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let webhook = WebhookConfig::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     let owner = resolve_owner_assignment(&state.db, payload.owner_key_id).await?;
 
     let webhook_name = webhook.name.clone();
@@ -63,7 +70,6 @@ pub async fn reassign_webhook_owner(
 
     Ok(Json(serde_json::json!({ "id": id, "owner_key_id": owner })))
 }
-
 
 // ─────────────────────────────────────────────────────────────
 // Admin CRUD — Webhooks
@@ -116,29 +122,27 @@ pub struct CreateWebhookPayload {
     pub signature_prefix: Option<String>,
     /// When `true`, `$target_address` and `$ip` expand to the `/48`-normalized IPv6 subnet for
     /// non-whitelist bare host IPv6 bans (intended for firewall hooks like `launch.block.ip`).
-    /// Defaults to `false` so reporting endpoints like AbuseIPDB receive exact full IPv6 hosts.
+    /// Defaults to `false` so reporting endpoints like `AbuseIPDB` receive exact full IPv6 hosts.
     pub send_normalized_ipv6: Option<bool>,
 }
 
+struct ValidatedWebhookCreate {
+    auth_mode: webhook_config::AuthMode,
+    api_key: Option<String>,
+    hmac_template: Option<String>,
+    secret_token: String,
+}
 
-/// Handles POST /api/v1/webhooks
-pub async fn create_webhook(
-    State(state): State<AppState>,
-    Extension(key): Extension<api_key::Model>,
-    Extension(client_ip): Extension<ClientIp>,
-    StrictJson(payload): StrictJson<CreateWebhookPayload>,
-) -> Result<impl IntoResponse, AppError> {
+async fn validate_webhook_create(
+    db: &sea_orm::DatabaseConnection,
+    key: &api_key::Model,
+    payload: &CreateWebhookPayload,
+) -> Result<ValidatedWebhookCreate, AppError> {
     if !key.is_master && !key.can_manage_webhooks {
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
-
-    // A webhook is a standing export of everything that happens in its group, to a URL the creator
-    // chooses. `can_manage_webhooks` alone therefore was not sufficient authority: it let a key
-    // scoped to one group subscribe to the events of *every* group — including ones it cannot read
-    // through any other endpoint — and stream them to a server it controls. Requiring `can_read` on
-    // the target group keeps a webhook's reach bounded by the creator's own reach.
     if !key.is_master {
-        let perm = caller_group_permission(&state.db, key.id, payload.group_id).await?;
+        let perm = caller_group_permission(db, key.id, payload.group_id).await?;
         if !perm.is_some_and(|p| p.can_read) {
             return Err(AppError::Forbidden(
                 "Permission denied: you have no read access to the target group".to_owned(),
@@ -146,17 +150,22 @@ pub async fn create_webhook(
         }
     }
 
-    let parsed_url = reqwest::Url::parse(&payload.target_url)
-        .map_err(|_| AppError::InvalidInput("Invalid target_url: must be a well-formed URL".to_owned()))?;
+    let parsed_url = reqwest::Url::parse(&payload.target_url).map_err(|_| {
+        AppError::InvalidInput("Invalid target_url: must be a well-formed URL".to_owned())
+    })?;
     if parsed_url.scheme() != "http" && parsed_url.scheme() != "https" {
-        return Err(AppError::InvalidInput("Invalid target_url: scheme must be http or https".to_owned()));
+        return Err(AppError::InvalidInput(
+            "Invalid target_url: scheme must be http or https".to_owned(),
+        ));
     }
     if parsed_url.host_str().is_none() {
-        return Err(AppError::InvalidInput("Invalid target_url: missing host".to_owned()));
+        return Err(AppError::InvalidInput(
+            "Invalid target_url: missing host".to_owned(),
+        ));
     }
 
     if let Some(events) = &payload.events {
-        for token in events.split(',').map(|s| s.trim()) {
+        for token in events.split(',').map(str::trim) {
             if !IP_EVENT_ACTIONS.contains(&token) {
                 return Err(AppError::InvalidInput(format!(
                     "Invalid events entry '{token}': must be one of {}",
@@ -166,9 +175,10 @@ pub async fn create_webhook(
         }
     }
 
-    // Rejected rather than silently defaulted: a caller who asks for an auth mode and gets a
-    // different one would ship a receiver that rejects every dispatch, with nothing to point at.
-    let requested_mode = payload.auth_mode.as_deref().or(payload.signature_mode.as_deref());
+    let requested_mode = payload
+        .auth_mode
+        .as_deref()
+        .or(payload.signature_mode.as_deref());
     let auth_mode = match requested_mode {
         None => webhook_config::AuthMode::CanonicalV1,
         Some(raw) => webhook_config::AuthMode::parse(raw).ok_or_else(|| {
@@ -179,15 +189,19 @@ pub async fn create_webhook(
         })?,
     };
 
-    // Empty strings are normalized to `None` up front, so "field present but blank" (what an
-    // untouched HTML input posts) and "field absent" mean the same thing everywhere downstream.
-    let api_key = payload.api_key.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
-    let hmac_template = payload.hmac_template.as_deref().filter(|v| !v.is_empty()).map(str::to_owned);
+    let api_key = payload
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned);
+    let hmac_template = payload
+        .hmac_template
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned);
     let secret_token = payload.secret_token.clone().unwrap_or_default();
 
-    // Each mode's own preconditions. Catching these here turns a webhook that would have failed
-    // silently on every future dispatch — in a background worker, where the operator sees only a
-    // log line — into an error on the request that configured it.
     if auth_mode.requires_secret() && secret_token.is_empty() {
         return Err(AppError::InvalidInput(format!(
             "auth_mode '{}' computes an HMAC and requires a non-empty secret_token",
@@ -207,19 +221,44 @@ pub async fn create_webhook(
         ));
     }
 
+    Ok(ValidatedWebhookCreate {
+        auth_mode,
+        api_key,
+        hmac_template,
+        secret_token,
+    })
+}
+
+/// Handles POST /api/v1/webhooks
+pub async fn create_webhook(
+    State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
+    StrictJson(payload): StrictJson<CreateWebhookPayload>,
+) -> Result<impl IntoResponse, AppError> {
+    let validated = validate_webhook_create(&state.db, &key, &payload).await?;
+
+    let stored_secret = if validated.secret_token.is_empty() {
+        String::new()
+    } else {
+        state.cipher.seal(&validated.secret_token)?
+    };
+    let stored_api_key = validated
+        .api_key
+        .as_deref()
+        .map(|raw| state.cipher.seal(raw))
+        .transpose()?;
+
     let id = Uuid::new_v4();
     let now = chrono::Utc::now().naive_utc();
     let model = webhook_config::ActiveModel {
         id: Set(id),
         name: Set(payload.name.clone()),
         target_url: Set(payload.target_url.clone()),
-        secret_token: Set(secret_token),
-        auth_mode: Set(auth_mode.as_str().to_owned()),
-        api_key: Set(api_key),
-        hmac_template: Set(hmac_template),
-        // Trimmed to `None` when blank so "unset" has exactly one representation in the column, and
-        // the dispatcher's fallback is reached rather than an empty header name being attempted.
-        // `signature_prefix` is *not* given that treatment: `Some("")` is a real choice there.
+        secret_token: Set(stored_secret),
+        auth_mode: Set(validated.auth_mode.as_str().to_owned()),
+        api_key: Set(stored_api_key),
+        hmac_template: Set(validated.hmac_template),
         signature_header: Set(payload
             .signature_header
             .as_deref()
@@ -230,26 +269,34 @@ pub async fn create_webhook(
         headers_json: Set(payload.headers_json.clone()),
         payload_template: Set(payload.payload_template.clone()),
         group_id: Set(payload.group_id),
-        // §4 makes a webhook creator-private. This column is the "creator" half; without it the only
-        // scoping available was the group's, which is the shared-resource rule §4 forbids here.
         owner_key_id: Set(resource_owner(&key)),
         is_active: Set(payload.is_active.unwrap_or(true)),
         send_normalized_ipv6: Set(payload.send_normalized_ipv6.unwrap_or(false)),
         events: Set(payload.events.clone()),
         created_at: Set(now),
     };
-    webhook_config::Entity::insert(model).exec(&state.db).await?;
+    webhook_config::Entity::insert(model)
+        .exec(&state.db)
+        .await?;
 
-    create_audit_log(&state.db, &key, client_ip.0, "WEBHOOK_CREATE", None, None, Some(payload.target_url.clone())).await?;
+    create_audit_log(
+        &state.db,
+        &key,
+        client_ip.0,
+        "WEBHOOK_CREATE",
+        None,
+        None,
+        Some(payload.target_url.clone()),
+    )
+    .await?;
 
     Ok(Json(serde_json::json!({
         "id": id,
         "target_url": payload.target_url,
-        "auth_mode": auth_mode.as_str(),
+        "auth_mode": validated.auth_mode.as_str(),
         "send_normalized_ipv6": payload.send_normalized_ipv6.unwrap_or(false),
     })))
 }
-
 
 /// Public-safe summary of a webhook configuration. Deliberately omits `secret_token` **and**
 /// `api_key`: unlike `api_keys.key_hash` (a hash of a high-entropy generated value), both are
@@ -296,7 +343,6 @@ pub struct WebhookSummary {
     pub created_at: chrono::NaiveDateTime,
 }
 
-
 impl From<webhook_config::Model> for WebhookSummary {
     fn from(w: webhook_config::Model) -> Self {
         // Normalized through the enum so a hand-edited or legacy row is reported as the mode it
@@ -327,7 +373,6 @@ impl From<webhook_config::Model> for WebhookSummary {
         }
     }
 }
-
 
 /// Payload for updating an existing webhook. Every field is optional; omitted fields are left as
 /// they are.
@@ -378,7 +423,6 @@ pub struct UpdateWebhookPayload {
     pub send_normalized_ipv6: Option<bool>,
 }
 
-
 /// Response from [`update_webhook`]. Carries the new `secret_token` **only** when the update forced
 /// a rotation, and only on this one response — no read endpoint ever echoes it again.
 #[derive(Serialize)]
@@ -393,7 +437,6 @@ pub struct UpdateWebhookResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret_token: Option<String>,
 }
-
 
 /// Handles `PUT /api/v1/webhooks/{id}` — edits a webhook in place. Every stored field is editable
 /// this way: name, target, group, auth mode, secret, api key, headers, payload template, event
@@ -425,30 +468,25 @@ pub struct UpdateWebhookResponse {
 /// never rotated by this endpoint. Every other field on a privileged webhook — name, group, payload
 /// template, event filter, signature header/prefix, active state — stays editable by any
 /// `can_manage_webhooks` holder that owns it.
-pub async fn update_webhook(
-    State(state): State<AppState>,
-    Extension(key): Extension<api_key::Model>,
-    Extension(client_ip): Extension<ClientIp>,
-    StrictPath(id): StrictPath<Uuid>,
-    StrictJson(payload): StrictJson<UpdateWebhookPayload>,
-) -> Result<impl IntoResponse, AppError> {
-    if !key.is_master && !key.can_manage_webhooks {
-        return Err(AppError::Forbidden("Permission denied".to_owned()));
-    }
+enum ApiKeyChange {
+    Clear,
+    Replace(String),
+}
 
-    let target = WebhookConfig::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+struct ValidatedWebhookUpdate {
+    requested_mode: Option<webhook_config::AuthMode>,
+    requested_api_key: Option<ApiKeyChange>,
+    must_rotate: bool,
+    new_secret: Option<String>,
+    generated_secret: Option<String>,
+}
 
-    // Same scoping as create/delete, and for the same §4 reason: a dispatch target is visible to its
-    // creator and Master and to nobody else, so a webhook the caller does not own is one it cannot
-    // edit. `404` keeps "not yours" and "does not exist" indistinguishable from outside.
-    //
-    // This endpoint renames webhooks, which §3 names as a lifecycle action — but the ownership test
-    // is the same test either way, so it is applied once here rather than split into "you may repoint
-    // it but not rename it", which would be a distinction with no holder.
-    if !key.is_master && target.owner_key_id != Some(key.id) {
-        return Err(AppError::NotFound);
-    }
-
+async fn validate_webhook_update_fields(
+    db: &sea_orm::DatabaseConnection,
+    key: &api_key::Model,
+    target: &webhook_config::Model,
+    payload: &UpdateWebhookPayload,
+) -> Result<(), AppError> {
     if let Some(url) = &payload.target_url {
         let parsed = reqwest::Url::parse(url).map_err(|_| {
             AppError::InvalidInput("Invalid target_url: must be a well-formed URL".to_owned())
@@ -459,12 +497,14 @@ pub async fn update_webhook(
             ));
         }
         if parsed.host_str().is_none() {
-            return Err(AppError::InvalidInput("Invalid target_url: missing host".to_owned()));
+            return Err(AppError::InvalidInput(
+                "Invalid target_url: missing host".to_owned(),
+            ));
         }
     }
 
     if let Some(events) = &payload.events {
-        for token in events.split(',').map(|s| s.trim()) {
+        for token in events.split(',').map(str::trim) {
             if !IP_EVENT_ACTIONS.contains(&token) {
                 return Err(AppError::InvalidInput(format!(
                     "Invalid events entry '{token}': must be one of {}",
@@ -482,14 +522,11 @@ pub async fn update_webhook(
         ));
     }
 
-    // Same `can_read` check `create_webhook` applies to the group a webhook is created against —
-    // retargeting one onto a group the caller cannot read would be an equivalent way to reach data
-    // outside the caller's own scope, just via an edit instead of a fresh POST.
     if let Some(group_id) = payload.group_id
         && group_id != target.group_id
         && !key.is_master
     {
-        let perm = caller_group_permission(&state.db, key.id, group_id).await?;
+        let perm = caller_group_permission(db, key.id, group_id).await?;
         if !perm.is_some_and(|p| p.can_read) {
             return Err(AppError::Forbidden(
                 "Permission denied: you have no read access to the target group".to_owned(),
@@ -497,7 +534,17 @@ pub async fn update_webhook(
         }
     }
 
-    // Rejected rather than silently defaulted — same reasoning as `create_webhook`.
+    Ok(())
+}
+
+async fn validate_webhook_update(
+    db: &sea_orm::DatabaseConnection,
+    key: &api_key::Model,
+    target: &webhook_config::Model,
+    payload: &UpdateWebhookPayload,
+) -> Result<ValidatedWebhookUpdate, AppError> {
+    validate_webhook_update_fields(db, key, target, payload).await?;
+
     let requested_mode = match &payload.auth_mode {
         Some(raw) => Some(webhook_config::AuthMode::parse(raw).ok_or_else(|| {
             AppError::InvalidInput(format!(
@@ -508,12 +555,14 @@ pub async fn update_webhook(
         None => None,
     };
 
-    // Compared against the *effective* current values so that setting a field to what it already
-    // holds is not treated as a repoint — an idempotent PUT from a dashboard that submits every
-    // field on every save must not churn the secret on each click.
-    let effective_template =
-        target.hmac_template.as_deref().unwrap_or(webhook_config::DEFAULT_HMAC_TEMPLATE);
-    let url_changed = payload.target_url.as_deref().is_some_and(|u| u != target.target_url);
+    let effective_template = target
+        .hmac_template
+        .as_deref()
+        .unwrap_or(webhook_config::DEFAULT_HMAC_TEMPLATE);
+    let url_changed = payload
+        .target_url
+        .as_deref()
+        .is_some_and(|u| u != target.target_url);
     let template_changed = payload
         .hmac_template
         .as_deref()
@@ -524,33 +573,20 @@ pub async fn update_webhook(
     let auth_mode_changed = requested_mode.is_some_and(|m| m != current_mode);
     let effective_mode = requested_mode.unwrap_or(current_mode);
 
-    // Empty strings normalize to `None`, matching `create_webhook`'s own treatment — "field present
-    // but blank" and "field absent" mean the same thing everywhere downstream.
-    let requested_api_key = payload
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .map(|v| if v.is_empty() { None } else { Some(v.to_owned()) });
+    let requested_api_key = payload.api_key.as_deref().map(str::trim).map(|value| {
+        if value.is_empty() {
+            ApiKeyChange::Clear
+        } else {
+            ApiKeyChange::Replace(value.to_owned())
+        }
+    });
     let api_key_changed = requested_api_key.is_some();
-    let effective_api_key = match &requested_api_key {
-        Some(new_value) => new_value.clone(),
-        None => target.api_key.clone(),
+    let effective_api_key_present = match &requested_api_key {
+        Some(ApiKeyChange::Clear) => false,
+        Some(ApiKeyChange::Replace(_)) => true,
+        None => target.api_key.is_some(),
     };
 
-    // A *privileged* webhook carries a credential the receiver recognizes as an identity — an
-    // `api_key`, which is how instance chaining works (`AGENT.MD` §4): its dispatches authenticate
-    // as a real API caller on the receiving system. Repointing one, or changing what it signs, aims
-    // a working credential at a destination of the editor's choosing; changing the auth mode or the
-    // `api_key` value itself achieves the same hijack by other means — forced secret rotation alone
-    // does not undo any of these, because the `api_key` is not rotated and cannot be (it belongs to
-    // the remote system, not this one).
-    //
-    // So for these four fields, editing an *already-privileged* webhook is master-only. Every other
-    // property — name, payload template, event filter, group, enabled/disabled, signature header and
-    // prefix — stays editable by any `can_manage_webhooks` holder, and non-privileged webhooks are
-    // unaffected. (A non-master owner may still freely *create* a privileged webhook, or set an
-    // `api_key` on one that doesn't have one yet — this gate is about editing a credential that is
-    // already live, not about a non-master ever holding one.)
     if (url_changed || template_changed || auth_mode_changed || api_key_changed)
         && target.api_key.as_deref().is_some_and(|k| !k.is_empty())
         && !key.is_master
@@ -568,30 +604,23 @@ pub async fn update_webhook(
         ));
     }
 
-    // The same per-mode preconditions `create_webhook` enforces, checked against the *effective*
-    // post-update state so a transition into a mode this webhook cannot yet satisfy is refused up
-    // front rather than saved and left to fail silently on the next dispatch.
-    if effective_mode == webhook_config::AuthMode::ApiKeyOnly && effective_api_key.is_none() {
+    if effective_mode == webhook_config::AuthMode::ApiKeyOnly && !effective_api_key_present {
         return Err(AppError::InvalidInput(
             "auth_mode 'API_KEY_ONLY' requires a non-empty api_key".to_owned(),
         ));
     }
 
-    // Only the signing modes have a secret worth protecting; forcing a rotation on API_KEY_ONLY or
-    // NONE would mint a secret that is never used and cannot be verified against anything. A mode
-    // change into a signing mode rotates too, on the same anti-hijack logic as a repoint: a secret
-    // that was never meant to be used as an HMAC key (or was appropriate under a different mode)
-    // should not be inherited silently.
     let must_rotate =
         (url_changed || template_changed || auth_mode_changed) && effective_mode.requires_secret();
 
-    let supplied_secret = payload.secret_token.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let supplied_secret = payload
+        .secret_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let mut generated_secret = None;
-
     let new_secret = match (must_rotate, supplied_secret) {
-        // Caller brought its own replacement: honour it, and do not echo it back.
         (_, Some(supplied)) => Some(supplied.to_owned()),
-        // Repointed with no replacement offered: generate one and hand it over exactly once.
         (true, None) => {
             let secret = crate::crypto::generate_signing_secret();
             generated_secret = Some(secret.clone());
@@ -600,9 +629,6 @@ pub async fn update_webhook(
         (false, None) => None,
     };
 
-    // Defensive final check: belt-and-braces given `must_rotate` should already cover every
-    // transition into a signing mode, but this keeps the invariant enforced on every path rather
-    // than resting entirely on that one computation staying correct as the function grows.
     let final_secret_present = new_secret.is_some() || !target.secret_token.is_empty();
     if effective_mode.requires_secret() && !final_secret_present {
         return Err(AppError::InvalidInput(format!(
@@ -611,7 +637,38 @@ pub async fn update_webhook(
         )));
     }
 
-    let mut active: webhook_config::ActiveModel = target.clone().into();
+    Ok(ValidatedWebhookUpdate {
+        requested_mode,
+        requested_api_key,
+        must_rotate,
+        new_secret,
+        generated_secret,
+    })
+}
+
+pub async fn update_webhook(
+    State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
+    StrictPath(id): StrictPath<Uuid>,
+    StrictJson(payload): StrictJson<UpdateWebhookPayload>,
+) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master && !key.can_manage_webhooks {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
+    }
+
+    let target = WebhookConfig::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    if !key.is_master && target.owner_key_id != Some(key.id) {
+        return Err(AppError::NotFound);
+    }
+
+    let validated = validate_webhook_update(&state.db, &key, &target, &payload).await?;
+
+    let mut active: webhook_config::ActiveModel = target.into();
     if let Some(name) = payload.name {
         active.name = Set(name);
     }
@@ -633,17 +690,21 @@ pub async fn update_webhook(
     if let Some(is_active) = payload.is_active {
         active.is_active = Set(is_active);
     }
-    if let Some(secret) = new_secret {
-        active.secret_token = Set(secret);
+    if let Some(secret) = validated.new_secret {
+        active.secret_token = Set(state.cipher.seal(&secret)?);
     }
     if let Some(group_id) = payload.group_id {
         active.group_id = Set(group_id);
     }
-    if let Some(mode) = requested_mode {
+    if let Some(mode) = validated.requested_mode {
         active.auth_mode = Set(mode.as_str().to_owned());
     }
-    if requested_api_key.is_some() {
-        active.api_key = Set(effective_api_key.clone());
+    if let Some(new_api_key) = validated.requested_api_key {
+        let stored_api_key = match new_api_key {
+            ApiKeyChange::Clear => None,
+            ApiKeyChange::Replace(raw) => Some(state.cipher.seal(&raw)?),
+        };
+        active.api_key = Set(stored_api_key);
     }
     if let Some(header) = &payload.signature_header {
         active.signature_header = Set(Some(header.trim().to_owned()).filter(|h| !h.is_empty()));
@@ -657,11 +718,8 @@ pub async fn update_webhook(
 
     let updated = active.update(&state.db).await?;
 
-    let detail = if must_rotate {
-        format!(
-            "Updated webhook '{}' (secret_token rotated)",
-            updated.name
-        )
+    let detail = if validated.must_rotate {
+        format!("Updated webhook '{}' (secret_token rotated)", updated.name)
     } else {
         format!("Updated webhook '{}'", updated.name)
     };
@@ -678,11 +736,10 @@ pub async fn update_webhook(
 
     Ok(Json(UpdateWebhookResponse {
         webhook: WebhookSummary::from(updated),
-        secret_rotated: must_rotate,
-        secret_token: generated_secret,
+        secret_rotated: validated.must_rotate,
+        secret_token: validated.generated_secret,
     }))
 }
-
 
 /// Payload for `POST /api/v1/webhooks/{id}/clone`.
 #[derive(Deserialize)]
@@ -691,7 +748,6 @@ pub struct CloneWebhookPayload {
     /// Name for the new, cloned webhook.
     pub name: String,
 }
-
 
 /// Response from [`clone_webhook`]. Carries a freshly generated `secret_token` **only** when the
 /// clone's auth mode requires one — the same "shown once, never echoed again" shape
@@ -706,7 +762,6 @@ pub struct CloneWebhookResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret_token: Option<String>,
 }
-
 
 /// Handles `POST /api/v1/webhooks/{id}/clone` — duplicates an existing webhook's configuration under
 /// a new name, so an operator can stand up a variant (a different target group, a different event
@@ -756,7 +811,10 @@ pub async fn clone_webhook(
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
-    let source = WebhookConfig::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let source = WebhookConfig::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     if !key.is_master && source.owner_key_id != Some(key.id) {
         return Err(AppError::NotFound);
     }
@@ -785,8 +843,24 @@ pub async fn clone_webhook(
     let auth_mode = webhook_config::AuthMode::from_stored(&source.auth_mode);
     // Never inherited from the source — see this handler's own doc comment. Generated fresh exactly
     // like `create_webhook` would for a brand-new webhook in this mode.
-    let generated_secret = auth_mode.requires_secret().then(crate::crypto::generate_signing_secret);
-    let secret_token = generated_secret.clone().unwrap_or_default();
+    let generated_secret = auth_mode
+        .requires_secret()
+        .then(crate::crypto::generate_signing_secret);
+    let secret_token = match &generated_secret {
+        Some(secret) => state.cipher.seal(secret)?,
+        None => String::new(),
+    };
+    let cloned_api_key = match source.api_key.as_deref().filter(|k| !k.is_empty()) {
+        Some(raw) => {
+            let plain = state.cipher.open_legacy_or_sealed(raw)?;
+            if plain.is_empty() {
+                None
+            } else {
+                Some(state.cipher.seal(&plain)?)
+            }
+        }
+        None => None,
+    };
 
     let new_id = Uuid::new_v4();
     let now = chrono::Utc::now().naive_utc();
@@ -796,7 +870,7 @@ pub async fn clone_webhook(
         target_url: source.target_url.clone(),
         secret_token,
         auth_mode: auth_mode.as_str().to_owned(),
-        api_key: source.api_key.clone(),
+        api_key: cloned_api_key,
         hmac_template: source.hmac_template.clone(),
         signature_header: source.signature_header.clone(),
         signature_prefix: source.signature_prefix.clone(),
@@ -813,7 +887,9 @@ pub async fn clone_webhook(
         created_at: now,
     };
     let active: webhook_config::ActiveModel = cloned.clone().into();
-    webhook_config::Entity::insert(active).exec(&state.db).await?;
+    webhook_config::Entity::insert(active)
+        .exec(&state.db)
+        .await?;
 
     create_audit_log(
         &state.db,
@@ -837,7 +913,6 @@ pub async fn clone_webhook(
         }),
     ))
 }
-
 
 /// Handles GET /api/v1/webhooks
 pub async fn list_webhooks(
@@ -869,7 +944,6 @@ pub async fn list_webhooks(
     Ok(Json(summaries))
 }
 
-
 /// Handles DELETE /api/v1/webhooks/:id
 pub async fn delete_webhook(
     State(state): State<AppState>,
@@ -889,7 +963,10 @@ pub async fn delete_webhook(
     // `404` rather than `403` for a webhook the caller does not own: it never appeared in that
     // caller's `GET /api/webhooks`, so its existence is not something to confirm. That is §4's oracle
     // discipline, which Phase 3 extends to the rest of the surface.
-    let target = WebhookConfig::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let target = WebhookConfig::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     if !key.is_master && target.owner_key_id != Some(key.id) {
         return Err(AppError::NotFound);
     }
@@ -899,11 +976,19 @@ pub async fn delete_webhook(
         return Err(AppError::NotFound);
     }
 
-    create_audit_log(&state.db, &key, client_ip.0, "WEBHOOK_DELETE", None, None, Some(id.to_string())).await?;
+    create_audit_log(
+        &state.db,
+        &key,
+        client_ip.0,
+        "WEBHOOK_DELETE",
+        None,
+        None,
+        Some(id.to_string()),
+    )
+    .await?;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
-
 
 /// Handles `POST /api/v1/webhooks/{id}/test` — a live, synchronous, human-observed dispatch used by
 /// the dashboard's "Test Webhook" action, so an operator can see whether a configuration actually
@@ -929,7 +1014,10 @@ pub async fn test_webhook(
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
-    let target = WebhookConfig::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let target = WebhookConfig::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     if !key.is_master && target.owner_key_id != Some(key.id) {
         return Err(AppError::NotFound);
     }
@@ -951,7 +1039,14 @@ pub async fn test_webhook(
         cause: Some("Manual test dispatch from the dashboard".to_owned()),
     };
 
-    let result = crate::dispatch::send_test_dispatch(&state.db, &target, &event).await;
+    let result = crate::dispatch::send_test_dispatch_with_cipher_and_override(
+        &state.db,
+        &state.cipher,
+        &target,
+        &event,
+        state.allow_private_webhooks,
+    )
+    .await;
 
     create_audit_log(
         &state.db,
@@ -966,7 +1061,10 @@ pub async fn test_webhook(
             if result.success {
                 "delivered".to_owned()
             } else {
-                format!("failed — {}", result.error.as_deref().unwrap_or("unknown error"))
+                format!(
+                    "failed — {}",
+                    result.error.as_deref().unwrap_or("unknown error")
+                )
             }
         )),
     )
@@ -974,7 +1072,6 @@ pub async fn test_webhook(
 
     Ok(Json(result))
 }
-
 
 /// Query parameters for `GET /api/v1/webhooks/executions`. `deny_unknown_fields` so a misspelled
 /// filter (`success` for `is_success`) is refused with `400` rather than silently ignored and
@@ -1023,7 +1120,6 @@ pub struct WebhookExecutionQuery {
     pub offset: Option<u64>,
 }
 
-
 /// Handles `GET /api/v1/webhooks/executions` — the delivery history behind the dashboard's
 /// Executions tab.
 ///
@@ -1050,8 +1146,8 @@ pub async fn list_webhook_executions(
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
-    let mut q = webhook_execution::Entity::find()
-        .order_by_desc(webhook_execution::Column::CreatedAt);
+    let mut q =
+        webhook_execution::Entity::find().order_by_desc(webhook_execution::Column::CreatedAt);
 
     if !key.is_master {
         let owned_ids: Vec<Uuid> = WebhookConfig::find()
@@ -1110,7 +1206,9 @@ pub async fn list_webhook_executions(
     if let Some(ip) = &query.ip
         && !ip.is_empty()
     {
-        q = q.filter(webhook_execution::Column::TargetAddress.contains(normalize_ip_or_cidr(ip.trim())));
+        q = q.filter(
+            webhook_execution::Column::TargetAddress.contains(normalize_ip_or_cidr(ip.trim())),
+        );
     }
 
     if let Some(search) = &query.search
@@ -1155,7 +1253,6 @@ pub async fn list_webhook_executions(
     Ok(Json(executions))
 }
 
-
 /// Handles `DELETE /api/v1/webhooks/executions/{id}` — removes a single execution-history row.
 ///
 /// Same base gate as every other endpoint in this file, and the same ownership scoping
@@ -1182,7 +1279,10 @@ pub async fn delete_webhook_execution(
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
-    let execution = webhook_execution::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let execution = webhook_execution::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
 
     if !key.is_master {
         let owner = WebhookConfig::find_by_id(execution.webhook_id)
@@ -1194,7 +1294,9 @@ pub async fn delete_webhook_execution(
         }
     }
 
-    let result = webhook_execution::Entity::delete_by_id(id).exec(&state.db).await?;
+    let result = webhook_execution::Entity::delete_by_id(id)
+        .exec(&state.db)
+        .await?;
     if result.rows_affected == 0 {
         return Err(AppError::NotFound);
     }

@@ -28,6 +28,9 @@
     --transition-fast: 150ms ease;
     --transition-base: 200ms ease;
     --transition-slow: 300ms ease;
+
+    --container-padding-x: clamp(1rem, 2.5vw, 3rem);
+    --container-padding-y: 1.75rem;
 }
 
 /* ─── Reset & Base ──────────────────────────────────────── */
@@ -40,13 +43,17 @@
     padding: 0;
 }
 
+html,
+body {
+    overflow-x: clip;
+}
+
 body {
     background-color: var(--bg-main);
     color: var(--text-main);
     font-family: var(--font-sans);
     line-height: 1.6;
     min-height: 100vh;
-    overflow-x: clip;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
 }
@@ -63,7 +70,7 @@ body {
     max-width: min(2400px, 96vw);
     width: 100%;
     margin: 0 auto;
-    padding: 1.75rem clamp(1rem, 2.5vw, 3rem);
+    padding: var(--container-padding-y) var(--container-padding-x);
     transition: opacity var(--transition-slow), transform var(--transition-slow);
 }
 
@@ -83,11 +90,12 @@ body {
     width: 100vw;
     height: 100vh;
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: center;
     background-color: var(--bg-main);
     z-index: 10000;
     padding: 1.5rem;
+    overflow-y: auto;
     transition: opacity var(--transition-slow), visibility var(--transition-slow);
 }
 
@@ -103,6 +111,7 @@ body {
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
     padding: 2.5rem 2rem;
+    margin: auto;
     width: 100%;
     max-width: 420px;
     box-shadow: var(--shadow-lg);
@@ -252,6 +261,7 @@ body {
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
     padding: 1.5rem;
+    min-width: 0;
     transition: border-color var(--transition-base);
 }
 
@@ -849,6 +859,10 @@ body {
     gap: 1.5rem;
 }
 
+.admin-grid > * {
+    min-width: 0;
+}
+
 .admin-section {
     overflow: hidden;
 }
@@ -896,11 +910,30 @@ body {
     border-radius: var(--radius);
 }
 
+.key-reveal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    margin-bottom: 0.4rem;
+}
+
 .key-reveal-label {
     font-size: 0.8rem;
     color: var(--accent);
     font-weight: 600;
     margin-bottom: 0.4rem;
+}
+
+.key-reveal-header .key-reveal-label {
+    margin-bottom: 0;
+}
+
+.copy-compact-btn {
+    padding: 0.2rem 0.6rem;
+    font-size: 0.75rem;
+    line-height: 1.3;
+    flex: 0 0 auto;
 }
 
 .key-reveal-value {
@@ -913,6 +946,7 @@ body {
     text-overflow: ellipsis;
     padding: 0.5rem 0.7rem;
     background-color: var(--bg-input);
+    border: 1px solid var(--border);
     border-radius: var(--radius);
     user-select: all;
     cursor: text;
@@ -1016,7 +1050,7 @@ body {
     font-size: 0.7rem;
 }
 
-.badge-scope-master,
+.badge.badge-scope-master,
 .scope-badges .badge-tier-master {
     background-color: rgba(231, 76, 60, 0.16);
     color: #ff7b6b;
@@ -1151,8 +1185,8 @@ body {
     top: 0;
     z-index: 30;
     background-color: var(--bg-main);
-    margin: -2rem -2rem 0;
-    padding: 2rem 2rem 0;
+    margin: calc(-1 * var(--container-padding-y)) calc(-1 * var(--container-padding-x)) 0;
+    padding: var(--container-padding-y) var(--container-padding-x) 0;
     transition: transform var(--transition-base), box-shadow var(--transition-base);
 }
 
@@ -1297,9 +1331,11 @@ body {
 
 .date-range {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 0.35rem;
     flex: 0 1 auto;
+    max-width: 100%;
 }
 
 .date-range-label {
@@ -1318,8 +1354,13 @@ body {
     color-scheme: dark;
 }
 
+input[type="datetime-local"] {
+    color-scheme: dark;
+}
+
 /* The native calendar glyph renders near-black on a dark field in Chromium; invert it back. */
-.date-input::-webkit-calendar-picker-indicator {
+.date-input::-webkit-calendar-picker-indicator,
+input[type="datetime-local"]::-webkit-calendar-picker-indicator {
     filter: invert(0.8);
     cursor: pointer;
 }
@@ -1328,9 +1369,9 @@ body {
 
 .toast-container {
     position: fixed;
-    top: 1.5rem;
+    top: 5.25rem;
     right: 1.5rem;
-    z-index: 9999;
+    z-index: 20020;
     display: flex;
     flex-direction: column;
     gap: 0.5rem;
@@ -1444,8 +1485,9 @@ body {
 /* ─── Responsive ────────────────────────────────────────── */
 
 @media (max-width: 640px) {
-    .container {
-        padding: 1rem;
+    :root {
+        --container-padding-x: 1rem;
+        --container-padding-y: 1rem;
     }
 
     .header {
@@ -1703,41 +1745,62 @@ body {
     outline-offset: 2px;
 }
 
-/* A form is taller than a confirmation prompt, so it scrolls inside the card rather than
-   overflowing the viewport on a short window. Wider than `.modal-card`'s own cap for the same
-   reason it needs the extra height: these hold long target URLs, JSON payload templates, and
-   (in the Execution Detail modal) a receiver's raw response body — content that reads as a wall of
-   wrapped fragments at 520px on anything wider than a phone. Like `.modal-card`, this uses
-   `clamp()` rather than `min(vw, px)`: the old `min(92vw, 720px)` stopped growing the moment `92vw`
-   passed 720px — every viewport from a small laptop up through an ultra-wide monitor rendered the
-   same 720px card. The `clamp()` below keeps scaling with the viewport well past that point, so a
-   wide monitor actually gets to use the extra space for these longer, denser fields instead of
-   floating a fixed-size box in a sea of unused background. */
 .modal-card-form {
-    max-width: clamp(600px, 56vw, 960px);
+    max-width: clamp(720px, 64vw, 1040px);
     max-height: calc(100vh - 3rem);
     overflow-y: auto;
+    background-color: #383e45;
+    border: 1px solid #565b63;
+}
+
+.modal-card-form :is(.input-field, select, textarea, input[type="checkbox"], .checkmark) {
+    --bg-input: #17191b;
+}
+
+.modal-card-form .permissions-grid input[type="checkbox"] {
+    appearance: none;
+    position: relative;
+    width: 18px;
+    height: 18px;
 }
 
 #key-secret-modal .modal-card,
-#secret-reveal-modal .modal-card {
+#secret-reveal-modal .modal-card,
+#signing-secret-modal .modal-card {
     max-width: clamp(580px, 48vw, 860px);
 }
 
-#create-key-modal .modal-card-form,
-#edit-key-modal .modal-card-form {
-    max-width: clamp(620px, 56vw, 960px);
+.list-toolbar,
+.group-row-actions,
+.group-policy-badges {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
 }
 
-#form-create-group .form-row {
-    width: 100%;
-    max-width: none;
-    background-color: #383e45;
-    padding: 0.95rem 1.2rem;
+.group-policy-badges .badge {
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+
+.group-ban-policy {
+    margin: 1rem 0;
+    padding: 0.75rem 1rem;
     border: 1px solid #565b63;
     border-radius: var(--radius);
-    margin-bottom: 1rem;
-    box-shadow: var(--shadow);
+}
+
+.group-policy-option {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0.4rem 0;
+    overflow-wrap: anywhere;
+}
+
+.group-whitelist-options {
+    margin-top: 0.75rem;
 }
 
 .modal-card-form .form-actions {

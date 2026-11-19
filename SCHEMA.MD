@@ -41,12 +41,12 @@ Indexes that matter for the read path:
 - `idx_webhook_executions_success_created` `(is_success, created_at DESC)`, `idx_webhook_executions_status_code_created` `(status_code, created_at DESC)`, `idx_webhook_executions_event_type_created` `(event_type, created_at DESC)` (`m20261014_120000`): accelerates execution retention purge sweeps and status/event filters.
 - `idx-ip_groups-group_type` (`m20261014_120000`): accelerates `status=ban`/`white` group lookups on `GET /api/ips`.
 
-Pragmas, set per connection and checked at boot (`src/db.rs`): `journal_mode=WAL`, `synchronous=NORMAL`,
-`foreign_keys=ON`, `busy_timeout=10000`, `temp_store=MEMORY`, `mmap_size=512 MB`, `cache_size=-131072`.
-Incremental auto-vacuum (`auto_vacuum=INCREMENTAL`) is handled once at boot during migration via `ensure_incremental_auto_vacuum`,
-preventing connection-time exclusive schema lock requests. Standard `PRAGMA optimize` runs safely in the background after boot
-and every 12 hours during maintenance. The maintenance worker (`src/maintenance.rs`) runs bounded `incremental_vacuum(250)` (< 1s),
-`wal_checkpoint(TRUNCATE)`, and `PRAGMA optimize` every 12 hours.
+SQLx applies SQLite session settings when each connection opens. These include WAL, normal
+synchronization, foreign key enforcement, the busy timeout, in-memory temp storage, mmap and cache
+sizes, an analysis limit of 400, and optimization on close. Startup reads back the journal mode.
+New files use incremental auto-vacuum. Legacy files in mode NONE require an offline vacuum to
+enable it. The maintenance worker reclaims up to 50 free pages, attempts to truncate the WAL,
+and refreshes planner statistics every 12 hours.
 
 The membership migration is not reversible. Membership state cannot be split back onto a shared address row
 without choosing which group's copy wins, so `down` returns an error.
@@ -163,9 +163,24 @@ Logical collections of IP rules (e.g. `fail2ban`, `sshd`, `vpn_whitelist`).
 | `id` | `UUID` | Primary Key, Auto-Gen | Unique identifier for the group |
 | `name` | `String` | Not Null, Unique, Indexed | Group name used in API requests and UI |
 | `group_type` | `String` | Not Null, Default: `'banlist'` | Type of group: `'banlist'` or `'whitelist'` |
+| `allow_private_ips` | `Boolean` | Not Null, Default: `false` | Banlist opt-in for RFC1918, CGNAT, and IPv6 ULA ranges |
 | `description` | `Text` | Nullable | Optional detailed description of the group's purpose |
 | `owner_key_id` | `UUID` | Nullable, Indexed | The key holding **lifecycle authority** over this group (§3): deleting or renaming the group itself is restricted to the Master and this key. Holding `can_manage` on its permission rows, or any read/write/delete verb over its contents, confers none of it. `NULL` means unassigned, which reads as master-only; set on creation to the creating key (`NULL` when a master creates it), and reassignable by a master through `PUT /api/groups/{id}/owner` |
 | `created_at` | `DateTimeUtc` | Not Null | Group creation timestamp |
+
+---
+
+### `ip_group_exclusions`
+
+Links a banlist to whitelist groups whose active memberships protect overlapping CIDRs from bans.
+
+| Field | Type | Attributes | Description |
+| :--- | :--- | :--- | :--- |
+| `group_id` | `UUID` | Not Null, FK → `ip_groups.id` | Banlist that applies the exclusion |
+| `excluded_group_id` | `UUID` | Not Null, FK → `ip_groups.id`, Indexed | Protected whitelist |
+
+The composite primary key is `(group_id, excluded_group_id)`. Both foreign keys cascade on update
+and delete. The group API validates group types and prevents self-references.
 
 ---
 

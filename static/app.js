@@ -1062,22 +1062,20 @@ class FirewallClient {
         if (editGrid) editGrid.classList.toggle('hidden', !mayGrantScopes);
         if (editNote) editNote.classList.toggle('hidden', mayGrantScopes);
 
-        // ── Resource creation ───────────────────────────────────────────────
-        //
-        // `can_create_groups` and `can_manage_webhooks` are Master-granted rights (R4); a key without
-        // them cannot create the resource, so the creating form goes away while the listing below it
-        // stays. A Daughter that can read a group it was granted access to should still see it.
-        const groupForm = document.getElementById('form-create-group');
-        if (groupForm) groupForm.classList.toggle('hidden', !(p.is_master || p.can_create_groups));
-
-        const webhookForm = document.getElementById('form-create-webhook');
-        if (webhookForm) webhookForm.classList.toggle('hidden', !(p.is_master || p.can_manage_webhooks));
+        for (const [id, allowed] of [
+            ['create-group', p.is_master || p.can_create_groups],
+            ['create-webhook', p.is_master || p.can_manage_webhooks],
+            ['manage-rights', mayCreateKeys]
+        ]) {
+            document.getElementById(`btn-open-${id}`).classList.toggle('hidden', !allowed);
+            if (!allowed) document.getElementById(`${id}-modal`).classList.add('hidden');
+        }
 
         // ── Tier badge for the signed-in key ────────────────────────────────
         const tier = this.keyTier(p);
         const banner = document.getElementById('current-key-tier');
         if (banner) {
-            banner.className = `badge badge-tier badge-tier-${tier}`;
+            banner.className = `badge badge-tier badge-tier-${tier}${tier === 'master' ? ' badge-scope-master' : ''}`;
             banner.textContent = tier.charAt(0).toUpperCase() + tier.slice(1);
             banner.title = {
                 master: 'The Master key: full access, unique, and pinned at startup.',
@@ -1569,7 +1567,7 @@ class FirewallClient {
                             <td class="font-mono font-bold">${escapeHtml(item.target_address)}</td>
                             ${dateCols}
                             <td>
-                                <button type="button" class="btn btn-secondary btn-sm" onclick="app.filterByIp('${escapeHtml(item.target_address)}')">View in Records</button>
+                                <button type="button" class="btn btn-secondary btn-sm" data-action="filter-by-ip" data-address="${escapeHtml(item.target_address)}">View in Records</button>
                             </td>
                         </tr>
                     `;
@@ -1795,10 +1793,8 @@ class FirewallClient {
     // Wires a table's "select all" header checkbox and its .row-select body checkboxes to a
     // shared Set of selected row ids, keeping the header checkbox's checked/indeterminate state
     // and the "Delete Selected" button's enabled state + label in sync. Called at the end of
-    // every render*Table() — row checkboxes are recreated each time (tbody.innerHTML replace),
-    // so they get fresh listeners each call; the header checkbox and delete button are static
-    // elements outside the tbody, so their handlers are (re)assigned via .onchange/.onclick
-    // rather than addEventListener to avoid stacking duplicate handlers across renders.
+    // every render*Table(). Replace the previous listeners on the static header and delete
+    // controls when the row checkboxes are recreated.
     wireRowSelection({ tbodySelector, selectAllId, deleteBtnId, deleteBtnLabel, selectedSet, onDeleteSelected }) {
         const selectAllEl = document.getElementById(selectAllId);
         const deleteBtn = document.getElementById(deleteBtnId);
@@ -1828,15 +1824,19 @@ class FirewallClient {
             });
         });
 
-        selectAllEl.onchange = () => {
+        this.rowSelectionListeners ??= new Map();
+        this.rowSelectionListeners.get(selectAllId)?.abort();
+        const listeners = new AbortController();
+        this.rowSelectionListeners.set(selectAllId, listeners);
+        const options = { signal: listeners.signal };
+        selectAllEl.addEventListener('change', () => {
             rowCheckboxes().forEach(cb => {
                 cb.checked = selectAllEl.checked;
                 if (cb.checked) selectedSet.add(cb.dataset.id); else selectedSet.delete(cb.dataset.id);
             });
             updateControls();
-        };
-
-        deleteBtn.onclick = () => onDeleteSelected();
+        }, options);
+        deleteBtn.addEventListener('click', onDeleteSelected, options);
 
         updateControls();
     }
@@ -1926,7 +1926,7 @@ class FirewallClient {
                 <td class="text-sm">${formatTimestamp(ip.last_seen_at)}</td>
                 <td>
                     <div class="flex gap-2">
-                        <button class="btn btn-sm btn-danger" onclick="window.app.deleteIp('${escapeHtml(ip.target_address)}', '${escapeHtml(ip.group_name)}')" ${ip.is_locked ? 'disabled' : ''}>Delete</button>
+                        <button type="button" class="btn btn-sm btn-danger" data-action="delete-ip" data-address="${escapeHtml(ip.target_address)}" data-group="${escapeHtml(ip.group_name)}" ${ip.is_locked ? 'disabled' : ''}>Delete</button>
                     </div>
                 </td>
             </tr>
@@ -1966,11 +1966,11 @@ class FirewallClient {
             const actions = minimal
                 ? '<span class="text-muted text-sm" title="This key is visible because it shares a group you manage. Its credentials are outside your scope.">Shared &mdash; view only</span>'
                 : `
-                        <button class="btn btn-sm btn-secondary" onclick="window.app.openEditKeyModal('${k.id}')">Edit</button>
-                        <button class="btn btn-sm btn-secondary" onclick="window.app.openKeyLineageModal('${k.id}')" title="View this key's ancestors and children">Lineage</button>
-                        <button class="btn btn-sm btn-secondary" onclick="window.app.regenerateKeySecret('${k.id}')" title="Replace BOTH the API key and its signing secret">Regenerate</button>
-                        <button class="btn btn-sm btn-secondary" onclick="window.app.rotateSigningSecret('${k.id}')" title="Replace only the HMAC signing secret; the API key, name and permissions stay the same">Rotate Secret</button>
-                        <button class="btn btn-sm btn-danger" onclick="window.app.deleteKey('${k.id}')">Delete</button>`;
+                        <button type="button" class="btn btn-sm btn-secondary" data-action="edit-key" data-key-id="${escapeHtml(k.id)}">Edit</button>
+                        <button type="button" class="btn btn-sm btn-secondary" data-action="lineage-key" data-key-id="${escapeHtml(k.id)}" title="View this key's ancestors and children">Lineage</button>
+                        <button type="button" class="btn btn-sm btn-secondary" data-action="regenerate-key" data-key-id="${escapeHtml(k.id)}" title="Replace BOTH the API key and its signing secret">Regenerate</button>
+                        <button type="button" class="btn btn-sm btn-secondary" data-action="rotate-secret" data-key-id="${escapeHtml(k.id)}" title="Replace only the HMAC signing secret; the API key, name and permissions stay the same">Rotate Secret</button>
+                        <button type="button" class="btn btn-sm btn-danger" data-action="delete-key" data-key-id="${escapeHtml(k.id)}">Delete</button>`;
             return `
             <tr>
                 <td>${minimal ? '' : `<input type="checkbox" class="row-select" data-id="${k.id}">`}</td>
@@ -2010,7 +2010,7 @@ class FirewallClient {
                 parent: 'Parent key — holds can_manage_keys, so it may create Daughter keys',
                 daughter: 'Daughter key — cannot create or manage keys',
             }[tier];
-            scopes.push(`<span class="badge badge-tier badge-tier-${tier}" title="${why}">${label}</span>`);
+            scopes.push(`<span class="badge badge-tier badge-tier-${tier}${tier === 'master' ? ' badge-scope-master' : ''}" title="${why}">${label}</span>`);
         }
         if (k.can_manage_keys) scopes.push('<span class="badge badge-scope">can_manage_keys</span>');
         if (k.can_manage_webhooks) scopes.push('<span class="badge badge-scope">can_manage_webhooks</span>');
@@ -2020,7 +2020,7 @@ class FirewallClient {
             const rights = [p.can_read ? 'R' : '', p.can_write ? 'W' : '', p.can_delete ? 'D' : '']
                 .filter(Boolean).join('') || 'none';
             return `<span class="badge badge-group" title="${escapeHtml(p.group_name)}: ${rights}">${escapeHtml(p.group_name)}: ${rights}
-                <button type="button" class="badge-revoke" title="Revoke this group permission" onclick="window.app.revokeGroupPermission('${k.id}', '${p.group_id}')">&times;</button>
+                <button type="button" class="badge-revoke" title="Revoke this group permission" data-action="revoke-group-permission" data-key-id="${escapeHtml(k.id)}" data-group-id="${escapeHtml(p.group_id)}">&times;</button>
             </span>`;
         });
 
@@ -2132,8 +2132,14 @@ class FirewallClient {
 
     renderGroupsTable() {
         const tbody = document.getElementById('groups-table-body');
+        const isMaster = this.state.profile?.is_master;
+        const canEditGroup = group => isMaster || group.owner_key_id === this.state.profile?.id;
+        const editableIds = new Set(this.state.groups.filter(canEditGroup).map(group => group.id));
+        for (const id of this.state.selectedGroupIds) {
+            if (!editableIds.has(id)) this.state.selectedGroupIds.delete(id);
+        }
         if (this.state.groups.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted">No groups.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted">No groups.</td></tr>';
             this.wireRowSelection({
                 tbodySelector: '#groups-table-body', selectAllId: 'select-all-groups', deleteBtnId: 'delete-selected-groups',
                 deleteBtnLabel: 'Delete Selected', selectedSet: this.state.selectedGroupIds,
@@ -2146,15 +2152,24 @@ class FirewallClient {
             const typeBadge = g.group_type === 'whitelist'
                 ? '<span class="badge badge-white">Whitelist</span>'
                 : '<span class="badge badge-ban">Banlist</span>';
+            const canEdit = editableIds.has(g.id);
+            const policyBadges = [
+                ...(g.allow_private_ips ? ['<span class="badge badge-white">Private IPs Allowed</span>'] : []),
+                ...(g.excluded_whitelist_names ?? []).map(name =>
+                    `<span class="badge badge-scope" title="Excluded whitelist">${escapeHtml(name)}</span>`)
+            ];
             return `
             <tr>
-                <td><input type="checkbox" class="row-select" data-id="${g.id}"></td>
+                <td>${canEdit ? `<input type="checkbox" class="row-select" data-id="${g.id}" aria-label="Select ${escapeHtml(g.name)}">` : ''}</td>
                 <td class="font-mono text-sm">${g.id.substring(0, 8)}...</td>
                 <td><strong>${escapeHtml(g.name)}</strong></td>
                 <td>${typeBadge}</td>
+                <td><div class="group-policy-badges">${policyBadges.join('')}</div></td>
                 <td>
-                    <div class="flex gap-2">
-                        <button class="btn btn-sm btn-danger" onclick="window.app.deleteGroup('${g.id}')">Delete</button>
+                    <div class="group-row-actions">
+                        ${canEdit ? `<button type="button" class="btn btn-sm btn-secondary" data-action="edit-group" data-group-id="${g.id}">Edit</button>` : ''}
+                        ${isMaster ? `<button type="button" class="btn btn-sm btn-secondary" data-action="group-owner" data-group-id="${g.id}">Owner</button>` : ''}
+                        ${canEdit ? `<button type="button" class="btn btn-sm btn-danger" data-action="delete-group" data-group-id="${g.id}">Delete</button>` : ''}
                     </div>
                 </td>
             </tr>
@@ -2208,9 +2223,9 @@ class FirewallClient {
                 <td><span class="badge ${badgeClass}">${escapeHtml(mode)}</span>${keyBadge}${templateBadge}${ipv6NormBadge}</td>
                 <td>
                     <div class="flex gap-2">
-                        <button class="btn btn-sm btn-secondary" onclick="window.app.openEditWebhookModal('${w.id}')">Edit</button>
-                        <button class="btn btn-sm btn-secondary" onclick="window.app.openCloneWebhookModal('${w.id}')" title="Duplicate this webhook's configuration under a new name">Clone</button>
-                        <button class="btn btn-sm btn-danger" onclick="window.app.deleteWebhook('${w.id}')">Delete</button>
+                        <button type="button" class="btn btn-sm btn-secondary" data-action="edit-webhook" data-webhook-id="${escapeHtml(w.id)}">Edit</button>
+                        <button type="button" class="btn btn-sm btn-secondary" data-action="clone-webhook" data-webhook-id="${escapeHtml(w.id)}" title="Duplicate this webhook's configuration under a new name">Clone</button>
+                        <button type="button" class="btn btn-sm btn-danger" data-action="delete-webhook" data-webhook-id="${escapeHtml(w.id)}">Delete</button>
                     </div>
                 </td>
             </tr>
@@ -2439,8 +2454,8 @@ class FirewallClient {
                 <td>${this.executionStatusBadge(e)}</td>
                 <td class="text-sm">${e.duration_ms} ms</td>
                 <td>
-                    <button class="btn btn-sm btn-secondary" onclick="window.app.openExecutionDetailModal('${e.id}')">View</button>
-                    <button class="btn btn-sm btn-batch-delete" onclick="window.app.deleteExecutionRow('${e.id}')">Delete</button>
+                    <button type="button" class="btn btn-sm btn-secondary" data-action="view-execution" data-execution-id="${escapeHtml(e.id)}">View</button>
+                    <button type="button" class="btn btn-sm btn-batch-delete" data-action="delete-execution" data-execution-id="${escapeHtml(e.id)}">Delete</button>
                 </td>
             </tr>
         `;
@@ -2654,6 +2669,7 @@ class FirewallClient {
             await this.apiFetch(`/keys/${keyId}/groups`, { method: 'POST', body: JSON.stringify(payload) });
             this.showToast("Group Rights Assigned Effectively", 'success');
             document.getElementById('form-manage-rights').reset();
+            this.closeResourceModal(document.getElementById('manage-rights-modal'));
             this.loadGroups();
         } catch(e) {}
     }
@@ -2826,15 +2842,98 @@ class FirewallClient {
         } catch(e) {}
     }
 
-    async createGroup(e) {
+    openResourceModal(modal, trigger) {
+        this.resourceModalTrigger = trigger;
+        modal.classList.remove('hidden');
+        modal.querySelector('input:not([type="hidden"]), select')?.focus();
+    }
+
+    closeResourceModal(modal) {
+        modal.classList.add('hidden');
+        this.resourceModalTrigger?.focus();
+    }
+
+    syncGroupBanPolicy(form) {
+        const policy = form.querySelector('.group-ban-policy');
+        policy.disabled = form.querySelector('select').value === 'whitelist';
+        policy.hidden = policy.disabled;
+    }
+
+    openGroupModal(mode, trigger, group) {
+        const id = `${mode}-group`;
+        const form = document.getElementById(`form-${id}`);
+        form.reset();
+        form.dataset.groupId = group?.id ?? '';
+        document.getElementById(`${id}-name`).value = group?.name ?? '';
+        document.getElementById(`${id}-type`).value = group?.group_type ?? 'banlist';
+        document.getElementById(`${id}-allow-private`).checked = group?.allow_private_ips ?? false;
+
+        const excludedIds = group?.excluded_whitelist_ids ?? [];
+        const whitelists = new Map(this.state.groups.filter(g => g.group_type === 'whitelist')
+            .map(g => [g.id, g.name]));
+        excludedIds.forEach((id, index) => {
+            if (!whitelists.has(id)) whitelists.set(id, group.excluded_whitelist_names?.[index] ?? id);
+        });
+        const options = document.getElementById(`${id}-excluded-whitelists`);
+        options.innerHTML = Array.from(whitelists, ([whitelistId, name]) => `
+            <label class="group-policy-option">
+                <input type="checkbox" value="${escapeHtml(whitelistId)}"${excludedIds.includes(whitelistId) ? ' checked' : ''}>
+                ${escapeHtml(name)}
+            </label>`).join('') || '<span class="text-muted">No whitelist groups available.</span>';
+        this.syncGroupBanPolicy(form);
+        this.openResourceModal(document.getElementById(`${id}-modal`), trigger);
+    }
+
+    async saveGroup(e, mode) {
         e.preventDefault();
-        const name = document.getElementById('create-group-name').value;
-        const group_type = document.getElementById('group-type-select').value;
+        const form = e.currentTarget;
+        const id = `${mode}-group`;
+        const groupId = form.dataset.groupId;
+        const groupType = document.getElementById(`${id}-type`).value;
+        const payload = { name: document.getElementById(`${id}-name`).value };
+        if (!groupId) payload.group_type = groupType;
+        if (groupType === 'banlist') {
+            payload.allow_private_ips = document.getElementById(`${id}-allow-private`).checked;
+            payload.excluded_whitelist_ids = Array.from(
+                document.getElementById(`${id}-excluded-whitelists`).querySelectorAll('input:checked'),
+                input => input.value
+            );
+        }
         try {
-            await this.apiFetch('/groups', { method: 'POST', body: JSON.stringify({ name, group_type }) });
-            document.getElementById('form-create-group').reset();
+            await this.apiFetch(groupId ? `/groups/${groupId}` : '/groups', {
+                method: groupId ? 'PUT' : 'POST', body: JSON.stringify(payload)
+            });
+            this.closeResourceModal(document.getElementById(`${id}-modal`));
             this.loadGroups();
-            this.showToast("Group created", 'success');
+            this.showToast(groupId ? 'Group updated' : 'Group created', 'success');
+        } catch(e) {}
+    }
+
+    openGroupOwnerModal(group, trigger) {
+        const form = document.getElementById('form-group-owner');
+        form.dataset.groupId = group.id;
+        const select = document.getElementById('group-owner-key');
+        select.innerHTML = '<option value="">No owner</option>' + this.state.apiKeys
+            .filter(key => !key.is_master)
+            .map(key => `<option value="${escapeHtml(key.id)}">${escapeHtml(key.name)}</option>`).join('');
+        if (group.owner_key_id && !Array.from(select.options).some(option => option.value === group.owner_key_id)) {
+            select.add(new Option(group.owner_key_id, group.owner_key_id));
+        }
+        select.value = group.owner_key_id ?? '';
+        this.openResourceModal(document.getElementById('group-owner-modal'), trigger);
+    }
+
+    async saveGroupOwner(e) {
+        e.preventDefault();
+        const groupId = e.currentTarget.dataset.groupId;
+        const ownerId = document.getElementById('group-owner-key').value;
+        try {
+            await this.apiFetch(`/groups/${groupId}/owner`, {
+                method: 'PUT', body: JSON.stringify({ owner_key_id: ownerId || null })
+            });
+            this.closeResourceModal(document.getElementById('group-owner-modal'));
+            this.loadGroups();
+            this.showToast('Group owner updated', 'success');
         } catch(e) {}
     }
 
@@ -2933,11 +3032,14 @@ class FirewallClient {
     }
 
     openTemplateVarsModal() {
+        this.templateVarsTrigger = document.activeElement;
         document.getElementById('template-vars-modal').classList.remove('hidden');
+        document.getElementById('template-vars-close').focus();
     }
 
     closeTemplateVarsModal() {
         document.getElementById('template-vars-modal').classList.add('hidden');
+        this.templateVarsTrigger?.focus();
     }
 
     // ───────────────────────────────────────────────────────
@@ -3086,6 +3188,7 @@ class FirewallClient {
         try {
             await this.apiFetch('/webhooks', { method: 'POST', body: JSON.stringify(payload) });
             document.getElementById('form-create-webhook').reset();
+            this.closeResourceModal(document.getElementById('create-webhook-modal'));
             // `reset()` does not reach the header editor (its rows are JS-owned, not form fields),
             // so it is cleared explicitly — otherwise the next webhook would silently inherit the
             // previous one's headers.
@@ -3604,32 +3707,59 @@ class FirewallClient {
             }
         });
 
-        document.getElementById('btn-copy-vault-apikey')?.addEventListener('click', () => {
-            const text = document.getElementById('apikey-plaintext')?.textContent;
-            if (text) {
-                navigator.clipboard?.writeText(text);
-                const btn = document.getElementById('btn-copy-vault-apikey');
+        const copySecretNode = async (nodeId, btnId, label) => {
+            const node = document.getElementById(nodeId);
+            const btn = document.getElementById(btnId);
+            const value = node?.textContent || '';
+            if (!value) return;
+            try {
+                if (!navigator.clipboard) throw new Error('clipboard unavailable');
+                await navigator.clipboard.writeText(value);
                 if (btn) {
+                    const orig = btn.dataset.originalLabel || btn.textContent;
+                    btn.dataset.originalLabel = orig;
                     btn.textContent = 'Copied!';
-                    setTimeout(() => (btn.textContent = 'Copy'), 1500);
+                    setTimeout(() => { btn.textContent = orig; }, 1500);
                 }
-            }
-        });
-        document.getElementById('btn-copy-vault-signing-secret')?.addEventListener('click', () => {
-            const text = document.getElementById('apikey-signing-secret')?.textContent;
-            if (text) {
-                navigator.clipboard?.writeText(text);
-                const btn = document.getElementById('btn-copy-vault-signing-secret');
-                if (btn) {
-                    btn.textContent = 'Copied!';
-                    setTimeout(() => (btn.textContent = 'Copy'), 1500);
+                this.showToast(`${label} copied to clipboard`, 'success');
+            } catch {
+                if (node) {
+                    const range = document.createRange();
+                    range.selectNodeContents(node);
+                    const sel = window.getSelection();
+                    sel.removeAllRanges();
+                    sel.addRange(range);
                 }
+                this.showToast('Clipboard unavailable (needs HTTPS) — the secret is selected, press Ctrl+C', 'error');
             }
-        });
+        };
+
+        document.getElementById('btn-copy-vault-apikey')?.addEventListener('click', () =>
+            copySecretNode('apikey-plaintext', 'btn-copy-vault-apikey', 'API key'));
+        document.getElementById('btn-copy-vault-signing-secret')?.addEventListener('click', () =>
+            copySecretNode('apikey-signing-secret', 'btn-copy-vault-signing-secret', 'Signing secret'));
+        document.getElementById('secret-reveal-copy-key')?.addEventListener('click', () =>
+            copySecretNode('secret-reveal-value', 'secret-reveal-copy-key', 'API key'));
+        document.getElementById('secret-reveal-copy-secret')?.addEventListener('click', () =>
+            copySecretNode('secret-reveal-signing-secret', 'secret-reveal-copy-secret', 'Signing secret'));
 
         document.getElementById('form-create-apikey').addEventListener('submit', (e) => this.createApiKey(e));
         document.getElementById('form-manage-rights').addEventListener('submit', (e) => this.manageKeyRights(e));
-        document.getElementById('form-create-group').addEventListener('submit', (e) => this.createGroup(e));
+        document.getElementById('form-create-group').addEventListener('submit', (e) => this.saveGroup(e, 'create'));
+        document.getElementById('form-edit-group').addEventListener('submit', (e) => this.saveGroup(e, 'edit'));
+        document.getElementById('form-group-owner').addEventListener('submit', (e) => this.saveGroupOwner(e));
+        document.getElementById('create-group-type').addEventListener('change', (e) => this.syncGroupBanPolicy(e.target.form));
+        document.getElementById('btn-open-create-group').addEventListener('click', (e) => this.openGroupModal('create', e.currentTarget));
+        for (const id of ['create-webhook', 'manage-rights']) {
+            document.getElementById(`btn-open-${id}`).addEventListener('click', (e) => {
+                this.openResourceModal(document.getElementById(`${id}-modal`), e.currentTarget);
+            });
+        }
+        document.querySelectorAll('.resource-modal').forEach(modal => {
+            modal.addEventListener('click', (e) => {
+                if (e.target === modal || e.target.closest('[data-close-modal]')) this.closeResourceModal(modal);
+            });
+        });
         document.getElementById('form-create-webhook').addEventListener('submit', (e) => this.createWebhook(e));
 
         // Edit Key modal
@@ -3684,10 +3814,13 @@ class FirewallClient {
             if (e.key !== 'Escape') return;
             if (!document.getElementById('template-vars-modal').classList.contains('hidden')) {
                 this.closeTemplateVarsModal();
+                e.stopImmediatePropagation();
             }
         });
         document.addEventListener('keydown', (e) => {
-            if (e.key !== 'Escape') return;
+            if (e.key !== 'Escape' || e.defaultPrevented) return;
+            const resourceModal = document.querySelector('.resource-modal:not(.hidden)');
+            if (resourceModal) this.closeResourceModal(resourceModal);
             if (!document.getElementById('edit-webhook-modal').classList.contains('hidden')) {
                 this.closeEditWebhookModal();
             }
@@ -3720,8 +3853,10 @@ class FirewallClient {
         });
 
         // Secret reveal modal (used after key rotation)
-        document.getElementById('secret-reveal-close').addEventListener('click', () => {
-            document.getElementById('secret-reveal-modal').classList.add('hidden');
+        const closeSecretReveal = () => document.getElementById('secret-reveal-modal').classList.add('hidden');
+        document.getElementById('secret-reveal-close').addEventListener('click', closeSecretReveal);
+        document.getElementById('secret-reveal-modal').addEventListener('click', (e) => {
+            if (e.target.id === 'secret-reveal-modal') closeSecretReveal();
         });
 
         // Signing-secret reveal modal (used after POST /api/keys/{id}/rotate-secret, PUT
@@ -3729,32 +3864,24 @@ class FirewallClient {
         // one caller that needs a follow-up: if `pendingCloneEditId` is set, the operator dismissing
         // this modal is the cue to open the Edit Webhook modal for the newly cloned webhook next,
         // rather than showing both modals stacked at once.
-        document.getElementById('signing-secret-close').addEventListener('click', () => {
+        const closeSigningSecret = () => {
             document.getElementById('signing-secret-modal').classList.add('hidden');
             if (this.state.pendingCloneEditId) {
                 const id = this.state.pendingCloneEditId;
                 this.state.pendingCloneEditId = null;
                 this.openEditWebhookModal(id);
             }
+        };
+        document.getElementById('signing-secret-close').addEventListener('click', closeSigningSecret);
+        document.getElementById('signing-secret-modal').addEventListener('click', (e) => {
+            if (e.target.id === 'signing-secret-modal') closeSigningSecret();
         });
-        document.getElementById('signing-secret-copy').addEventListener('click', async () => {
-            const value = document.getElementById('signing-secret-value').textContent;
-            // navigator.clipboard is itself gated on a secure context — the same limitation that
-            // makes the pure-JS HMAC fallback necessary — so fall back to selecting the text and
-            // telling the user to copy manually rather than silently doing nothing.
-            try {
-                if (!navigator.clipboard) throw new Error('clipboard unavailable');
-                await navigator.clipboard.writeText(value);
-                this.showToast('Signing secret copied to clipboard', 'success');
-            } catch {
-                const node = document.getElementById('signing-secret-value');
-                const range = document.createRange();
-                range.selectNodeContents(node);
-                const sel = window.getSelection();
-                sel.removeAllRanges();
-                sel.addRange(range);
-                this.showToast('Clipboard unavailable (needs HTTPS) — the secret is selected, press Ctrl+C', 'error');
-            }
+        document.getElementById('signing-secret-copy').addEventListener('click', () =>
+            copySecretNode('signing-secret-value', 'signing-secret-copy', 'Signing secret'));
+        document.addEventListener('keydown', (e) => {
+            if (e.key !== 'Escape') return;
+            if (!document.getElementById('secret-reveal-modal').classList.contains('hidden')) closeSecretReveal();
+            if (!document.getElementById('signing-secret-modal').classList.contains('hidden')) closeSigningSecret();
         });
 
         // Audit log search & clear
@@ -3849,6 +3976,88 @@ class FirewallClient {
         });
         document.getElementById('intersection-btn-next')?.addEventListener('click', () => {
             this.loadIntersection(this.state.intersectionPage + 1);
+        });
+
+        // Delegated action handlers for dynamically rendered table/badge rows (replaces inline onclick).
+        const delegateTableAction = (containerId, handler) => {
+            document.getElementById(containerId)?.addEventListener('click', (e) => {
+                const btn = e.target.closest('button[data-action]');
+                if (!btn || btn.disabled) return;
+                handler(btn);
+            });
+        };
+
+        delegateTableAction('intersection-table-body', (btn) => {
+            if (btn.dataset.action === 'filter-by-ip') {
+                this.filterByIp(btn.dataset.address);
+            }
+        });
+        delegateTableAction('ip-table-body', (btn) => {
+            if (btn.dataset.action === 'delete-ip') {
+                this.deleteIp(btn.dataset.address, btn.dataset.group);
+            }
+        });
+        const handleKeyBadgeOrAction = (btn) => {
+            switch (btn.dataset.action) {
+                case 'edit-key':
+                    this.openEditKeyModal(btn.dataset.keyId);
+                    break;
+                case 'lineage-key':
+                    this.openKeyLineageModal(btn.dataset.keyId);
+                    break;
+                case 'regenerate-key':
+                    this.regenerateKeySecret(btn.dataset.keyId);
+                    break;
+                case 'rotate-secret':
+                    this.rotateSigningSecret(btn.dataset.keyId);
+                    break;
+                case 'delete-key':
+                    this.deleteKey(btn.dataset.keyId);
+                    break;
+                case 'revoke-group-permission':
+                    this.revokeGroupPermission(btn.dataset.keyId, btn.dataset.groupId);
+                    break;
+            }
+        };
+        delegateTableAction('apikeys-table-body', handleKeyBadgeOrAction);
+        delegateTableAction('key-lineage-body', handleKeyBadgeOrAction);
+        delegateTableAction('groups-table-body', (btn) => {
+            const group = this.state.groups.find(g => g.id === btn.dataset.groupId);
+            if (!group) return;
+            switch (btn.dataset.action) {
+                case 'edit-group':
+                    this.openGroupModal('edit', btn, group);
+                    break;
+                case 'group-owner':
+                    this.openGroupOwnerModal(group, btn);
+                    break;
+                case 'delete-group':
+                    this.deleteGroup(group.id);
+                    break;
+            }
+        });
+        delegateTableAction('webhooks-table-body', (btn) => {
+            switch (btn.dataset.action) {
+                case 'edit-webhook':
+                    this.openEditWebhookModal(btn.dataset.webhookId);
+                    break;
+                case 'clone-webhook':
+                    this.openCloneWebhookModal(btn.dataset.webhookId);
+                    break;
+                case 'delete-webhook':
+                    this.deleteWebhook(btn.dataset.webhookId);
+                    break;
+            }
+        });
+        delegateTableAction('executions-table-body', (btn) => {
+            switch (btn.dataset.action) {
+                case 'view-execution':
+                    this.openExecutionDetailModal(btn.dataset.executionId);
+                    break;
+                case 'delete-execution':
+                    this.deleteExecutionRow(btn.dataset.executionId);
+                    break;
+            }
         });
     }
 }

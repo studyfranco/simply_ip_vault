@@ -51,7 +51,9 @@ async fn setup() -> (DatabaseConnection, axum::Router) {
 fn signed_request(method: &str, uri: &str, body: &str) -> Request<Body> {
     let secret = format!("signing-secret-for-{MASTER_KEY}");
     let ts = Utc::now().timestamp().to_string();
-    let sig = simply_ip_vault::crypto::compute_signature(&secret, method, uri, &ts, body.as_bytes()).unwrap();
+    let sig =
+        simply_ip_vault::crypto::compute_signature(&secret, method, uri, &ts, body.as_bytes())
+            .unwrap();
     Request::builder()
         .method(method)
         .uri(uri)
@@ -59,7 +61,10 @@ fn signed_request(method: &str, uri: &str, body: &str) -> Request<Body> {
         .header("X-Timestamp", ts)
         .header("X-Signature-256", sig)
         .header("Content-Type", "application/json")
-        .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 8080))))
+        .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            8080,
+        ))))
         .body(Body::from(body.to_owned()))
         .unwrap()
 }
@@ -69,240 +74,15 @@ async fn test_analytics_and_intersection_endpoints() {
     let (db, app) = setup().await;
     let now = Utc::now().naive_utc();
 
-    // Create 2 groups: GroupA and GroupB
-    let group_a_id = Uuid::new_v4();
-    ip_group::ActiveModel {
-        id: Set(group_a_id),
-        name: Set("Fail2ban".to_owned()),
-        description: Set(Some("Host bans".to_owned())),
-        group_type: Set("banlist".to_owned()),
-        owner_key_id: Set(None),
-        created_at: Set(now),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
-
-    let group_b_id = Uuid::new_v4();
-    ip_group::ActiveModel {
-        id: Set(group_b_id),
-        name: Set("Seedbox_Ban".to_owned()),
-        description: Set(Some("Torrent bans".to_owned())),
-        group_type: Set("banlist".to_owned()),
-        owner_key_id: Set(None),
-        created_at: Set(now),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
-
-    // Create 3 IPs:
-    // IP 1: 192.168.1.1 (Only in Fail2ban)
-    let ip1_id = Uuid::new_v4();
-    ip_record::ActiveModel {
-        id: Set(ip1_id),
-        target_address: Set("192.168.1.1".to_owned()),
-        created_at: Set(now),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
-
-    let m1_id = Uuid::new_v4();
-    ip_record_group_membership::ActiveModel {
-        id: Set(m1_id),
-        ip_record_id: Set(ip1_id),
-        group_id: Set(group_a_id),
-        is_locked: Set(false),
-        created_at: Set(now),
-        last_seen_at: Set(now),
-        is_deleted: Set(false),
-        deleted_at: Set(None),
-        deleted_by: Set(None),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
-
-    ip_record_cause::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        membership_id: Set(m1_id),
-        cause: Set("ssh-bruteforce".to_owned()),
-        created_at: Set(now),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
-
-    // IP 2: 10.0.0.2 (Only in Seedbox_Ban)
-    let ip2_id = Uuid::new_v4();
-    ip_record::ActiveModel {
-        id: Set(ip2_id),
-        target_address: Set("10.0.0.2".to_owned()),
-        created_at: Set(now),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
-
-    let m2_id = Uuid::new_v4();
-    ip_record_group_membership::ActiveModel {
-        id: Set(m2_id),
-        ip_record_id: Set(ip2_id),
-        group_id: Set(group_b_id),
-        is_locked: Set(false),
-        created_at: Set(now),
-        last_seen_at: Set(now),
-        is_deleted: Set(false),
-        deleted_at: Set(None),
-        deleted_by: Set(None),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
-
-    ip_record_cause::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        membership_id: Set(m2_id),
-        cause: Set("torrent-ratio-cheat".to_owned()),
-        created_at: Set(now),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
-
-    // IP 3: 172.16.0.3 (In BOTH Fail2ban and Seedbox_Ban -> Recidivist!)
-    let ip3_id = Uuid::new_v4();
-    ip_record::ActiveModel {
-        id: Set(ip3_id),
-        target_address: Set("172.16.0.3".to_owned()),
-        created_at: Set(now),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
-
-    let m3a_id = Uuid::new_v4();
-    ip_record_group_membership::ActiveModel {
-        id: Set(m3a_id),
-        ip_record_id: Set(ip3_id),
-        group_id: Set(group_a_id),
-        is_locked: Set(false),
-        created_at: Set(now),
-        last_seen_at: Set(now),
-        is_deleted: Set(false),
-        deleted_at: Set(None),
-        deleted_by: Set(None),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
-
-    ip_record_cause::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        membership_id: Set(m3a_id),
-        cause: Set("ssh-bruteforce".to_owned()),
-        created_at: Set(now),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
-
-    let m3b_id = Uuid::new_v4();
-    ip_record_group_membership::ActiveModel {
-        id: Set(m3b_id),
-        ip_record_id: Set(ip3_id),
-        group_id: Set(group_b_id),
-        is_locked: Set(false),
-        created_at: Set(now),
-        last_seen_at: Set(now),
-        is_deleted: Set(false),
-        deleted_at: Set(None),
-        deleted_by: Set(None),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
-
-    ip_record_cause::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        membership_id: Set(m3b_id),
-        cause: Set("torrent-ratio-cheat".to_owned()),
-        created_at: Set(now),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
-
-    // IP 4: 1.1.1.1 (Deleted in Seedbox_Ban, active in Fail2ban -> Not a recidivist)
-    let ip4_id = Uuid::new_v4();
-    ip_record::ActiveModel {
-        id: Set(ip4_id),
-        target_address: Set("1.1.1.1".to_owned()),
-        created_at: Set(now),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
-
-    let m4a_id = Uuid::new_v4();
-    ip_record_group_membership::ActiveModel {
-        id: Set(m4a_id),
-        ip_record_id: Set(ip4_id),
-        group_id: Set(group_a_id),
-        is_locked: Set(false),
-        created_at: Set(now),
-        last_seen_at: Set(now),
-        is_deleted: Set(false),
-        deleted_at: Set(None),
-        deleted_by: Set(None),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
-
-    ip_record_cause::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        membership_id: Set(m4a_id),
-        cause: Set("port-scan".to_owned()),
-        created_at: Set(now),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
-
-    let m4b_id = Uuid::new_v4();
-    ip_record_group_membership::ActiveModel {
-        id: Set(m4b_id),
-        ip_record_id: Set(ip4_id),
-        group_id: Set(group_b_id),
-        is_locked: Set(false),
-        created_at: Set(now),
-        last_seen_at: Set(now),
-        is_deleted: Set(true),
-        deleted_at: Set(Some(now)),
-        deleted_by: Set(Some("admin".to_owned())),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
-
-    ip_record_cause::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        membership_id: Set(m4b_id),
-        cause: Set("old-violation".to_owned()),
-        created_at: Set(now),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
-
+    let (ip2_id, ip3_id) = seed_analytics_fixture(&db, now).await;
     // Test 1: GET /api/stats/analytics
     let req = signed_request("GET", "/api/stats/analytics", "");
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
-    let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+        .await
+        .unwrap();
     let body: Value = serde_json::from_slice(&bytes).unwrap();
 
     // Total active IPs = 4 (IP1, IP2, IP3, IP4)
@@ -318,18 +98,27 @@ async fn test_analytics_and_intersection_endpoints() {
     assert_eq!(groups.len(), 2);
 
     // Fail2ban has 3 active (IP1, IP3, IP4), shared = 1 (IP3)
-    let f2b = groups.iter().find(|g| g["group_name"] == "Fail2ban").unwrap();
+    let f2b = groups
+        .iter()
+        .find(|g| g["group_name"] == "Fail2ban")
+        .unwrap();
     assert_eq!(f2b["active_count"], 3);
     assert_eq!(f2b["shared_count"], 1);
 
     // Seedbox_Ban has 2 active (IP2, IP3), shared = 1 (IP3)
-    let sb = groups.iter().find(|g| g["group_name"] == "Seedbox_Ban").unwrap();
+    let sb = groups
+        .iter()
+        .find(|g| g["group_name"] == "Seedbox_Ban")
+        .unwrap();
     assert_eq!(sb["active_count"], 2);
     assert_eq!(sb["shared_count"], 1);
 
     // Check top causes
     let causes = body["top_causes"].as_array().unwrap();
-    let ssh = causes.iter().find(|c| c["cause"] == "ssh-bruteforce").unwrap();
+    let ssh = causes
+        .iter()
+        .find(|c| c["cause"] == "ssh-bruteforce")
+        .unwrap();
     assert_eq!(ssh["count"], 2);
 
     // Check top recidivists
@@ -358,11 +147,17 @@ async fn test_analytics_and_intersection_endpoints() {
     assert_eq!(v7d["soft_deleted"], 1);
 
     // Test 2: GET /api/stats/intersection?group_a=Fail2ban&group_b=Seedbox_Ban
-    let req = signed_request("GET", "/api/stats/intersection?group_a=Fail2ban&group_b=Seedbox_Ban", "");
+    let req = signed_request(
+        "GET",
+        "/api/stats/intersection?group_a=Fail2ban&group_b=Seedbox_Ban",
+        "",
+    );
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
-    let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+        .await
+        .unwrap();
     let isect: Value = serde_json::from_slice(&bytes).unwrap();
 
     assert_eq!(isect["group_a_name"], "Fail2ban");
@@ -374,91 +169,162 @@ async fn test_analytics_and_intersection_endpoints() {
     assert_eq!(items[0]["target_address"], "172.16.0.3");
 
     // Test 3: Non-existent group returns 404
-    let req = signed_request("GET", "/api/stats/intersection?group_a=Fail2ban&group_b=NoSuchGroup", "");
+    let req = signed_request(
+        "GET",
+        "/api/stats/intersection?group_a=Fail2ban&group_b=NoSuchGroup",
+        "",
+    );
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 
+    assert_multi_group_intersection(db, app, now, ip2_id, ip3_id).await;
+}
+
+async fn seed_analytics_fixture(
+    db: &DatabaseConnection,
+    now: chrono::NaiveDateTime,
+) -> (Uuid, Uuid) {
+    // Create 2 groups: GroupA and GroupB
+    let fail2ban = add_test_group(db, "Fail2ban", Some("Host bans"), now).await;
+
+    let seedbox = add_test_group(db, "Seedbox_Ban", Some("Torrent bans"), now).await;
+
+    // Create 3 IPs:
+    // IP 1: 192.168.1.1 (Only in Fail2ban)
+    let ip1_id = add_test_ip(db, "192.168.1.1", now).await;
+
+    let m1_id = add_test_membership(db, ip1_id, fail2ban, false, now, now, None).await;
+
+    ip_record_cause::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        membership_id: Set(m1_id),
+        cause: Set("ssh-bruteforce".to_owned()),
+        created_at: Set(now),
+    }
+    .insert(db)
+    .await
+    .unwrap();
+
+    // IP 2: 10.0.0.2 (Only in Seedbox_Ban)
+    let ip2_id = add_test_ip(db, "10.0.0.2", now).await;
+
+    let m2_id = add_test_membership(db, ip2_id, seedbox, false, now, now, None).await;
+
+    ip_record_cause::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        membership_id: Set(m2_id),
+        cause: Set("torrent-ratio-cheat".to_owned()),
+        created_at: Set(now),
+    }
+    .insert(db)
+    .await
+    .unwrap();
+
+    // IP 3: 172.16.0.3 (In BOTH Fail2ban and Seedbox_Ban -> Recidivist!)
+    let ip3_id = add_test_ip(db, "172.16.0.3", now).await;
+
+    let recidivist_host_membership =
+        add_test_membership(db, ip3_id, fail2ban, false, now, now, None).await;
+
+    ip_record_cause::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        membership_id: Set(recidivist_host_membership),
+        cause: Set("ssh-bruteforce".to_owned()),
+        created_at: Set(now),
+    }
+    .insert(db)
+    .await
+    .unwrap();
+
+    let recidivist_torrent_membership =
+        add_test_membership(db, ip3_id, seedbox, false, now, now, None).await;
+
+    ip_record_cause::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        membership_id: Set(recidivist_torrent_membership),
+        cause: Set("torrent-ratio-cheat".to_owned()),
+        created_at: Set(now),
+    }
+    .insert(db)
+    .await
+    .unwrap();
+
+    // IP 4: 1.1.1.1 (Deleted in Seedbox_Ban, active in Fail2ban -> Not a recidivist)
+    let ip4_id = add_test_ip(db, "1.1.1.1", now).await;
+
+    let live_membership = add_test_membership(db, ip4_id, fail2ban, false, now, now, None).await;
+
+    ip_record_cause::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        membership_id: Set(live_membership),
+        cause: Set("port-scan".to_owned()),
+        created_at: Set(now),
+    }
+    .insert(db)
+    .await
+    .unwrap();
+
+    let deleted_membership = Uuid::new_v4();
+    ip_record_group_membership::ActiveModel {
+        id: Set(deleted_membership),
+        ip_record_id: Set(ip4_id),
+        group_id: Set(seedbox),
+        is_locked: Set(false),
+        created_at: Set(now),
+        last_seen_at: Set(now),
+        is_deleted: Set(true),
+        deleted_at: Set(Some(now)),
+        deleted_by: Set(Some("admin".to_owned())),
+    }
+    .insert(db)
+    .await
+    .unwrap();
+
+    ip_record_cause::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        membership_id: Set(deleted_membership),
+        cause: Set("old-violation".to_owned()),
+        created_at: Set(now),
+    }
+    .insert(db)
+    .await
+    .unwrap();
+    (ip2_id, ip3_id)
+}
+
+async fn assert_multi_group_intersection(
+    db: DatabaseConnection,
+    app: axum::Router,
+    now: chrono::NaiveDateTime,
+    ip2_id: Uuid,
+    ip3_id: Uuid,
+) {
     // Test 4: 4-Group Intersection
     // Create GroupC and GroupD
-    let group_c_id = Uuid::new_v4();
-    ip_group::ActiveModel {
-        id: Set(group_c_id),
-        name: Set("Spamhaus".to_owned()),
-        description: Set(Some("Spam blacklist".to_owned())),
-        group_type: Set("banlist".to_owned()),
-        owner_key_id: Set(None),
-        created_at: Set(now),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
+    let spamhaus = add_test_group(&db, "Spamhaus", Some("Spam blacklist"), now).await;
 
-    let group_d_id = Uuid::new_v4();
-    ip_group::ActiveModel {
-        id: Set(group_d_id),
-        name: Set("TorExit".to_owned()),
-        description: Set(Some("Tor exit nodes".to_owned())),
-        group_type: Set("banlist".to_owned()),
-        owner_key_id: Set(None),
-        created_at: Set(now),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
+    let tor_exit = add_test_group(&db, "TorExit", Some("Tor exit nodes"), now).await;
 
     // Add IP3 into GroupC and GroupD (IP3 is now in Fail2ban, Seedbox_Ban, Spamhaus, TorExit)
-    ip_record_group_membership::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        ip_record_id: Set(ip3_id),
-        group_id: Set(group_c_id),
-        is_locked: Set(false),
-        created_at: Set(now),
-        last_seen_at: Set(now),
-        is_deleted: Set(false),
-        deleted_at: Set(None),
-        deleted_by: Set(None),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
+    add_test_membership(&db, ip3_id, spamhaus, false, now, now, None).await;
 
-    ip_record_group_membership::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        ip_record_id: Set(ip3_id),
-        group_id: Set(group_d_id),
-        is_locked: Set(false),
-        created_at: Set(now),
-        last_seen_at: Set(now),
-        is_deleted: Set(false),
-        deleted_at: Set(None),
-        deleted_by: Set(None),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
+    add_test_membership(&db, ip3_id, tor_exit, false, now, now, None).await;
 
     // Add IP2 into GroupC (IP2 is now in Seedbox_Ban and Spamhaus)
-    ip_record_group_membership::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        ip_record_id: Set(ip2_id),
-        group_id: Set(group_c_id),
-        is_locked: Set(false),
-        created_at: Set(now),
-        last_seen_at: Set(now),
-        is_deleted: Set(false),
-        deleted_at: Set(None),
-        deleted_by: Set(None),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
+    add_test_membership(&db, ip2_id, spamhaus, false, now, now, None).await;
 
     // Query 4 groups: Fail2ban, Seedbox_Ban, Spamhaus, TorExit
-    let req = signed_request("GET", "/api/stats/intersection?groups=Fail2ban,Seedbox_Ban,Spamhaus,TorExit", "");
+    let req = signed_request(
+        "GET",
+        "/api/stats/intersection?groups=Fail2ban,Seedbox_Ban,Spamhaus,TorExit",
+        "",
+    );
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
-    let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+        .await
+        .unwrap();
     let isect4: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(isect4["total_overlap"], 1);
     assert_eq!(isect4["groups"].as_array().unwrap().len(), 4);
@@ -470,10 +336,16 @@ async fn test_analytics_and_intersection_endpoints() {
     assert!(gls["TorExit"].is_string());
 
     // Query 2 groups via `groups` parameter: Seedbox_Ban, Spamhaus -> Overlap is 2 (IP2 and IP3)
-    let req = signed_request("GET", "/api/stats/intersection?groups=Seedbox_Ban,Spamhaus", "");
+    let req = signed_request(
+        "GET",
+        "/api/stats/intersection?groups=Seedbox_Ban,Spamhaus",
+        "",
+    );
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+        .await
+        .unwrap();
     let isect2: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(isect2["total_overlap"], 2);
 
@@ -527,118 +399,15 @@ async fn add_test_membership(
 async fn test_analytics_new_statistics_and_pagination() {
     let (db, app) = setup().await;
     let now = Utc::now().naive_utc();
-    let two_days_ago = now - chrono::Duration::days(2);
-    let ten_days_ago = now - chrono::Duration::days(10);
-
-    // Create 3 groups: Alpha, Beta, Gamma
-    let g1_id = Uuid::new_v4();
-    ip_group::ActiveModel {
-        id: Set(g1_id),
-        name: Set("Alpha".to_owned()),
-        description: Set(None),
-        group_type: Set("banlist".to_owned()),
-        owner_key_id: Set(None),
-        created_at: Set(now),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
-
-    let g2_id = Uuid::new_v4();
-    ip_group::ActiveModel {
-        id: Set(g2_id),
-        name: Set("Beta".to_owned()),
-        description: Set(None),
-        group_type: Set("banlist".to_owned()),
-        owner_key_id: Set(None),
-        created_at: Set(now),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
-
-    let g3_id = Uuid::new_v4();
-    ip_group::ActiveModel {
-        id: Set(g3_id),
-        name: Set("Gamma".to_owned()),
-        description: Set(None),
-        group_type: Set("banlist".to_owned()),
-        owner_key_id: Set(None),
-        created_at: Set(now),
-    }
-    .insert(&db)
-    .await
-    .unwrap();
-
-    let ip1 = add_test_ip(&db, "192.168.10.1", now).await;
-    let ip2 = add_test_ip(&db, "192.168.10.2", now).await;
-    let ip3 = add_test_ip(&db, "192.168.10.3", now).await;
-    let ip4 = add_test_ip(&db, "10.50.0.1", now).await;
-    let ip5 = add_test_ip(&db, "10.50.0.2", now).await;
-    let ip6 = add_test_ip(&db, "2001:db8:beef::1", now).await;
-    let ip7 = add_test_ip(&db, "2001:db8:beef::2", now).await;
-    let ip8 = add_test_ip(&db, "2001:db8:cafe::/48", now).await;
-
-    // Memberships:
-    // ip1 in Alpha (locked, now) AND in Beta (dynamic, now) AND in Gamma (dynamic, now) -> 3 groups (top recidivist!)
-    add_test_membership(&db, ip1, g1_id, true, now, now, None).await;
-    add_test_membership(&db, ip1, g2_id, false, now, now, None).await;
-    add_test_membership(&db, ip1, g3_id, false, now, now, None).await;
-
-    // ip2 in Alpha (locked, now) AND in Beta (dynamic, now) -> 2 groups
-    add_test_membership(&db, ip2, g1_id, true, now, now, None).await;
-    add_test_membership(&db, ip2, g2_id, false, now, now, None).await;
-
-    // ip3 in Alpha (locked, two_days_ago) -> 1 group
-    add_test_membership(&db, ip3, g1_id, true, two_days_ago, two_days_ago, None).await;
-
-    // ip4 in Beta (locked, two_days_ago) -> 1 group
-    add_test_membership(&db, ip4, g2_id, true, two_days_ago, two_days_ago, None).await;
-
-    // ip5 in Gamma (dynamic, ten_days_ago) -> 1 group
-    add_test_membership(&db, ip5, g3_id, false, ten_days_ago, ten_days_ago, None).await;
-
-    // ip6 in Alpha (dynamic, now)
-    add_test_membership(&db, ip6, g1_id, false, now, now, None).await;
-
-    // ip7 in Alpha (dynamic, now)
-    add_test_membership(&db, ip7, g1_id, false, now, now, None).await;
-
-    // ip8 in Beta (dynamic, now)
-    add_test_membership(&db, ip8, g2_id, false, now, now, None).await;
-
-    // Soft-deleted memberships:
-    // ip3 deleted in Beta recently (within 24h)
-    add_test_membership(&db, ip3, g2_id, false, now, now, Some(now)).await;
-    // ip4 deleted in Gamma 2 days ago (within 7d)
-    add_test_membership(
-        &db,
-        ip4,
-        g3_id,
-        false,
-        two_days_ago,
-        two_days_ago,
-        Some(two_days_ago),
-    )
-    .await;
-    // ip5 deleted in Alpha 10 days ago (outside 7d)
-    add_test_membership(
-        &db,
-        ip5,
-        g1_id,
-        false,
-        ten_days_ago,
-        ten_days_ago,
-        Some(ten_days_ago),
-    )
-    .await;
-
+    seed_pagination_fixture(&db, now).await;
     // Test GET /api/stats/analytics
     let req = signed_request("GET", "/api/stats/analytics", "");
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
-    let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+        .await
+        .unwrap();
     let body: Value = serde_json::from_slice(&bytes).unwrap();
 
     // 8 active IPs total (ip1..ip8)
@@ -706,6 +475,89 @@ async fn test_analytics_new_statistics_and_pagination() {
     assert_eq!(v7d["active_added_or_seen"], 10);
     assert_eq!(v7d["soft_deleted"], 2);
 
+    assert_intersection_pagination(db, app, now).await;
+}
+
+async fn seed_pagination_fixture(db: &DatabaseConnection, now: chrono::NaiveDateTime) {
+    let two_days_ago = now - chrono::Duration::days(2);
+    let ten_days_ago = now - chrono::Duration::days(10);
+
+    // Create 3 groups: Alpha, Beta, Gamma
+    let g1_id = add_test_group(db, "Alpha", None, now).await;
+
+    let g2_id = add_test_group(db, "Beta", None, now).await;
+
+    let g3_id = add_test_group(db, "Gamma", None, now).await;
+
+    let ip1 = add_test_ip(db, "192.168.10.1", now).await;
+    let ip2 = add_test_ip(db, "192.168.10.2", now).await;
+    let ip3 = add_test_ip(db, "192.168.10.3", now).await;
+    let ip4 = add_test_ip(db, "10.50.0.1", now).await;
+    let ip5 = add_test_ip(db, "10.50.0.2", now).await;
+    let ip6 = add_test_ip(db, "2001:db8:beef::1", now).await;
+    let ip7 = add_test_ip(db, "2001:db8:beef::2", now).await;
+    let ip8 = add_test_ip(db, "2001:db8:cafe::/48", now).await;
+
+    // Memberships:
+    // ip1 in Alpha (locked, now) AND in Beta (dynamic, now) AND in Gamma (dynamic, now) -> 3 groups (top recidivist!)
+    add_test_membership(db, ip1, g1_id, true, now, now, None).await;
+    add_test_membership(db, ip1, g2_id, false, now, now, None).await;
+    add_test_membership(db, ip1, g3_id, false, now, now, None).await;
+
+    // ip2 in Alpha (locked, now) AND in Beta (dynamic, now) -> 2 groups
+    add_test_membership(db, ip2, g1_id, true, now, now, None).await;
+    add_test_membership(db, ip2, g2_id, false, now, now, None).await;
+
+    // ip3 in Alpha (locked, two_days_ago) -> 1 group
+    add_test_membership(db, ip3, g1_id, true, two_days_ago, two_days_ago, None).await;
+
+    // ip4 in Beta (locked, two_days_ago) -> 1 group
+    add_test_membership(db, ip4, g2_id, true, two_days_ago, two_days_ago, None).await;
+
+    // ip5 in Gamma (dynamic, ten_days_ago) -> 1 group
+    add_test_membership(db, ip5, g3_id, false, ten_days_ago, ten_days_ago, None).await;
+
+    // ip6 in Alpha (dynamic, now)
+    add_test_membership(db, ip6, g1_id, false, now, now, None).await;
+
+    // ip7 in Alpha (dynamic, now)
+    add_test_membership(db, ip7, g1_id, false, now, now, None).await;
+
+    // ip8 in Beta (dynamic, now)
+    add_test_membership(db, ip8, g2_id, false, now, now, None).await;
+
+    // Soft-deleted memberships:
+    // ip3 deleted in Beta recently (within 24h)
+    add_test_membership(db, ip3, g2_id, false, now, now, Some(now)).await;
+    // ip4 deleted in Gamma 2 days ago (within 7d)
+    add_test_membership(
+        db,
+        ip4,
+        g3_id,
+        false,
+        two_days_ago,
+        two_days_ago,
+        Some(two_days_ago),
+    )
+    .await;
+    // ip5 deleted in Alpha 10 days ago (outside 7d)
+    add_test_membership(
+        db,
+        ip5,
+        g1_id,
+        false,
+        ten_days_ago,
+        ten_days_ago,
+        Some(ten_days_ago),
+    )
+    .await;
+}
+
+async fn assert_intersection_pagination(
+    db: DatabaseConnection,
+    app: axum::Router,
+    now: chrono::NaiveDateTime,
+) {
     // Intersection pagination tests between Alpha and Beta:
     // Common IPs in Alpha and Beta: ip1 and ip2 (total overlap = 2)
     // Page limit 1, offset 0 -> 1 item
@@ -716,7 +568,9 @@ async fn test_analytics_new_statistics_and_pagination() {
     );
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+        .await
+        .unwrap();
     let isect: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(isect["total_overlap"], 2);
     assert_eq!(isect["items"].as_array().unwrap().len(), 1);
@@ -729,7 +583,9 @@ async fn test_analytics_new_statistics_and_pagination() {
     );
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+        .await
+        .unwrap();
     let isect: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(isect["total_overlap"], 2);
     assert_eq!(isect["items"].as_array().unwrap().len(), 1);
@@ -742,20 +598,20 @@ async fn test_analytics_new_statistics_and_pagination() {
     );
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+        .await
+        .unwrap();
     let isect: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(isect["total_overlap"], 2);
     assert_eq!(isect["items"].as_array().unwrap().len(), 0);
 
     // 3-Group intersection: Alpha, Beta, Gamma (only ip1 is in all three)
-    let req = signed_request(
-        "GET",
-        "/api/stats/intersection?groups=Alpha,Beta,Gamma",
-        "",
-    );
+    let req = signed_request("GET", "/api/stats/intersection?groups=Alpha,Beta,Gamma", "");
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+        .await
+        .unwrap();
     let isect3: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(isect3["total_overlap"], 1);
     assert_eq!(isect3["items"].as_array().unwrap().len(), 1);
@@ -766,29 +622,38 @@ async fn test_analytics_new_statistics_and_pagination() {
     assert!(gls["Gamma"].is_string());
 
     // Create an empty group Delta
-    let g4_id = Uuid::new_v4();
+    let _empty_group = add_test_group(&db, "Delta", None, now).await;
+
+    // Intersection with Delta should return total_overlap = 0 and empty items
+    let req = signed_request("GET", "/api/stats/intersection?groups=Alpha,Delta", "");
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let isect_empty: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(isect_empty["total_overlap"], 0);
+    assert_eq!(isect_empty["items"].as_array().unwrap().len(), 0);
+}
+
+async fn add_test_group(
+    db: &DatabaseConnection,
+    name: &str,
+    description: Option<&str>,
+    now: chrono::NaiveDateTime,
+) -> Uuid {
+    let id = Uuid::new_v4();
     ip_group::ActiveModel {
-        id: Set(g4_id),
-        name: Set("Delta".to_owned()),
-        description: Set(None),
+        id: Set(id),
+        name: Set(name.to_owned()),
+        description: Set(description.map(str::to_owned)),
+        allow_private_ips: Set(false),
         group_type: Set("banlist".to_owned()),
         owner_key_id: Set(None),
         created_at: Set(now),
     }
-    .insert(&db)
+    .insert(db)
     .await
     .unwrap();
-
-    // Intersection with Delta should return total_overlap = 0 and empty items
-    let req = signed_request(
-        "GET",
-        "/api/stats/intersection?groups=Alpha,Delta",
-        "",
-    );
-    let res = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
-    let isect_empty: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(isect_empty["total_overlap"], 0);
-    assert_eq!(isect_empty["items"].as_array().unwrap().len(), 0);
+    id
 }

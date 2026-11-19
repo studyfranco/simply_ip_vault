@@ -61,7 +61,7 @@ fn syntax_errors(relative: &str) -> Vec<String> {
             // reported error with an unknown position is still a reported error.
             // `offset()` is a `u32` in current oxc; widened once here so the slicing below stays in
             // `usize` and cannot silently truncate on a large file.
-            let offset = (err.labels.first().map_or(0, |span| span.offset()) as usize)
+            let offset = (err.labels.first().map_or(0, oxc_span::LabeledSpan::offset) as usize)
                 .min(source.len());
             let line = source[..offset].matches('\n').count() + 1;
             let column = offset - source[..offset].rfind('\n').map_or(0, |i| i + 1) + 1;

@@ -80,6 +80,7 @@ pick_port() {
             exit 1
         fi
         VAULT_PORT="$REQUESTED_PORT"
+        BASE_URL="http://127.0.0.1:$VAULT_PORT"
         return
     fi
 
@@ -384,6 +385,11 @@ cleanup() {
         kill "$HOOK_EXECUTOR_PID" 2>/dev/null || true
         wait "$HOOK_EXECUTOR_PID" 2>/dev/null || true
     fi
+    if [ -n "${EDGE_SSRF_VAULT_PID:-}" ] && kill -0 "$EDGE_SSRF_VAULT_PID" 2>/dev/null; then
+        log "Stopping edge SSRF simply_ip_vault (pid $EDGE_SSRF_VAULT_PID)..."
+        kill "$EDGE_SSRF_VAULT_PID" 2>/dev/null || true
+        wait "$EDGE_SSRF_VAULT_PID" 2>/dev/null || true
+    fi
     rm -rf "$WORK_DIR"
 }
 trap cleanup EXIT INT TERM
@@ -610,7 +616,7 @@ raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $EDGE_T
 check "200" "a 290s-old timestamp is still inside the 300s window"
 
 # The signature binds the body: replaying an authentic signature over different content fails.
-BIND_BODY='{"target_address":"198.51.100.77","group_name":"Group-Sig","cause":"signed"}'
+BIND_BODY='{"target_address":"45.51.100.77","group_name":"Group-Sig","cause":"signed"}'
 BIND_TS=$(date -u +%s)
 BIND_SIG=$(hmac_sign "$MASTER_SIGNING_SECRET" "POST" "/api/ban" "$BIND_TS" "$BIND_BODY")
 raw_call POST "/api/ban" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $BIND_TS" \
@@ -636,7 +642,7 @@ check "401" "a /api/ban signature replayed onto /api/white is rejected"
 # freshness check, every captured signature would stay replayable forever, since the signature
 # itself encodes no notion of time.
 STRIP_TS=$(date -u +%s)
-STRIP_BODY='{"target_address":"198.51.100.91","group_name":"Group-Sig","cause":"no-timestamp"}'
+STRIP_BODY='{"target_address":"45.51.100.91","group_name":"Group-Sig","cause":"no-timestamp"}'
 STRIP_SIG=$(hmac_sign "$MASTER_SIGNING_SECRET" "POST" "/api/ban" "$STRIP_TS" "$STRIP_BODY")
 raw_call POST "/api/ban" -H "X-API-Key: $MASTER_KEY" \
     -H "X-Signature-256: $STRIP_SIG" -H "Content-Type: application/json" -d "$STRIP_BODY"
@@ -746,28 +752,28 @@ check "200" "grant Write-Only Key read+write rights on Group A"
 # No-Access Key: no grant at all — left as-is.
 
 log "Seeding Group A with an address as master..."
-api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"198.51.100.50","group_name":"Group-A","cause":"seed"}'
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.51.100.50","group_name":"Group-A","cause":"seed"}'
 check "200" "master seeds an address into Group A"
 
 log "-- Read-Only Key --"
 api_call GET "/api/ips?group_id=$GROUP_A_ID" "$READONLY_KEY"
 check "200" "Read-Only Key can list Group A"
-api_call POST "/api/ban" "$READONLY_KEY" '{"target_address":"198.51.100.51","group_name":"Group-A"}'
+api_call POST "/api/ban" "$READONLY_KEY" '{"target_address":"45.51.100.51","group_name":"Group-A"}'
 check "403" "Read-Only Key cannot write to Group A"
 
 log "-- Write-Only Key --"
 api_call GET "/api/ips?group_id=$GROUP_A_ID" "$WRITEONLY_KEY"
 check "200" "Write-Only Key can list Group A"
-api_call POST "/api/ban" "$WRITEONLY_KEY" '{"target_address":"198.51.100.52","group_name":"Group-A"}'
+api_call POST "/api/ban" "$WRITEONLY_KEY" '{"target_address":"45.51.100.52","group_name":"Group-A"}'
 check "200" "Write-Only Key can write to Group A"
-api_call DELETE "/api/ips?target_address=198.51.100.52&group_name=Group-A" "$WRITEONLY_KEY"
+api_call DELETE "/api/ips?target_address=45.51.100.52&group_name=Group-A" "$WRITEONLY_KEY"
 check "403" "Write-Only Key cannot delete from Group A (no can_delete)"
 
 log "-- No-Access Key --"
 api_call GET "/api/ips?group_id=$GROUP_A_ID" "$NOACCESS_KEY"
 check "200" "No-Access Key's list call still succeeds..."
 check_jq "length" "0" "...but returns zero rows (RBAC-filtered, not a 403)"
-api_call POST "/api/ban" "$NOACCESS_KEY" '{"target_address":"198.51.100.53","group_name":"Group-A"}'
+api_call POST "/api/ban" "$NOACCESS_KEY" '{"target_address":"45.51.100.53","group_name":"Group-A"}'
 check "403" "No-Access Key cannot write to Group A"
 
 # ── 3. IP management across multiple groups ─────────────────────────────────
@@ -777,46 +783,46 @@ log_section "3. IP Add / List / Filter / Update / Delete Across Groups"
 api_call POST "/api/groups" "$MASTER_KEY" '{"name":"Group-B"}'
 check "200" "Group B is created"
 
-api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.10","group_name":"Group-B","cause":"initial-cause"}'
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.0.113.10","group_name":"Group-B","cause":"initial-cause"}'
 check "200" "add an address to Group B"
 
 # A group's type (banlist/whitelist) is fixed at creation and doesn't change per-membership, so
 # the whitelist example needs its OWN group rather than reusing Group B — /white auto-creates it
 # as type=whitelist since it doesn't exist yet.
-api_call POST "/api/white" "$MASTER_KEY" '{"target_address":"203.0.113.11","group_name":"Group-C"}'
+api_call POST "/api/white" "$MASTER_KEY" '{"target_address":"45.0.113.11","group_name":"Group-C"}'
 check "200" "whitelist an address into a fresh whitelist group (Group C)"
 
 api_call GET "/api/ips?groups=Group-A,Group-B,Group-C" "$MASTER_KEY"
 check "200" "list across multiple groups at once"
 check_jq "length" "4" "sees all 4 addresses across Group A + Group B + Group C"
 
-api_call GET "/api/ips?ip=203.0.113.10" "$MASTER_KEY"
+api_call GET "/api/ips?ip=45.0.113.10" "$MASTER_KEY"
 check "200" "filter by IP substring"
 check_jq "length" "1" "IP substring filter narrows to exactly one record"
 
 api_call GET "/api/ips?status=white" "$MASTER_KEY"
 check "200" "filter by status=white"
-check_jq ".[0].target_address" "203.0.113.11" "status filter finds the whitelisted address"
+check_jq ".[0].target_address" "45.0.113.11" "status filter finds the whitelisted address"
 
-log "Updating (re-registering) 203.0.113.10 with a new cause..."
-api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.10","group_name":"Group-B","cause":"updated-cause"}'
+log "Updating (re-registering) 45.0.113.10 with a new cause..."
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.0.113.10","group_name":"Group-B","cause":"updated-cause"}'
 check "200" "re-registering an existing address updates it rather than failing"
-api_call GET "/api/ips?ip=203.0.113.10" "$MASTER_KEY"
+api_call GET "/api/ips?ip=45.0.113.10" "$MASTER_KEY"
 check_jq ".[0].cause" "updated-cause" "the cause was actually updated"
 check_jq "length" "1" "still exactly one row — no duplicate created"
 
-log "Deleting 203.0.113.10 from Group B via query-string parameters..."
-api_call DELETE "/api/ips?target_address=203.0.113.10&group_name=Group-B" "$MASTER_KEY"
+log "Deleting 45.0.113.10 from Group B via query-string parameters..."
+api_call DELETE "/api/ips?target_address=45.0.113.10&group_name=Group-B" "$MASTER_KEY"
 check "204" "delete via query string succeeds"
-api_call GET "/api/ips?ip=203.0.113.10" "$MASTER_KEY"
+api_call GET "/api/ips?ip=45.0.113.10" "$MASTER_KEY"
 check_jq "length" "0" "the query-string-deleted address is gone"
 
-log "Adding 203.0.113.20 to Group B, then deleting it via a JSON request body instead..."
-api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.20","group_name":"Group-B","cause":"json-body-delete-test"}'
-check "200" "add 203.0.113.20 to Group B for the JSON-body delete test"
-api_call DELETE "/api/ips" "$MASTER_KEY" '{"target_address":"203.0.113.20","group_name":"Group-B"}'
+log "Adding 45.0.113.20 to Group B, then deleting it via a JSON request body instead..."
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.0.113.20","group_name":"Group-B","cause":"json-body-delete-test"}'
+check "200" "add 45.0.113.20 to Group B for the JSON-body delete test"
+api_call DELETE "/api/ips" "$MASTER_KEY" '{"target_address":"45.0.113.20","group_name":"Group-B"}'
 check "204" "delete via JSON body (no query string at all) succeeds"
-api_call GET "/api/ips?ip=203.0.113.20" "$MASTER_KEY"
+api_call GET "/api/ips?ip=45.0.113.20" "$MASTER_KEY"
 check_jq "length" "0" "the JSON-body-deleted address is gone"
 
 # ── 4. Multi-group overlap / conflict detection ─────────────────────────────
@@ -824,16 +830,16 @@ check_jq "length" "0" "the JSON-body-deleted address is gone"
 log_section "4. Multi-Group Overlap (Banlist + Whitelist) Conflict Detection"
 
 log "Adding the SAME address to both a banlist group and a whitelist group..."
-api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"192.0.2.200","group_name":"Group-B","cause":"flagged as hostile"}'
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.0.2.200","group_name":"Group-B","cause":"flagged as hostile"}'
 check "200" "address added to banlist Group B"
-api_call POST "/api/white" "$MASTER_KEY" '{"target_address":"192.0.2.200","group_name":"Group-C","cause":"also a trusted partner"}'
+api_call POST "/api/white" "$MASTER_KEY" '{"target_address":"45.0.2.200","group_name":"Group-C","cause":"also a trusted partner"}'
 check "200" "the SAME address added to whitelist Group C"
 
-api_call GET "/api/ips?ip=192.0.2.200" "$MASTER_KEY"
+api_call GET "/api/ips?ip=45.0.2.200" "$MASTER_KEY"
 check "200" "list the overlapping address"
 check_jq "length" "2" "GET /api/ips exposes BOTH memberships (one row per group), not a single merged/deduped row"
 check_true '[.[].group_type] | sort == ["banlist","whitelist"]' "the two rows carry the two different group_types the UI conflict indicator diffs on"
-check_true '[.[].target_address] | unique == ["192.0.2.200"]' "both rows are unambiguously the same address"
+check_true '[.[].target_address] | unique == ["45.0.2.200"]' "both rows are unambiguously the same address"
 
 # ── 5. Key lifecycle: update + rotate ───────────────────────────────────────
 
@@ -1054,7 +1060,7 @@ api_call POST "/api/keys/$NOACCESS_ID/groups" "$MASTER_KEY" \
 check "400" "can_write without can_read is rejected (least-privilege rule)"
 
 log "Assigning rights via a literal group_name ('fail2ban_nginx') alongside a UUID-based grant..."
-api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"198.51.100.77","group_name":"fail2ban_nginx","cause":"nginx probing"}'
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.51.100.77","group_name":"fail2ban_nginx","cause":"nginx probing"}'
 check "200" "seed the fail2ban_nginx group into existence"
 api_call GET "/api/groups" "$MASTER_KEY"
 check "200" "list groups to find fail2ban_nginx's id"
@@ -1149,7 +1155,7 @@ api_call POST "/api/groups" "$MASTER_KEY" '{"name":"cascade-test-group"}'
 check "200" "create the temporary cascade-test-group"
 CASCADE_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
-api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"198.51.100.90","group_name":"cascade-test-group","cause":"cascade delete test"}'
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.51.100.90","group_name":"cascade-test-group","cause":"cascade delete test"}'
 check "200" "add an IP record into the temporary group"
 
 create_scoped_key "Cascade Test Key"
@@ -1165,7 +1171,7 @@ check "204" "the group with attached records/permissions is removed cleanly, wit
 api_call GET "/api/groups" "$MASTER_KEY"
 check_true "all(.[]; .id != \"$CASCADE_GROUP_ID\")" "the deleted group no longer appears in the group list"
 
-api_call GET "/api/ips?ip=198.51.100.90" "$MASTER_KEY"
+api_call GET "/api/ips?ip=45.51.100.90" "$MASTER_KEY"
 check_jq "length" "0" "its IP record's membership was cascade-deleted along with the group"
 
 api_call POST "/api/keys/$CASCADE_KEY_ID/groups" "$MASTER_KEY" \
@@ -1249,7 +1255,7 @@ if [ "$WEBHOOK_RECEIVER_AVAILABLE" -eq 1 ]; then
     check_true "any(.[]; .id == \"$EVENT_FILTER_WEBHOOK_ID\" and .events == \"IP_ADD\")" "the events field round-trips and is visible when listing webhooks"
 
     log "Banning a brand-new address (IP_ADD) — the events:\"IP_ADD\" webhook should fire..."
-    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"192.0.2.250","group_name":"event-filter-group","cause":"event filter test"}'
+    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.0.2.250","group_name":"event-filter-group","cause":"event filter test"}'
     check "200" "add the address (IP_ADD)"
 
     HITS=0
@@ -1288,7 +1294,7 @@ if [ "$WEBHOOK_RECEIVER_AVAILABLE" -eq 1 ]; then
         "the real dispatch above produced a matching webhook_executions row (event_type=IP_ADD, is_success=true, status_code=200)"
 
     log "Re-registering the same address (IP_UPDATE) — must NOT fire (not subscribed)..."
-    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"192.0.2.250","group_name":"event-filter-group","cause":"updated"}'
+    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.0.2.250","group_name":"event-filter-group","cause":"updated"}'
     check "200" "re-register the address (IP_UPDATE)"
     sleep 1
     HITS=$(count_receiver_hits)
@@ -1301,7 +1307,7 @@ if [ "$WEBHOOK_RECEIVER_AVAILABLE" -eq 1 ]; then
     fi
 
     log "Deleting the address (IP_DELETE) — must also NOT fire..."
-    api_call DELETE "/api/ips?target_address=192.0.2.250&group_name=event-filter-group" "$MASTER_KEY"
+    api_call DELETE "/api/ips?target_address=45.0.2.250&group_name=event-filter-group" "$MASTER_KEY"
     check "204" "delete the address (IP_DELETE)"
     sleep 1
     HITS=$(count_receiver_hits)
@@ -1331,13 +1337,13 @@ check_true '(.[0].api_key_prefix | length) == 8' "the audit entry's api_key_pref
 log_section "15. RBAC Precedence & Strict Group Type Validation"
 
 log "Master creates a whitelist group and a banlist group for the type-validation scenarios..."
-api_call POST "/api/white" "$MASTER_KEY" '{"target_address":"203.0.113.60","group_name":"rbac-precedence-whitelist","cause":"seed"}'
+api_call POST "/api/white" "$MASTER_KEY" '{"target_address":"45.0.113.60","group_name":"rbac-precedence-whitelist","cause":"seed"}'
 check "200" "seed the whitelist group"
-api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.61","group_name":"rbac-precedence-banlist","cause":"seed"}'
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.0.113.61","group_name":"rbac-precedence-banlist","cause":"seed"}'
 check "200" "seed the banlist group"
 
 log "A key with NO permission mapping on the whitelist group attempts to ban into it..."
-api_call POST "/api/ban" "$NOACCESS_KEY" '{"target_address":"198.51.100.30","group_name":"rbac-precedence-whitelist"}'
+api_call POST "/api/ban" "$NOACCESS_KEY" '{"target_address":"45.51.100.30","group_name":"rbac-precedence-whitelist"}'
 check "403" "no-access key gets 403 (RBAC), not 400 (type mismatch) — permission is checked first"
 check_true '.error | contains("Permission denied")' "the 403 body is a genuine permission-denied error, not a type-validation one"
 
@@ -1352,13 +1358,13 @@ api_call POST "/api/keys/$TYPE_CHECK_ID/groups" "$MASTER_KEY" \
 check "200" "grant the type-validation key rights on the banlist group"
 
 log "Now authorized: banning into the whitelist group is rejected with the exact 400 message..."
-api_call POST "/api/ban" "$TYPE_CHECK_KEY" '{"target_address":"198.51.100.31","group_name":"rbac-precedence-whitelist"}'
+api_call POST "/api/ban" "$TYPE_CHECK_KEY" '{"target_address":"45.51.100.31","group_name":"rbac-precedence-whitelist"}'
 check "400" "banning into a whitelist group is rejected with 400, not 200 or 403"
 check_jq ".error" "Cannot ban IP into group 'rbac-precedence-whitelist': group type is 'whitelist'. Use /api/white or target a banlist group." \
     "the error message exactly matches the spec"
 
 log "Whitelisting into the banlist group is rejected with the exact reverse 400 message..."
-api_call POST "/api/white" "$TYPE_CHECK_KEY" '{"target_address":"198.51.100.32","group_name":"rbac-precedence-banlist"}'
+api_call POST "/api/white" "$TYPE_CHECK_KEY" '{"target_address":"45.51.100.32","group_name":"rbac-precedence-banlist"}'
 check "400" "whitelisting into a banlist group is rejected with 400, not 200 or 403"
 check_jq ".error" "Cannot whitelist IP into group 'rbac-precedence-banlist': group type is 'banlist'. Use /api/ban or target a whitelist group." \
     "the error message exactly matches the reverse spec"
@@ -1385,7 +1391,7 @@ check_true "[.group_permissions[] | select(.group_id == \"$EXPLICIT_CREATOR_GROU
     "that permission record grants full can_read/can_write/can_delete"
 
 log "Implicit creation via POST /api/ban (auto-create-on-first-use)..."
-api_call POST "/api/ban" "$GROUP_CREATOR_KEY" '{"target_address":"198.51.100.240","group_name":"implicit-creator-group","cause":"testing implicit auto-grant"}'
+api_call POST "/api/ban" "$GROUP_CREATOR_KEY" '{"target_address":"45.51.100.240","group_name":"implicit-creator-group","cause":"testing implicit auto-grant"}'
 check "200" "the can_create_groups key implicitly creates a new group via POST /api/ban"
 
 api_call GET "/api/groups" "$MASTER_KEY"
@@ -1444,40 +1450,40 @@ api_call GET "/api/ips?groups=canon-e2e-group" "$MASTER_KEY"
 check_jq "length" "0" "the record is actually gone"
 
 log "A genuine subnet (not a single-host CIDR) must keep its CIDR notation unchanged..."
-api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.0/24","group_name":"canon-e2e-group","cause":"real subnet"}'
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.0.113.0/24","group_name":"canon-e2e-group","cause":"real subnet"}'
 check "200" "ban a /24 subnet"
 api_call GET "/api/ips?groups=canon-e2e-group" "$MASTER_KEY"
-check_jq ".[0].target_address" "203.0.113.0/24" "a /24 keeps its CIDR notation (already the network address; host bits would be masked)"
+check_jq ".[0].target_address" "45.0.113.0/24" "a /24 keeps its CIDR notation (already the network address; host bits would be masked)"
 
 # ── 19. Latest-activity-first ordering & lightweight iplist format ──────────
 
 log_section "19. Latest-Activity-First Ordering & Lightweight iplist Format"
 
 log "Banning 3 addresses in sequence — GET /api/ips must return them most-recent-first..."
-api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"198.51.100.201","group_name":"ordering-e2e-group"}'
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.51.100.201","group_name":"ordering-e2e-group"}'
 check "200" "ban address 1"
-api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"198.51.100.202","group_name":"ordering-e2e-group"}'
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.51.100.202","group_name":"ordering-e2e-group"}'
 check "200" "ban address 2"
-api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"198.51.100.203","group_name":"ordering-e2e-group"}'
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.51.100.203","group_name":"ordering-e2e-group"}'
 check "200" "ban address 3"
 
 api_call GET "/api/ips?groups=ordering-e2e-group" "$MASTER_KEY"
 check "200" "list the ordering test group"
-check_jq ".[0].target_address" "198.51.100.203" "the most recently created record sorts first"
-check_jq ".[2].target_address" "198.51.100.201" "the oldest record sorts last"
+check_jq ".[0].target_address" "45.51.100.203" "the most recently created record sorts first"
+check_jq ".[2].target_address" "45.51.100.201" "the oldest record sorts last"
 
 log "Re-banning the oldest address must move it back to the front..."
-api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"198.51.100.201","group_name":"ordering-e2e-group","cause":"renewed"}'
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.51.100.201","group_name":"ordering-e2e-group","cause":"renewed"}'
 check "200" "re-ban address 1"
 api_call GET "/api/ips?groups=ordering-e2e-group" "$MASTER_KEY"
-check_jq ".[0].target_address" "198.51.100.201" "the re-registered record jumps back to the front"
+check_jq ".[0].target_address" "45.51.100.201" "the re-registered record jumps back to the front"
 
 log "GET /api/ips?format=iplist returns a lightweight, deduplicated address list..."
 api_call GET "/api/ips?groups=ordering-e2e-group&format=iplist" "$MASTER_KEY"
 check "200" "iplist format request succeeds"
 check_true '(.ip_list | type) == "array"' "the response has an ip_list array"
 check_jq "(.ip_list | length)" "3" "all 3 addresses are present"
-check_true '.ip_list | contains(["198.51.100.201","198.51.100.202","198.51.100.203"])' "the exact addresses are present"
+check_true '.ip_list | contains(["45.51.100.201","45.51.100.202","45.51.100.203"])' "the exact addresses are present"
 
 log "mode=iplist is accepted as a synonym for format=iplist..."
 api_call GET "/api/ips?groups=ordering-e2e-group&mode=iplist" "$MASTER_KEY"
@@ -1490,7 +1496,7 @@ log_section "19b. GET /api/ips?include_total=true Pagination Envelope"
 
 log "Seeding 5 records in a dedicated group..."
 for n in 1 2 3 4 5; do
-    api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"198.51.100.21${n}\",\"group_name\":\"include-total-e2e-group\"}"
+    api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"45.51.100.21${n}\",\"group_name\":\"include-total-e2e-group\"}"
     check "200" "seed record #$n"
 done
 
@@ -1697,7 +1703,7 @@ if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
     check_true '.auth_mode == "CANONICAL_V1"' "creation echoes CANONICAL_V1"
     CANON_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
-    api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"198.51.100.222\",\"group_name\":\"SigMode-Group\",\"cause\":\"canonical dispatch\"}"
+    api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"45.51.100.222\",\"group_name\":\"SigMode-Group\",\"cause\":\"canonical dispatch\"}"
     check "200" "ban an address to trigger the canonical dispatch"
 
     # Dispatch is asynchronous; poll for the delivery line.
@@ -1764,7 +1770,7 @@ if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
     check "200" "create an HMAC_ONLY webhook on the same receiver"
     LEGACY_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
-    api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"198.51.100.223\",\"group_name\":\"SigMode-Group\"}"
+    api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"45.51.100.223\",\"group_name\":\"SigMode-Group\"}"
     check "200" "ban an address to trigger the legacy dispatch"
 
     for _ in $(seq 1 40); do
@@ -1824,7 +1830,7 @@ if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
     check "200" "create a CANONICAL_V1 webhook with a hardcoded-path hmac_template"
     TEMPLATE_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
-    api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"198.51.100.224\",\"group_name\":\"SigMode-Group\",\"cause\":\"templated dispatch\"}"
+    api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"45.51.100.224\",\"group_name\":\"SigMode-Group\",\"cause\":\"templated dispatch\"}"
     check "200" "ban an address to trigger the templated dispatch"
 
     for _ in $(seq 1 40); do
@@ -1884,7 +1890,7 @@ if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
     check "204" "delete the templated webhook"
 
     # The two unsigned modes, back to back through the same receiver.
-    for MODE_SPEC in "API_KEY_ONLY:198.51.100.225:$DOWNSTREAM_KEY" "NONE:198.51.100.226:"; do
+    for MODE_SPEC in "API_KEY_ONLY:45.51.100.225:$DOWNSTREAM_KEY" "NONE:45.51.100.226:"; do
         MODE="${MODE_SPEC%%:*}"
         REST="${MODE_SPEC#*:}"
         MODE_ADDR="${REST%%:*}"
@@ -1968,67 +1974,67 @@ api_call POST "/api/keys/$SOFTDEL_KEY_ID/permissions" "$MASTER_KEY" \
     "{\"group_id\":\"$SOFTDEL_GROUP_ID\",\"can_read\":true,\"can_write\":true,\"can_delete\":true}"
 check "200" "grant the deleter full rights on the group"
 
-api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"198.51.100.201","group_name":"softdelete-group","cause":"soft delete test"}'
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.51.100.201","group_name":"softdelete-group","cause":"soft delete test"}'
 check "200" "ban an address to soft-delete"
 
 api_call GET "/api/ips?groups=softdelete-group" "$MASTER_KEY"
 check "200" "list the group before deletion"
 
 # A non-master delete must be soft: hidden from reads, row retained.
-api_call DELETE "/api/ips" "$SOFTDEL_KEY" '{"target_address":"198.51.100.201","group_name":"softdelete-group"}'
+api_call DELETE "/api/ips" "$SOFTDEL_KEY" '{"target_address":"45.51.100.201","group_name":"softdelete-group"}'
 check "204" "a non-master DELETE /api/ips (by address and group) succeeds"
 
 api_call GET "/api/ips?groups=softdelete-group" "$SOFTDEL_KEY"
 check "200" "the deleter lists the group after deleting"
-check_true '[.[] | select(.target_address == "198.51.100.201")] | length == 0' \
+check_true '[.[] | select(.target_address == "45.51.100.201")] | length == 0' \
     "the soft-deleted record is hidden from the non-master listing"
 
 api_call GET "/api/ips?groups=softdelete-group&format=iplist" "$SOFTDEL_KEY"
 check "200" "the iplist export also runs after deletion"
-check_true '[.ip_list[] | select(. == "198.51.100.201")] | length == 0' \
+check_true '[.ip_list[] | select(. == "45.51.100.201")] | length == 0' \
     "the soft-deleted record is excluded from the iplist export too"
 
 # A non-master cannot escalate to a permanent delete.
-api_call DELETE "/api/ips?hard=true" "$SOFTDEL_KEY" '{"target_address":"198.51.100.201","group_name":"softdelete-group"}'
+api_call DELETE "/api/ips?hard=true" "$SOFTDEL_KEY" '{"target_address":"45.51.100.201","group_name":"softdelete-group"}'
 check "403" "a non-master cannot hard-delete a record"
 
 # The master trash view sees it, with its attribution.
 api_call GET "/api/ips?include_deleted=true&groups=softdelete-group" "$MASTER_KEY"
 check "200" "master lists the trash with include_deleted=true"
-check_true '[.[] | select(.target_address == "198.51.100.201" and .is_deleted == true)] | length == 1' \
+check_true '[.[] | select(.target_address == "45.51.100.201" and .is_deleted == true)] | length == 1' \
     "the master trash view exposes the soft-deleted record"
-check_true "[.[] | select(.target_address == \"198.51.100.201\") | .deleted_by == \"$SOFTDEL_KEY_ID\"] | all" \
+check_true "[.[] | select(.target_address == \"45.51.100.201\") | .deleted_by == \"$SOFTDEL_KEY_ID\"] | all" \
     "deleted_by attributes the key that issued the delete"
 
 # The master's DEFAULT listing still hides it — the trash is opt-in, not a master-only default view.
 api_call GET "/api/ips?groups=softdelete-group" "$MASTER_KEY"
 check "200" "master lists the group without include_deleted"
-check_true '[.[] | select(.target_address == "198.51.100.201")] | length == 0' \
+check_true '[.[] | select(.target_address == "45.51.100.201")] | length == 0' \
     "the trash stays hidden unless include_deleted is explicitly requested"
 
 # Restore.
-api_call POST "/api/ips/restore" "$SOFTDEL_KEY" '{"target_address":"198.51.100.201","group_name":"softdelete-group"}'
+api_call POST "/api/ips/restore" "$SOFTDEL_KEY" '{"target_address":"45.51.100.201","group_name":"softdelete-group"}'
 check "403" "a non-master cannot restore a deleted record"
 
-api_call POST "/api/ips/restore" "$MASTER_KEY" '{"target_address":"198.51.100.201","group_name":"softdelete-group"}'
+api_call POST "/api/ips/restore" "$MASTER_KEY" '{"target_address":"45.51.100.201","group_name":"softdelete-group"}'
 check "200" "master restores the soft-deleted record"
 check_true '.restored == true' "the restore is reported"
 
 api_call GET "/api/ips?groups=softdelete-group" "$SOFTDEL_KEY"
 check "200" "list the group after restoration"
-check_true '[.[] | select(.target_address == "198.51.100.201")] | length == 1' \
+check_true '[.[] | select(.target_address == "45.51.100.201")] | length == 1' \
     "the restored record is visible again"
 
-api_call POST "/api/ips/restore" "$MASTER_KEY" '{"target_address":"198.51.100.201","group_name":"softdelete-group"}'
+api_call POST "/api/ips/restore" "$MASTER_KEY" '{"target_address":"45.51.100.201","group_name":"softdelete-group"}'
 check "400" "restoring an already-live record is rejected"
 
 # Re-banning a soft-deleted address must resurrect it rather than collide with the unique index.
-api_call DELETE "/api/ips" "$SOFTDEL_KEY" '{"target_address":"198.51.100.201","group_name":"softdelete-group"}'
+api_call DELETE "/api/ips" "$SOFTDEL_KEY" '{"target_address":"45.51.100.201","group_name":"softdelete-group"}'
 check "204" "soft-delete the record again"
-api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"198.51.100.201","group_name":"softdelete-group","cause":"seen again"}'
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.51.100.201","group_name":"softdelete-group","cause":"seen again"}'
 check "200" "re-banning a soft-deleted address succeeds instead of colliding"
 api_call GET "/api/ips?groups=softdelete-group" "$MASTER_KEY"
-check_true '[.[] | select(.target_address == "198.51.100.201")] | length == 1' \
+check_true '[.[] | select(.target_address == "45.51.100.201")] | length == 1' \
     "re-registration resurrected the record"
 
 # Purge: master-only, and the window cannot be set to a destructive zero.
@@ -2047,15 +2053,15 @@ check_true '.retention_days == 92' "the default retention window is 92 days"
 check_true '.purged == 0' "nothing is purged: the only deleted record is far younger than 92 days"
 
 api_call GET "/api/ips?groups=softdelete-group" "$MASTER_KEY"
-check_true '[.[] | select(.target_address == "198.51.100.201")] | length == 1' \
+check_true '[.[] | select(.target_address == "45.51.100.201")] | length == 1' \
     "the live record survived the purge"
 
 # Master hard delete really drops the row.
-api_call DELETE "/api/ips?hard=true" "$MASTER_KEY" '{"target_address":"198.51.100.201","group_name":"softdelete-group"}'
+api_call DELETE "/api/ips?hard=true" "$MASTER_KEY" '{"target_address":"45.51.100.201","group_name":"softdelete-group"}'
 check "204" "master hard-deletes the record"
 
 api_call GET "/api/ips?include_deleted=true&groups=softdelete-group" "$MASTER_KEY"
-check_true '[.[] | select(.target_address == "198.51.100.201")] | length == 0' \
+check_true '[.[] | select(.target_address == "45.51.100.201")] | length == 0' \
     "a hard-deleted record is gone even from the trash view"
 
 log_section "24c. Whitelist Parity: Update, Soft Delete, Restore, Hard Delete"
@@ -2531,7 +2537,7 @@ if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
     EDITVERIFY_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
     log "Before any edit: banning a new address must reach /before-edit..."
-    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"192.0.2.150","group_name":"edit-verify-group","cause":"pre-edit"}'
+    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.0.2.150","group_name":"edit-verify-group","cause":"pre-edit"}'
     check "200" "IP_ADD before editing the webhook"
     BEFORE_HITS=0
     for _ in $(seq 1 20); do
@@ -2551,7 +2557,7 @@ if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
     check_jq ".events" "IP_DELETE" "the PUT response reports the new events filter"
 
     log "After the edit: an IP_ADD on a fresh address must fire on NEITHER path — events no longer includes IP_ADD..."
-    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"192.0.2.151","group_name":"edit-verify-group","cause":"post-edit, wrong event"}'
+    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.0.2.151","group_name":"edit-verify-group","cause":"post-edit, wrong event"}'
     check "200" "IP_ADD after editing the webhook (the ban itself still succeeds; only dispatch is filtered)"
     sleep 1
     check_local "$(count_receiver_hits_for_path "/before-edit")" "1" \
@@ -2560,7 +2566,7 @@ if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
         "the new URL received nothing either — IP_ADD is no longer a subscribed event"
 
     log "Deleting that same address (IP_DELETE) must now reach /after-edit — proving both edits together..."
-    api_call DELETE "/api/ips?target_address=192.0.2.151&group_name=edit-verify-group" "$MASTER_KEY"
+    api_call DELETE "/api/ips?target_address=45.0.2.151&group_name=edit-verify-group" "$MASTER_KEY"
     check "204" "IP_DELETE after editing the webhook"
     AFTER_HITS=0
     for _ in $(seq 1 20); do
@@ -2593,7 +2599,7 @@ if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
     TMPLURL_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
     api_call POST "/api/ban" "$MASTER_KEY" \
-        '{"target_address":"192.0.2.170","group_name":"tmpl-url-group","cause":"templating-e2e-cause"}'
+        '{"target_address":"45.0.2.170","group_name":"tmpl-url-group","cause":"templating-e2e-cause"}'
     check "200" "#25c IP_ADD to trigger the templated webhook"
 
     TMPLURL_HITS=0
@@ -2617,7 +2623,7 @@ if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
     check "200" "#25c list this webhook's executions"
     check_jq ".[0].resolved_target_url" "http://127.0.0.1:$RECEIVER_PORT/tmpl-hooks/IP_ADD" \
         "the execution row's resolved_target_url has \$action already expanded"
-    check_jq ".[0].target_address" "192.0.2.170" "the execution row records the triggering event's address"
+    check_jq ".[0].target_address" "45.0.2.170" "the execution row records the triggering event's address"
     check_jq ".[0].cause" "templating-e2e-cause" "the execution row records the triggering event's cause"
     TMPLURL_EXEC_ID=$(echo "$RESP_BODY" | jq -r '.[0].id')
 
@@ -2630,7 +2636,7 @@ if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
     check_true 'length == 1 and .[0].id == "'"$TMPLURL_EXEC_ID"'"' \
         "#25c search matches by cause and returns exactly this row"
 
-    api_call GET "/api/webhooks/executions?ip=192.0.2.170" "$MASTER_KEY"
+    api_call GET "/api/webhooks/executions?ip=45.0.2.170" "$MASTER_KEY"
     check_true 'length == 1 and .[0].id == "'"$TMPLURL_EXEC_ID"'"' \
         "#25c ip filter matches the triggering event's address"
 
@@ -2676,7 +2682,7 @@ log_section "26. Convergence — Full-URI Signing, Anti-Replay & Fail-Closed Cry
 # forge a signature could still append `?hard=true` to a captured `DELETE /api/ips` and turn a
 # reversible soft delete into an irreversible purge — no secret required.
 
-api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"198.51.100.240","group_name":"convergence-group","cause":"full-uri signing"}'
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.51.100.240","group_name":"convergence-group","cause":"full-uri signing"}'
 check "200" "#26 seed a record for the query-tampering checks"
 
 api_call GET "/api/ips?groups=convergence-group" "$MASTER_KEY"
@@ -2686,7 +2692,7 @@ check "200" "#26 read the seeded record back"
 # attacker performs.
 next_timestamp "TAMPER|convergence"
 TAMPER_TS="$SIGNED_TS"
-TAMPER_BODY='{"target_address":"198.51.100.240","group_name":"convergence-group"}'
+TAMPER_BODY='{"target_address":"45.51.100.240","group_name":"convergence-group"}'
 TAMPER_SIG=$(hmac_sign "$MASTER_SIGNING_SECRET" "DELETE" "/api/ips" "$TAMPER_TS" "$TAMPER_BODY")
 raw_call DELETE "/api/ips?hard=true" \
     -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $TAMPER_TS" -H "X-Signature-256: $TAMPER_SIG" \
@@ -2694,7 +2700,7 @@ raw_call DELETE "/api/ips?hard=true" \
 check "401" "#26 a query string appended after signing breaks the signature"
 
 api_call GET "/api/ips?groups=convergence-group" "$MASTER_KEY"
-check_true '[.[] | select(.target_address == "198.51.100.240")] | length == 1' \
+check_true '[.[] | select(.target_address == "45.51.100.240")] | length == 1' \
     "#26 the record survived the rejected escalation"
 
 # The mirror image: a signature computed *with* a query is not valid without it, so a parameter
@@ -2721,7 +2727,7 @@ check "200" "#26 a correctly signed query string authenticates normally"
 
 next_timestamp "REPLAY|convergence"
 REPLAY_TS="$SIGNED_TS"
-REPLAY_BODY='{"target_address":"198.51.100.241","group_name":"convergence-group","cause":"replay probe"}'
+REPLAY_BODY='{"target_address":"45.51.100.241","group_name":"convergence-group","cause":"replay probe"}'
 REPLAY_SIG=$(hmac_sign "$MASTER_SIGNING_SECRET" "POST" "/api/ban" "$REPLAY_TS" "$REPLAY_BODY")
 
 raw_call POST "/api/ban" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $REPLAY_TS" \
@@ -2742,7 +2748,7 @@ check "401" "#26 the replay stays rejected on further attempts"
 
 # ...while a freshly signed request from the same key is unaffected, proving the guard rejects
 # replays rather than simply burning the key after one use.
-api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"198.51.100.242","group_name":"convergence-group","cause":"fresh after replay"}'
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.51.100.242","group_name":"convergence-group","cause":"fresh after replay"}'
 check "200" "#26 a freshly signed request from the same key still works"
 
 # --- Fail-closed cipher initialization --------------------------------------------------------
@@ -2896,7 +2902,7 @@ log_section "27. Hardening — Monotonic Replay Guard, RBAC Revocation & Strict 
 
 next_timestamp "SPELL|convergence"
 SPELL_TS="$SIGNED_TS"
-SPELL_BODY='{"target_address":"198.51.100.243","group_name":"convergence-group","cause":"digest keying"}'
+SPELL_BODY='{"target_address":"45.51.100.243","group_name":"convergence-group","cause":"digest keying"}'
 SPELL_SIG=$(hmac_sign "$MASTER_SIGNING_SECRET" "POST" "/api/ban" "$SPELL_TS" "$SPELL_BODY")
 
 raw_call POST "/api/ban" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $SPELL_TS" \
@@ -3219,7 +3225,7 @@ check "200" "#6 the daughter creates a group it owns"
 CASC_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
 # An IP inside it, to prove the cascade never destroys resource data.
-api_call POST "/api/ban" "$CASC_CHILD_KEY" '{"target_address":"203.0.113.211","group_name":"cascade-owned-group","cause":"pre-cascade"}'
+api_call POST "/api/ban" "$CASC_CHILD_KEY" '{"target_address":"45.0.113.211","group_name":"cascade-owned-group","cause":"pre-cascade"}'
 check "200" "#6 put a record in the owned group"
 
 # Deleting the root refuses, and hands back the inventory.
@@ -3274,7 +3280,7 @@ check_true "[.[] | select(.name == \"cascade-owned-group\") | select(.owner_key_
 
 api_call GET "/api/ips?group_name=cascade-owned-group" "$MASTER_KEY"
 check "200" "#6 read the reassigned group's records"
-check_true '[.[] | select(.target_address == "203.0.113.211")] | length == 1' \
+check_true '[.[] | select(.target_address == "45.0.113.211")] | length == 1' \
     "#6 resource data is never destroyed implicitly (§6)"
 
 # --- 27d. A wrong-but-well-formed encryption key refuses startup, not just a request -----------
@@ -3592,20 +3598,20 @@ EDGE_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
 # Two entries for one address, with conflicting causes. Must be a clean 400 naming the address —
 # never a 500 from the UNIQUE constraint, and never a silent last-wins that depends on payload order.
 api_call POST "/api/records/batch" "$MASTER_KEY" \
-    "{\"group_name\":\"edge-group\",\"records\":[{\"target_address\":\"203.0.113.240\",\"cause\":\"first\"},{\"target_address\":\"203.0.113.240\",\"cause\":\"second\"}]}"
+    "{\"group_name\":\"edge-group\",\"records\":[{\"target_address\":\"45.0.113.240\",\"cause\":\"first\"},{\"target_address\":\"45.0.113.240\",\"cause\":\"second\"}]}"
 check "400" "#30 an intra-batch duplicate is refused, not surfaced as a database error"
 check_true '.error | test("uplicate")' "#30 the refusal says what was wrong"
-check_true '.error | test("203.0.113.240")' "#30 and names the offending address"
+check_true '.error | test("45.0.113.240")' "#30 and names the offending address"
 
 # Different spellings of one host collide the same way, because the check runs after canonicalisation.
 api_call POST "/api/records/batch" "$MASTER_KEY" \
-    "{\"group_name\":\"edge-group\",\"records\":[{\"target_address\":\"203.0.113.241\"},{\"target_address\":\"203.0.113.241/32\"}]}"
+    "{\"group_name\":\"edge-group\",\"records\":[{\"target_address\":\"45.0.113.241\"},{\"target_address\":\"45.0.113.241/32\"}]}"
 check "400" "#30 two spellings of one host are a duplicate after canonicalisation"
 
 # The control: the same shape without the duplicate succeeds, so the refusals above were the
 # duplicate and not something incidental about batch payloads.
 api_call POST "/api/records/batch" "$MASTER_KEY" \
-    "{\"group_name\":\"edge-group\",\"records\":[{\"target_address\":\"203.0.113.242\"},{\"target_address\":\"203.0.113.243\"}]}"
+    "{\"group_name\":\"edge-group\",\"records\":[{\"target_address\":\"45.0.113.242\"},{\"target_address\":\"45.0.113.243\"}]}"
 check "200" "#30 a batch of distinct addresses is accepted"
 check_true '.created == 2' "#30 both records were created"
 
@@ -3616,7 +3622,7 @@ check_true '.created == 2' "#30 both records were created"
 #
 # Its own group and a range no other section touches. `target_address` is globally UNIQUE, so a
 # record created by an earlier section is the *same row* here — an earlier draft of this block reused
-# 203.0.113.0/24, which §16 already bans, and the `.created == 1` assertion failed because the batch
+# 45.0.113.0/24, which §16 already bans, and the `.created == 1` assertion failed because the batch
 # correctly reported `updated` instead. The isolation is what makes "created" mean what it says.
 api_call POST "/api/groups" "$MASTER_KEY" \
     "{\"name\":\"cidr-group\",\"group_type\":\"banlist\"}"
@@ -3653,10 +3659,10 @@ check_true '[.[] | select(.target_address == "93.184.216.77")] | length == 1' \
 
 # IPv6 subnets follow the same rule.
 api_call POST "/api/records/batch" "$MASTER_KEY" \
-    "{\"group_name\":\"cidr-group\",\"records\":[{\"target_address\":\"2001:db8:beef::fe/64\"}]}"
+    "{\"group_name\":\"cidr-group\",\"records\":[{\"target_address\":\"2606:4700:beef::fe/64\"}]}"
 check "200" "#30 an IPv6 CIDR with host bits set is accepted"
-api_call GET "/api/ips?groups=cidr-group&ip=2001:db8:beef&limit=100" "$MASTER_KEY"
-check_true '[.[] | select(.target_address == "2001:db8:beef::/64")] | length == 1' \
+api_call GET "/api/ips?groups=cidr-group&ip=2606:4700:beef&limit=100" "$MASTER_KEY"
+check_true '[.[] | select(.target_address == "2606:4700:beef::/64")] | length == 1' \
     "#30 the IPv6 CIDR is stored masked to its network address"
 
 # ── IPv6 canonicalisation over the wire (with /48 normalization temporarily off) ──────────────
@@ -3666,27 +3672,27 @@ api_call PUT "/api/settings" "$MASTER_KEY" '{"normalize_ipv6_to_48":false}'
 check "200" "#30 disable IPv6 /48 normalization temporarily to test raw /128 host canonicalisation"
 
 api_call POST "/api/records/batch" "$MASTER_KEY" \
-    "{\"group_name\":\"edge-group\",\"records\":[{\"target_address\":\"2001:0db8:0000:0000:0000:0000:0000:00ff/128\",\"cause\":\"expanded form\"}]}"
+    "{\"group_name\":\"edge-group\",\"records\":[{\"target_address\":\"2606:4700:0000:0000:0000:0000:0000:00ff/128\",\"cause\":\"expanded form\"}]}"
 check "200" "#30 an expanded IPv6 address with /128 is accepted"
 check_true '.created == 1' "#30 and stored as a new record"
 
 api_call GET "/api/ips?groups=edge-group&limit=100" "$MASTER_KEY"
 check "200" "#30 list the edge-case group"
-check_true '[.[] | select(.target_address == "2001:db8::ff")] | length == 1' \
+check_true '[.[] | select(.target_address == "2606:4700::ff")] | length == 1' \
     "#30 the expanded IPv6 form is stored in canonical compressed notation"
 
 # Re-submitting a *different* spelling of the same address must update that one record rather than
 # create a second — the property the UNIQUE index exists to guarantee.
 api_call POST "/api/records/batch" "$MASTER_KEY" \
-    "{\"group_name\":\"edge-group\",\"records\":[{\"target_address\":\"2001:DB8::00FF\",\"cause\":\"mixed case, compressed\"}]}"
+    "{\"group_name\":\"edge-group\",\"records\":[{\"target_address\":\"2606:4700::00FF\",\"cause\":\"mixed case, compressed\"}]}"
 check "200" "#30 a different spelling of the same IPv6 host is accepted"
 check_true '.created == 0 and .updated == 1' \
     "#30 and matches the existing record instead of creating a duplicate"
 
-# Filtered on the full canonical address, not the `2001:db8` prefix. The looser form worked only
-# while this was the sole documentation-prefix record in the group; it is a substring match, so any
-# later 2001:db8 address would join the result and this assertion would fail for an unrelated reason.
-api_call GET "/api/ips?groups=edge-group&ip=2001:db8::ff&limit=100" "$MASTER_KEY"
+# Filtered on the full canonical address, not the `2606:4700` prefix. The looser form worked only
+# while this was the sole record under that prefix in the group; it is a substring match, so any
+# later 2606:4700 address would join the result and this assertion would fail for an unrelated reason.
+api_call GET "/api/ips?groups=edge-group&ip=2606:4700::ff&limit=100" "$MASTER_KEY"
 check_true 'length == 1' "#30 exactly one row exists for the IPv6 host, whatever the spelling"
 check_true '.[0].cause == "mixed case, compressed"' "#30 and the re-submission updated it"
 
@@ -3949,7 +3955,7 @@ if [ "$HOOK_EXECUTOR_AVAILABLE" -eq 1 ]; then
     check "200" "create a CANONICAL_V1 webhook targeting the live executor's HMAC_ONLY hook"
     CANON_EXEC_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
-    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.31","group_name":"hook-executor-group","cause":"canonical live dispatch"}'
+    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.0.113.31","group_name":"hook-executor-group","cause":"canonical live dispatch"}'
     check "200" "ban an address to trigger the CANONICAL_V1 dispatch"
 
     AFTER=0
@@ -3961,7 +3967,7 @@ if [ "$HOOK_EXECUTOR_AVAILABLE" -eq 1 ]; then
     check_local "$AFTER" "$((BEFORE + 1))" "CANONICAL_V1: exactly one new successful execution was recorded"
 
     hook_api_call GET "/api/executions?hook=$HOOK_HMACONLY_ID&status=SUCCESS&limit=1" "$HOOK_EXECUTOR_MASTER_KEY"
-    check_true '.[0].stdout | contains("vault-triggered:203.0.113.31")' \
+    check_true '.[0].stdout | contains("vault-triggered:45.0.113.31")' \
         "CANONICAL_V1: the executed script actually saw the banned address, end to end"
     check_true '.[0].api_key_id != null' \
         "CANONICAL_V1: the execution is attributed to the presenting key, even though the target hook's own auth_mode is HMAC_ONLY"
@@ -3979,7 +3985,7 @@ if [ "$HOOK_EXECUTOR_AVAILABLE" -eq 1 ]; then
     check "200" "create an API_KEY_ONLY webhook targeting the live executor's NONE hook"
     APIKEY_EXEC_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
-    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.32","group_name":"hook-executor-group","cause":"api-key-only live dispatch"}'
+    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.0.113.32","group_name":"hook-executor-group","cause":"api-key-only live dispatch"}'
     check "200" "ban an address to trigger the API_KEY_ONLY dispatch"
 
     AFTER=0
@@ -3991,7 +3997,7 @@ if [ "$HOOK_EXECUTOR_AVAILABLE" -eq 1 ]; then
     check_local "$AFTER" "$((BEFORE + 1))" "API_KEY_ONLY: exactly one new successful execution was recorded"
 
     hook_api_call GET "/api/executions?hook=$HOOK_NOAUTH_ID&status=SUCCESS&limit=1" "$HOOK_EXECUTOR_MASTER_KEY"
-    check_true '.[0].stdout | contains("vault-triggered:203.0.113.32")' \
+    check_true '.[0].stdout | contains("vault-triggered:45.0.113.32")' \
         "API_KEY_ONLY: the bearer-only, non-signing key's dispatch still executed with the correct payload"
     check_true '.[0].api_key_id != null' \
         "API_KEY_ONLY: attributed to the bearer-only key, even though the target hook's own auth_mode is NONE"
@@ -4011,7 +4017,7 @@ if [ "$HOOK_EXECUTOR_AVAILABLE" -eq 1 ]; then
     check "200" "create an HMAC_ONLY webhook targeting the live executor's keyless HMAC_ONLY hook"
     HMACONLY_EXEC_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
-    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.33","group_name":"hook-executor-group","cause":"hmac-only live dispatch"}'
+    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.0.113.33","group_name":"hook-executor-group","cause":"hmac-only live dispatch"}'
     check "200" "ban an address to trigger the HMAC_ONLY dispatch"
 
     AFTER=0
@@ -4023,7 +4029,7 @@ if [ "$HOOK_EXECUTOR_AVAILABLE" -eq 1 ]; then
     check_local "$AFTER" "$((BEFORE + 1))" "HMAC_ONLY: exactly one new successful execution was recorded, keyless"
 
     hook_api_call GET "/api/executions?hook=$HOOK_HMACONLY_ID&status=SUCCESS&limit=1" "$HOOK_EXECUTOR_MASTER_KEY"
-    check_true '.[0].stdout | contains("vault-triggered:203.0.113.33")' \
+    check_true '.[0].stdout | contains("vault-triggered:45.0.113.33")' \
         "HMAC_ONLY: the keyless dispatch still executed with the correct payload, end to end"
     check_true '.[0].api_key_id == null' \
         "HMAC_ONLY: the execution is recorded as keyless (no api_key_id), unlike either keyed case above"
@@ -4064,7 +4070,7 @@ if [ "$HOOK_EXECUTOR_AVAILABLE" -eq 1 ]; then
             "and it is normalised to HMAC_ONLY in the response, identically to the canonical spelling"
         BODYONLY_CAPTURE_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
-        api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.38","group_name":"hook-executor-group","cause":"body-only wire capture"}'
+        api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.0.113.38","group_name":"hook-executor-group","cause":"body-only wire capture"}'
         check "200" "ban an address to trigger the BODY_ONLY-labelled dispatch"
 
         for _ in $(seq 1 40); do
@@ -4125,7 +4131,7 @@ if [ "$HOOK_EXECUTOR_AVAILABLE" -eq 1 ]; then
     check_true '.auth_mode == "HMAC_ONLY"' "and its stored auth_mode is HMAC_ONLY, not BODY_ONLY"
     BODYONLY_EXEC_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
-    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.39","group_name":"hook-executor-group","cause":"body-only live dispatch"}'
+    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.0.113.39","group_name":"hook-executor-group","cause":"body-only live dispatch"}'
     check "200" "ban an address to trigger the BODY_ONLY-labelled live dispatch"
 
     AFTER=0
@@ -4138,7 +4144,7 @@ if [ "$HOOK_EXECUTOR_AVAILABLE" -eq 1 ]; then
         "BODY_ONLY: exactly one new successful execution was recorded on the live executor"
 
     hook_api_call GET "/api/executions?hook=$HOOK_HMACONLY_ID&status=SUCCESS&limit=1" "$HOOK_EXECUTOR_MASTER_KEY"
-    check_true '.[0].stdout | contains("vault-triggered:203.0.113.39")' \
+    check_true '.[0].stdout | contains("vault-triggered:45.0.113.39")' \
         "BODY_ONLY: simply_hook_executor validated the signature and executed with the correct payload"
 
     api_call DELETE "/api/webhooks/$BODYONLY_EXEC_WEBHOOK_ID" "$MASTER_KEY"
@@ -4179,7 +4185,7 @@ if [ "$HOOK_EXECUTOR_AVAILABLE" -eq 1 ]; then
         check "200" "create a CANONICAL_V1 webhook whose hmac_template is exactly {body}"
         KEYEDBODY_CAPTURE_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
-        api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.40","group_name":"hook-executor-group","cause":"keyed body-only wire capture"}'
+        api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.0.113.40","group_name":"hook-executor-group","cause":"keyed body-only wire capture"}'
         check "200" "ban an address to trigger the keyed body-only dispatch"
 
         for _ in $(seq 1 40); do
@@ -4237,7 +4243,7 @@ if [ "$HOOK_EXECUTOR_AVAILABLE" -eq 1 ]; then
     check "200" "create the keyed body-only webhook targeting the live executor"
     KEYEDBODY_EXEC_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
-    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.41","group_name":"hook-executor-group","cause":"keyed body-only live dispatch"}'
+    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.0.113.41","group_name":"hook-executor-group","cause":"keyed body-only live dispatch"}'
     check "200" "ban an address to trigger the keyed body-only live dispatch"
 
     AFTER=0
@@ -4250,7 +4256,7 @@ if [ "$HOOK_EXECUTOR_AVAILABLE" -eq 1 ]; then
         "keyed body-only: exactly one new successful execution was recorded, with an API key present"
 
     hook_api_call GET "/api/executions?hook=$HOOK_HMACONLY_ID&status=SUCCESS&limit=1" "$HOOK_EXECUTOR_MASTER_KEY"
-    check_true '.[0].stdout | contains("vault-triggered:203.0.113.41")' \
+    check_true '.[0].stdout | contains("vault-triggered:45.0.113.41")' \
         "keyed body-only: the executor verified the body-only signature against the key's own canonical_template and executed"
     check_true '.[0].api_key_id != null' \
         "keyed body-only: the execution IS attributed to the presenting key, unlike the keyless HMAC_ONLY/BODY_ONLY cases above"
@@ -4265,7 +4271,7 @@ if [ "$HOOK_EXECUTOR_AVAILABLE" -eq 1 ]; then
     check "200" "create a NONE webhook targeting the live executor's keyless NONE hook"
     NONE_EXEC_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
-    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.34","group_name":"hook-executor-group","cause":"none live dispatch"}'
+    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.0.113.34","group_name":"hook-executor-group","cause":"none live dispatch"}'
     check "200" "ban an address to trigger the NONE dispatch"
 
     AFTER=0
@@ -4277,7 +4283,7 @@ if [ "$HOOK_EXECUTOR_AVAILABLE" -eq 1 ]; then
     check_local "$AFTER" "$((BEFORE + 1))" "NONE: exactly one new successful execution was recorded, with zero authentication headers"
 
     hook_api_call GET "/api/executions?hook=$HOOK_NOAUTH_ID&status=SUCCESS&limit=1" "$HOOK_EXECUTOR_MASTER_KEY"
-    check_true '.[0].stdout | contains("vault-triggered:203.0.113.34")' \
+    check_true '.[0].stdout | contains("vault-triggered:45.0.113.34")' \
         "NONE: the fully unauthenticated dispatch still executed with the correct payload"
     check_true '.[0].api_key_id == null' \
         "NONE: recorded as keyless too, same as HMAC_ONLY, distinct from both keyed cases above"
@@ -4305,7 +4311,7 @@ if [ "$HOOK_EXECUTOR_AVAILABLE" -eq 1 ]; then
     check "200" "create a CANONICAL_V1 webhook signed with the wrong secret"
     TAMPERED_EXEC_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
-    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.35","group_name":"hook-executor-group","cause":"tampered secret dispatch"}'
+    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.0.113.35","group_name":"hook-executor-group","cause":"tampered secret dispatch"}'
     check "200" "ban an address to trigger the mis-signed dispatch"
     sleep 2
     AFTER=$(executor_success_count "$HOOK_HMACONLY_ID")
@@ -4325,7 +4331,7 @@ if [ "$HOOK_EXECUTOR_AVAILABLE" -eq 1 ]; then
     check "200" "create a correctly-signed webhook targeting a hook name that does not exist"
     MISSING_HOOK_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
-    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.36","group_name":"hook-executor-group","cause":"unexpected 404 dispatch"}'
+    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"45.0.113.36","group_name":"hook-executor-group","cause":"unexpected 404 dispatch"}'
     check "200" "ban an address to trigger a dispatch the executor will 404"
     sleep 1
 
@@ -4479,7 +4485,7 @@ if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
     # skip_webhooks: true — the record is written, but the receiver must never be reached.
     : > "$RECEIVER_LOG"
     api_call POST "/api/records/batch" "$MASTER_KEY" \
-        "{\"group_name\":\"batch-skip-e2e-group\",\"skip_webhooks\":true,\"records\":[{\"target_address\":\"203.0.113.90\"}]}"
+        "{\"group_name\":\"batch-skip-e2e-group\",\"skip_webhooks\":true,\"records\":[{\"target_address\":\"45.0.113.90\"}]}"
     check "200" "#33 batch with skip_webhooks: true succeeds"
     check_true '.created == 1' "#33 and the record is written regardless of skip_webhooks"
 
@@ -4496,7 +4502,7 @@ if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
     # skip_webhooks omitted — the documented default is "dispatch normally", not "suppress".
     : > "$RECEIVER_LOG"
     api_call POST "/api/records/batch" "$MASTER_KEY" \
-        "{\"group_name\":\"batch-skip-e2e-group\",\"records\":[{\"target_address\":\"203.0.113.91\"}]}"
+        "{\"group_name\":\"batch-skip-e2e-group\",\"records\":[{\"target_address\":\"45.0.113.91\"}]}"
     check "200" "#33 batch with skip_webhooks omitted succeeds"
     check_true '.created == 1' "#33 and the record is written"
 
@@ -4509,7 +4515,7 @@ if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
         echo -e "$(ts)   ${GREEN}✓ PASS${RESET} #33 skip_webhooks omitted dispatches normally — the receiver was reached" >&2
         HIT=$(head -n 1 "$RECEIVER_LOG")
         HOOK_BODY=$(echo "$HIT" | jq -r '.body // empty')
-        if [[ "$HOOK_BODY" == *"203.0.113.91"* ]]; then
+        if [[ "$HOOK_BODY" == *"45.0.113.91"* ]]; then
             PASS_COUNT=$((PASS_COUNT + 1))
             echo -e "$(ts)   ${GREEN}✓ PASS${RESET} #33 the dispatched payload names the batch-created address" >&2
         else
@@ -4526,7 +4532,7 @@ if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
 else
     warn "Local webhook receiver unavailable — §33 checks only the record-level effect of skip_webhooks."
     api_call POST "/api/records/batch" "$MASTER_KEY" \
-        "{\"group_name\":\"batch-skip-e2e-group\",\"skip_webhooks\":true,\"records\":[{\"target_address\":\"203.0.113.90\"}]}"
+        "{\"group_name\":\"batch-skip-e2e-group\",\"skip_webhooks\":true,\"records\":[{\"target_address\":\"45.0.113.90\"}]}"
     check "200" "#33 batch with skip_webhooks: true still succeeds without a receiver"
     check_true '.created == 1' "#33 and the record is written regardless of skip_webhooks"
 fi
@@ -4625,7 +4631,7 @@ fi
 # The address row is canonical; lock, soft delete and last observation belong to the membership in one
 # group. These checks exercise that split through the wire, against the refactored schema.
 
-ADDR_M="198.51.100.231"
+ADDR_M="45.51.100.231"
 GROUP_MA="membership-a"
 GROUP_MB="membership-b"
 DEL_A="{\"target_address\":\"$ADDR_M\",\"group_name\":\"$GROUP_MA\"}"
@@ -4706,14 +4712,14 @@ log_section "36. Keyset (Cursor) Pagination & Minimal Format (GET /api/ips)"
 
 CUR_GA="cursor-e2e-a"
 CUR_GB="cursor-e2e-b"
-api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"198.51.100.241\",\"group_name\":\"$CUR_GA\",\"cause\":\"c1\"}"
-check "200" "#36 seed 198.51.100.241 in $CUR_GA"
-api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"198.51.100.242\",\"group_name\":\"$CUR_GB\",\"cause\":\"c2\"}"
-check "200" "#36 seed 198.51.100.242 in $CUR_GB"
-api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"198.51.100.243\",\"group_name\":\"$CUR_GA\",\"cause\":\"c3\"}"
-check "200" "#36 seed 198.51.100.243 in $CUR_GA"
-api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"198.51.100.244\",\"group_name\":\"$CUR_GB\",\"cause\":\"c4\"}"
-check "200" "#36 seed 198.51.100.244 in $CUR_GB"
+api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"45.51.100.241\",\"group_name\":\"$CUR_GA\",\"cause\":\"c1\"}"
+check "200" "#36 seed 45.51.100.241 in $CUR_GA"
+api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"45.51.100.242\",\"group_name\":\"$CUR_GB\",\"cause\":\"c2\"}"
+check "200" "#36 seed 45.51.100.242 in $CUR_GB"
+api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"45.51.100.243\",\"group_name\":\"$CUR_GA\",\"cause\":\"c3\"}"
+check "200" "#36 seed 45.51.100.243 in $CUR_GA"
+api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"45.51.100.244\",\"group_name\":\"$CUR_GB\",\"cause\":\"c4\"}"
+check "200" "#36 seed 45.51.100.244 in $CUR_GB"
 
 # First page (cursor= empty, limit=2, format=minimal across two groups).
 api_call GET "/api/ips?groups=$CUR_GA,$CUR_GB&limit=2&cursor=&format=minimal" "$MASTER_KEY"
@@ -4774,53 +4780,53 @@ if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
 fi
 
 # 37a. Bare IPv6 host ban -> stored as /48, webhook carries full host IPv6.
-api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"2001:0db8:4848:1111::1\",\"group_name\":\"$IPV6_NORM_GROUP\",\"cause\":\"v6 ssh brute\"}"
-check "200" "#37a ban bare host IPv6 2001:0db8:4848:1111::1"
+api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"2606:4700:4848:1111::1\",\"group_name\":\"$IPV6_NORM_GROUP\",\"cause\":\"v6 ssh brute\"}"
+check "200" "#37a ban bare host IPv6 2606:4700:4848:1111::1"
 
 api_call GET "/api/ips?groups=$IPV6_NORM_GROUP&limit=100" "$MASTER_KEY"
 check "200" "#37a list $IPV6_NORM_GROUP after first ban"
-check_true '[.[] | select(.target_address == "2001:db8:4848::/48")] | length == 1' \
+check_true '[.[] | select(.target_address == "2606:4700:4848::/48")] | length == 1' \
     "#37a bare IPv6 ban is stored normalized to /48"
-check_true '[.[] | select(.target_address == "2001:db8:4848:1111::1")] | length == 0' \
+check_true '[.[] | select(.target_address == "2606:4700:4848:1111::1")] | length == 0' \
     "#37a full host IPv6 is not duplicated in storage"
 
 # Search by full host IPv6 still resolves the /48 record.
-api_call GET "/api/ips?groups=$IPV6_NORM_GROUP&ip=2001:db8:4848:1111::1&limit=100" "$MASTER_KEY"
-check_true 'length == 1 and .[0].target_address == "2001:db8:4848::/48"' \
+api_call GET "/api/ips?groups=$IPV6_NORM_GROUP&ip=2606:4700:4848:1111::1&limit=100" "$MASTER_KEY"
+check_true 'length == 1 and .[0].target_address == "2606:4700:4848::/48"' \
     "#37a GET /api/ips?ip=<full host> finds the stored /48 record"
 
 # Second bare IPv6 host in the same /48 -> deduplicates in DB, emits IP_UPDATE with new full host IPv6.
-api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"2001:db8:4848:9999::2\",\"group_name\":\"$IPV6_NORM_GROUP\",\"cause\":\"v6 port scan\"}"
+api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"2606:4700:4848:9999::2\",\"group_name\":\"$IPV6_NORM_GROUP\",\"cause\":\"v6 port scan\"}"
 check "200" "#37a ban second bare host IPv6 in same /48"
 
 api_call GET "/api/ips?groups=$IPV6_NORM_GROUP&limit=100" "$MASTER_KEY"
-check_true '[.[] | select(.target_address == "2001:db8:4848::/48")] | length == 1' \
+check_true '[.[] | select(.target_address == "2606:4700:4848::/48")] | length == 1' \
     "#37a second IPv6 in same /48 deduplicates onto the single /48 record"
 
 # 37b. IPv6 CIDRs with prefix != /128 (/56, /64, /120, /32) MUST NOT be converted to /48.
-api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"2001:db8:5656:1234::1/56\",\"group_name\":\"$IPV6_NORM_GROUP\",\"cause\":\"explicit /56\"}"
+api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"2606:4700:5656:1234::1/56\",\"group_name\":\"$IPV6_NORM_GROUP\",\"cause\":\"explicit /56\"}"
 check "200" "#37b ban explicit /56 IPv6 CIDR"
-api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"2001:db8:6464:abcd::9/64\",\"group_name\":\"$IPV6_NORM_GROUP\",\"cause\":\"explicit /64\"}"
+api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"2606:4700:6464:abcd::9/64\",\"group_name\":\"$IPV6_NORM_GROUP\",\"cause\":\"explicit /64\"}"
 check "200" "#37b ban explicit /64 IPv6 CIDR"
 api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"2001:3200::/32\",\"group_name\":\"$IPV6_NORM_GROUP\",\"cause\":\"explicit /32\"}"
 check "200" "#37b ban explicit /32 IPv6 CIDR"
 
 api_call POST "/api/records/batch" "$MASTER_KEY" \
-    "{\"group_name\":\"$IPV6_NORM_GROUP\",\"mode\":\"upsert\",\"records\":[{\"target_address\":\"2001:db8:bbbb:0001::a\",\"cause\":\"batch host 1\"},{\"target_address\":\"2001:db8:bbbb:0002::b\",\"cause\":\"batch host 2\"},{\"target_address\":\"2001:db8:bbbb:0003::1/64\",\"cause\":\"batch /64\"},{\"target_address\":\"2001:db8:c0de:1:2:3:4:9/120\",\"cause\":\"batch /120\"}]}"
+    "{\"group_name\":\"$IPV6_NORM_GROUP\",\"mode\":\"upsert\",\"records\":[{\"target_address\":\"2606:4700:bbbb:0001::a\",\"cause\":\"batch host 1\"},{\"target_address\":\"2606:4700:bbbb:0002::b\",\"cause\":\"batch host 2\"},{\"target_address\":\"2606:4700:bbbb:0003::1/64\",\"cause\":\"batch /64\"},{\"target_address\":\"2606:4700:c0de:1:2:3:4:9/120\",\"cause\":\"batch /120\"}]}"
 check "200" "#37b batch ban mixing bare IPv6 hosts and explicit non-/128 CIDRs"
 
 api_call GET "/api/ips?groups=$IPV6_NORM_GROUP&limit=100" "$MASTER_KEY"
-check_true '[.[] | select(.target_address == "2001:db8:5656:1200::/56")] | length == 1' \
+check_true '[.[] | select(.target_address == "2606:4700:5656:1200::/56")] | length == 1' \
     "#37b /56 prefix is preserved (not altered to /48)"
-check_true '[.[] | select(.target_address == "2001:db8:6464:abcd::/64")] | length == 1' \
+check_true '[.[] | select(.target_address == "2606:4700:6464:abcd::/64")] | length == 1' \
     "#37b /64 prefix is preserved (not altered to /48)"
 check_true '[.[] | select(.target_address == "2001:3200::/32")] | length == 1' \
     "#37b /32 prefix is preserved (not altered to /48)"
-check_true '[.[] | select(.target_address == "2001:db8:c0de:1:2:3:4:0/120")] | length == 1' \
+check_true '[.[] | select(.target_address == "2606:4700:c0de:1:2:3:4:0/120")] | length == 1' \
     "#37b /120 prefix is preserved (not altered to /48)"
-check_true '[.[] | select(.target_address == "2001:db8:bbbb::/48")] | length == 1' \
+check_true '[.[] | select(.target_address == "2606:4700:bbbb::/48")] | length == 1' \
     "#37b bare batch IPv6 hosts deduplicate to one /48"
-check_true '[.[] | select(.target_address == "2001:db8:bbbb:3::/64")] | length == 1' \
+check_true '[.[] | select(.target_address == "2606:4700:bbbb:3::/64")] | length == 1' \
     "#37b explicit /64 inside same /48 batch remains its own /64 record"
 
 # 37c. Whitelist must never normalize IPv6 to /48 (even with send_normalized_ipv6=true).
@@ -4834,25 +4840,25 @@ if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
     check "200" "#37c register whitelist webhook with send_normalized_ipv6=true"
     IPV6_WHITE_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 fi
-api_call POST "/api/white" "$MASTER_KEY" "{\"target_address\":\"2001:db8:7777:8888::1\",\"group_name\":\"$IPV6_WHITE_GROUP\",\"cause\":\"trusted host\"}"
+api_call POST "/api/white" "$MASTER_KEY" "{\"target_address\":\"2606:4700:7777:8888::1\",\"group_name\":\"$IPV6_WHITE_GROUP\",\"cause\":\"trusted host\"}"
 check "200" "#37c whitelist bare IPv6 host"
 api_call GET "/api/ips?groups=$IPV6_WHITE_GROUP&limit=100" "$MASTER_KEY"
-check_true '[.[] | select(.target_address == "2001:db8:7777:8888::1")] | length == 1' \
+check_true '[.[] | select(.target_address == "2606:4700:7777:8888::1")] | length == 1' \
     "#37c whitelist preserves exact host IPv6 without /48 normalization"
 
 # 37d. Delete by bare host resolves /48, leaves /56 untouched, and restore works.
-api_call DELETE "/api/ips?target_address=2001:db8:4848:2222::5&group_name=$IPV6_NORM_GROUP" "$MASTER_KEY"
+api_call DELETE "/api/ips?target_address=2606:4700:4848:2222::5&group_name=$IPV6_NORM_GROUP" "$MASTER_KEY"
 check "204" "#37d DELETE by bare host inside /48 soft-deletes the stored /48 membership"
 
 api_call GET "/api/ips?groups=$IPV6_NORM_GROUP&limit=100" "$MASTER_KEY"
-check_true '[.[] | select(.target_address == "2001:db8:4848::/48")] | length == 0' \
+check_true '[.[] | select(.target_address == "2606:4700:4848::/48")] | length == 0' \
     "#37d /48 record is no longer active after delete by bare host"
-check_true '[.[] | select(.target_address == "2001:db8:5656:1200::/56")] | length == 1' \
+check_true '[.[] | select(.target_address == "2606:4700:5656:1200::/56")] | length == 1' \
     "#37d /56 record remains unaffected"
 
-api_call POST "/api/ips/restore" "$MASTER_KEY" "{\"target_address\":\"2001:db8:4848:1111::1\",\"group_name\":\"$IPV6_NORM_GROUP\"}"
+api_call POST "/api/ips/restore" "$MASTER_KEY" "{\"target_address\":\"2606:4700:4848:1111::1\",\"group_name\":\"$IPV6_NORM_GROUP\"}"
 check "200" "#37d restore by bare host IPv6 resolves stored /48"
-check_jq ".target_address" "2001:db8:4848::/48" "#37d restore returns stored /48 target_address"
+check_jq ".target_address" "2606:4700:4848::/48" "#37d restore returns stored /48 target_address"
 
 # 37e. Verify live webhook deliveries compare send_normalized_ipv6=false (AbuseIPDB) vs true (launch.block.ip),
 #      plus whitelist exemption, clone preservation, and PUT toggling.
@@ -4889,32 +4895,32 @@ with open(sys.argv[1]) as f:
             white_hits.append(payload)
 
 full_ok = (
-    any(h["action"] == "IP_ADD" and h["target"] == "2001:db8:4848:1111::1" and h["ip"] == "2001:db8:4848:1111::1" and h["_url_ip"] == "2001:db8:4848:1111::1" and h["normalized"] == "2001:db8:4848::/48" for h in full_hits)
-    and any(h["action"] == "IP_UPDATE" and h["target"] == "2001:db8:4848:9999::2" and h["ip"] == "2001:db8:4848:9999::2" and h["_url_ip"] == "2001:db8:4848:9999::2" and h["normalized"] == "2001:db8:4848::/48" for h in full_hits)
-    and any(h["ip"] == "2001:db8:5656:1200::/56" and h["_url_ip"] == "2001:db8:5656:1200::/56" for h in full_hits)
-    and any(h["ip"] == "2001:db8:6464:abcd::/64" and h["_url_ip"] == "2001:db8:6464:abcd::/64" for h in full_hits)
+    any(h["action"] == "IP_ADD" and h["target"] == "2606:4700:4848:1111::1" and h["ip"] == "2606:4700:4848:1111::1" and h["_url_ip"] == "2606:4700:4848:1111::1" and h["normalized"] == "2606:4700:4848::/48" for h in full_hits)
+    and any(h["action"] == "IP_UPDATE" and h["target"] == "2606:4700:4848:9999::2" and h["ip"] == "2606:4700:4848:9999::2" and h["_url_ip"] == "2606:4700:4848:9999::2" and h["normalized"] == "2606:4700:4848::/48" for h in full_hits)
+    and any(h["ip"] == "2606:4700:5656:1200::/56" and h["_url_ip"] == "2606:4700:5656:1200::/56" for h in full_hits)
+    and any(h["ip"] == "2606:4700:6464:abcd::/64" and h["_url_ip"] == "2606:4700:6464:abcd::/64" for h in full_hits)
     and any(h["ip"] == "2001:3200::/32" and h["_url_ip"] == "2001:3200::/32" for h in full_hits)
-    and any(h["ip"] == "2001:db8:bbbb:1::a" and h["normalized"] == "2001:db8:bbbb::/48" for h in full_hits)
-    and any(h["ip"] == "2001:db8:bbbb:2::b" and h["normalized"] == "2001:db8:bbbb::/48" for h in full_hits)
-    and any(h["ip"] == "2001:db8:bbbb:3::/64" for h in full_hits)
-    and any(h["ip"] == "2001:db8:c0de:1:2:3:4:0/120" for h in full_hits)
-    and any(h["action"] == "IP_DELETE" and h["ip"] == "2001:db8:4848::/48" for h in full_hits)
+    and any(h["ip"] == "2606:4700:bbbb:1::a" and h["normalized"] == "2606:4700:bbbb::/48" for h in full_hits)
+    and any(h["ip"] == "2606:4700:bbbb:2::b" and h["normalized"] == "2606:4700:bbbb::/48" for h in full_hits)
+    and any(h["ip"] == "2606:4700:bbbb:3::/64" for h in full_hits)
+    and any(h["ip"] == "2606:4700:c0de:1:2:3:4:0/120" for h in full_hits)
+    and any(h["action"] == "IP_DELETE" and h["ip"] == "2606:4700:4848::/48" for h in full_hits)
 )
 
 norm_ok = (
-    any(h["action"] == "IP_ADD" and h["target"] == "2001:db8:4848::/48" and h["ip"] == "2001:db8:4848::/48" and h["_url_ip"] == "2001:db8:4848::/48" and h["normalized"] == "2001:db8:4848::/48" for h in norm_hits)
-    and any(h["action"] == "IP_UPDATE" and h["target"] == "2001:db8:4848::/48" and h["ip"] == "2001:db8:4848::/48" and h["_url_ip"] == "2001:db8:4848::/48" for h in norm_hits)
-    and any(h["target"] == "2001:db8:5656:1200::/56" and h["_url_ip"] == "2001:db8:5656:1200::/56" for h in norm_hits)
-    and any(h["target"] == "2001:db8:6464:abcd::/64" and h["_url_ip"] == "2001:db8:6464:abcd::/64" for h in norm_hits)
+    any(h["action"] == "IP_ADD" and h["target"] == "2606:4700:4848::/48" and h["ip"] == "2606:4700:4848::/48" and h["_url_ip"] == "2606:4700:4848::/48" and h["normalized"] == "2606:4700:4848::/48" for h in norm_hits)
+    and any(h["action"] == "IP_UPDATE" and h["target"] == "2606:4700:4848::/48" and h["ip"] == "2606:4700:4848::/48" and h["_url_ip"] == "2606:4700:4848::/48" for h in norm_hits)
+    and any(h["target"] == "2606:4700:5656:1200::/56" and h["_url_ip"] == "2606:4700:5656:1200::/56" for h in norm_hits)
+    and any(h["target"] == "2606:4700:6464:abcd::/64" and h["_url_ip"] == "2606:4700:6464:abcd::/64" for h in norm_hits)
     and any(h["target"] == "2001:3200::/32" and h["_url_ip"] == "2001:3200::/32" for h in norm_hits)
-    and any(h["target"] == "2001:db8:bbbb::/48" and h["ip"] == "2001:db8:bbbb::/48" for h in norm_hits)
-    and any(h["target"] == "2001:db8:bbbb:3::/64" for h in norm_hits)
-    and any(h["target"] == "2001:db8:c0de:1:2:3:4:0/120" for h in norm_hits)
-    and any(h["action"] == "IP_DELETE" and h["target"] == "2001:db8:4848::/48" for h in norm_hits)
+    and any(h["target"] == "2606:4700:bbbb::/48" and h["ip"] == "2606:4700:bbbb::/48" for h in norm_hits)
+    and any(h["target"] == "2606:4700:bbbb:3::/64" for h in norm_hits)
+    and any(h["target"] == "2606:4700:c0de:1:2:3:4:0/120" for h in norm_hits)
+    and any(h["action"] == "IP_DELETE" and h["target"] == "2606:4700:4848::/48" for h in norm_hits)
 )
 
 white_ok = (
-    any(h["ip"] == "2001:db8:7777:8888::1" and h["normalized"] == "2001:db8:7777:8888::1" and h["_url_ip"] == "2001:db8:7777:8888::1" for h in white_hits)
+    any(h["ip"] == "2606:4700:7777:8888::1" and h["normalized"] == "2606:4700:7777:8888::1" and h["_url_ip"] == "2606:4700:7777:8888::1" for h in white_hits)
 )
 
 print("1" if (full_ok and norm_ok and white_ok) else f"0:full={full_ok},norm={norm_ok},white={white_ok}")
@@ -4941,7 +4947,7 @@ PY
     check_jq ".send_normalized_ipv6" "false" "#37e PUT response shows send_normalized_ipv6=false"
 
     : > "$RECEIVER_LOG"
-    api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"2001:db8:f00d:1234::1\",\"group_name\":\"$IPV6_NORM_GROUP\",\"cause\":\"toggle verification\"}"
+    api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"2606:4700:f00d:1234::1\",\"group_name\":\"$IPV6_NORM_GROUP\",\"cause\":\"toggle verification\"}"
     check "200" "#37e ban host after toggling send_normalized_ipv6"
 
     TOG_FULL_HITS=0
@@ -4968,13 +4974,13 @@ with open(sys.argv[1]) as f:
             norm_hit = payload
 ok = (
     full_hit is not None
-    and full_hit["target"] == "2001:db8:f00d::/48"
-    and full_hit["ip"] == "2001:db8:f00d::/48"
-    and full_hit["_url_ip"] == "2001:db8:f00d::/48"
+    and full_hit["target"] == "2606:4700:f00d::/48"
+    and full_hit["ip"] == "2606:4700:f00d::/48"
+    and full_hit["_url_ip"] == "2606:4700:f00d::/48"
     and norm_hit is not None
-    and norm_hit["target"] == "2001:db8:f00d:1234::1"
-    and norm_hit["ip"] == "2001:db8:f00d:1234::1"
-    and norm_hit["_url_ip"] == "2001:db8:f00d:1234::1"
+    and norm_hit["target"] == "2606:4700:f00d:1234::1"
+    and norm_hit["ip"] == "2606:4700:f00d:1234::1"
+    and norm_hit["_url_ip"] == "2606:4700:f00d:1234::1"
 )
 print("1" if ok else "0")
 PY
@@ -5002,14 +5008,414 @@ api_call GET "/api/settings" "$MASTER_KEY"
 check "200" "#37f GET /api/settings reflects disabled toggle immediately (cache invalidated)"
 check_jq ".normalize_ipv6_to_48" "false" "#37f GET /api/settings normalize_ipv6_to_48 == false"
 
-api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"2001:db8:eeee:1111::1\",\"group_name\":\"$IPV6_NORM_GROUP\",\"cause\":\"exact v6 check\"}"
+api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"2606:4700:eeee:1111::1\",\"group_name\":\"$IPV6_NORM_GROUP\",\"cause\":\"exact v6 check\"}"
 check "200" "#37f ban bare IPv6 while normalization is disabled"
-api_call GET "/api/ips?groups=$IPV6_NORM_GROUP&ip=2001:db8:eeee:1111::1&limit=100" "$MASTER_KEY"
-check_true 'length == 1 and .[0].target_address == "2001:db8:eeee:1111::1"' \
+api_call GET "/api/ips?groups=$IPV6_NORM_GROUP&ip=2606:4700:eeee:1111::1&limit=100" "$MASTER_KEY"
+check_true 'length == 1 and .[0].target_address == "2606:4700:eeee:1111::1"' \
     "#37f exact host IPv6 is stored when normalize_ipv6_to_48 is disabled"
 
 api_call PUT "/api/settings" "$MASTER_KEY" '{"normalize_ipv6_to_48":true}'
 check "200" "#37f master re-enables IPv6 /48 normalization"
+
+# ── 38. Edge-Case / Boundary / Security E2E ──────────────────────────────────
+log_section "38. Edge-Case / Boundary / Security E2E"
+
+if ! command -v sqlite3 >/dev/null 2>&1; then
+    sqlite3() {
+        python3 - "$@" <<'PY'
+import sqlite3, sys
+db_path = sys.argv[1]
+query = sys.argv[2] if len(sys.argv) > 2 else sys.stdin.read()
+conn = sqlite3.connect(db_path, timeout=10.0)
+try:
+    cur = conn.cursor()
+    if query.strip().lower() == ".dump":
+        for line in conn.iterdump():
+            print(line)
+    else:
+        for stmt in [s.strip() for s in query.split(";") if s.strip()]:
+            cur.execute(stmt)
+            for row in cur.fetchall():
+                print("|".join("" if v is None else str(v) for v in row))
+        conn.commit()
+finally:
+    conn.close()
+PY
+    }
+fi
+
+# 38a. At-rest encryption check on webhook_configs (secret_token & api_key).
+api_call POST "/api/groups" "$MASTER_KEY" '{"name":"edge-cipher-webhook-group","group_type":"banlist"}'
+check "200" "#38a create group for webhook_configs at-rest encryption test"
+EDGE_CIPHER_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+AT_REST_WH_SECRET="e2e-at-rest-webhook-secret-token-canary-${RANDOM}-9911"
+AT_REST_WH_API_KEY="e2e-at-rest-webhook-api-key-canary-${RANDOM}-8822"
+api_call POST "/api/webhooks" "$MASTER_KEY" \
+    "{\"name\":\"at-rest-cipher-webhook\",\"target_url\":\"https://receiver.example.com/hook\",\"secret_token\":\"$AT_REST_WH_SECRET\",\"api_key\":\"$AT_REST_WH_API_KEY\",\"group_id\":\"$EDGE_CIPHER_GROUP_ID\",\"payload_template\":\"{\\\"ip\\\":\\\"\$ip\\\"}\"}"
+check "200" "#38a create webhook carrying distinctive secret_token and api_key"
+AT_REST_WH_ID=$(echo "$RESP_BODY" | jq -r '.id')
+check_not_contains "$AT_REST_WH_SECRET" "#38a create response does not echo plaintext secret_token"
+check_not_contains "$AT_REST_WH_API_KEY" "#38a create response does not echo plaintext api_key"
+
+STORED_WH_SECRET=$(sqlite3 "$DB_PATH" "SELECT secret_token FROM webhook_configs WHERE name = 'at-rest-cipher-webhook';")
+STORED_WH_API_KEY=$(sqlite3 "$DB_PATH" "SELECT api_key FROM webhook_configs WHERE name = 'at-rest-cipher-webhook';")
+if [[ "$STORED_WH_SECRET" =~ ^v1\.xchacha20poly1305\.[0-9a-f]{48}\.[0-9a-f]+$ ]]; then
+    check_local "sealed" "sealed" "#38a webhook_configs.secret_token is XChaCha20-Poly1305 sealed in SQLite"
+else
+    check_local "$STORED_WH_SECRET" "sealed" "#38a webhook_configs.secret_token is XChaCha20-Poly1305 sealed in SQLite"
+fi
+if [[ "$STORED_WH_API_KEY" =~ ^v1\.xchacha20poly1305\.[0-9a-f]{48}\.[0-9a-f]+$ ]]; then
+    check_local "sealed" "sealed" "#38a webhook_configs.api_key is XChaCha20-Poly1305 sealed in SQLite"
+else
+    check_local "$STORED_WH_API_KEY" "sealed" "#38a webhook_configs.api_key is XChaCha20-Poly1305 sealed in SQLite"
+fi
+
+WH_DUMP="$(sqlite3 "$DB_PATH" ".dump")"
+if [[ "$WH_DUMP" == *"$AT_REST_WH_SECRET"* ]] || grep -aq "$AT_REST_WH_SECRET" "$DB_PATH" "${DB_PATH}-wal" 2>/dev/null; then
+    check_local "plaintext-leaked" "sealed-only" "#38a plaintext webhook_configs.secret_token never appears in SQLite rows or file"
+else
+    check_local "sealed-only" "sealed-only" "#38a plaintext webhook_configs.secret_token never appears in SQLite rows or file"
+fi
+if [[ "$WH_DUMP" == *"$AT_REST_WH_API_KEY"* ]] || grep -aq "$AT_REST_WH_API_KEY" "$DB_PATH" "${DB_PATH}-wal" 2>/dev/null; then
+    check_local "plaintext-leaked" "sealed-only" "#38a plaintext webhook_configs.api_key never appears in SQLite rows or file"
+else
+    check_local "sealed-only" "sealed-only" "#38a plaintext webhook_configs.api_key never appears in SQLite rows or file"
+fi
+
+AT_REST_WH_SECRET_UPD="e2e-at-rest-webhook-secret-updated-${RANDOM}-7733"
+AT_REST_WH_API_KEY_UPD="e2e-at-rest-webhook-apikey-updated-${RANDOM}-6644"
+api_call PUT "/api/webhooks/$AT_REST_WH_ID" "$MASTER_KEY" \
+    "{\"secret_token\":\"$AT_REST_WH_SECRET_UPD\",\"api_key\":\"$AT_REST_WH_API_KEY_UPD\"}"
+check "200" "#38a PUT /api/webhooks/{id} updates secret_token and api_key"
+
+STORED_WH_SECRET_UPD=$(sqlite3 "$DB_PATH" "SELECT secret_token FROM webhook_configs WHERE name = 'at-rest-cipher-webhook';")
+STORED_WH_API_KEY_UPD=$(sqlite3 "$DB_PATH" "SELECT api_key FROM webhook_configs WHERE name = 'at-rest-cipher-webhook';")
+if [[ "$STORED_WH_SECRET_UPD" =~ ^v1\.xchacha20poly1305\. ]] && [[ "$STORED_WH_API_KEY_UPD" =~ ^v1\.xchacha20poly1305\. ]]; then
+    check_local "sealed" "sealed" "#38a updated webhook_configs.secret_token and api_key remain sealed in SQLite"
+else
+    check_local "unsealed" "sealed" "#38a updated webhook_configs.secret_token and api_key remain sealed in SQLite"
+fi
+WH_DUMP_UPD="$(sqlite3 "$DB_PATH" ".dump")"
+if [[ "$WH_DUMP_UPD" == *"$AT_REST_WH_SECRET_UPD"* ]] || [[ "$WH_DUMP_UPD" == *"$AT_REST_WH_API_KEY_UPD"* ]]; then
+    check_local "plaintext-leaked" "sealed-only" "#38a updated webhook secrets never appear in plaintext in SQLite"
+else
+    check_local "sealed-only" "sealed-only" "#38a updated webhook secrets never appear in plaintext in SQLite"
+fi
+
+api_call DELETE "/api/webhooks/$AT_REST_WH_ID" "$MASTER_KEY"
+check "204" "#38a clean up at-rest cipher webhook"
+
+# 38b. Webhook JSON $cause / $group_name injection safety.
+if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" == "1" ]; then
+    INJ_GROUP_NAME='edge-inj-group"quoted'
+    api_call POST "/api/groups" "$MASTER_KEY" \
+        "$(jq -nc --arg g "$INJ_GROUP_NAME" '{name:$g,group_type:"banlist"}')"
+    check "200" "#38b create group with JSON quote character in name"
+    INJ_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    api_call POST "/api/webhooks" "$MASTER_KEY" \
+        "$(jq -nc --arg url "http://127.0.0.1:$RECEIVER_PORT/json-injection-probe" --arg gid "$INJ_GROUP_ID" '{
+            name: "json-injection-safety-hook",
+            target_url: $url,
+            secret_token: "json-inj-secret-0123456789abcdef",
+            group_id: $gid,
+            payload_template: "{\"ip\":\"$ip\",\"group\":\"$group_name\",\"cause\":\"$cause\"}"
+        }')"
+    check "200" "#38b create webhook with JSON payload template using \$group_name and \$cause"
+    INJ_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    : > "$RECEIVER_LOG"
+    HOSTILE_CAUSE='foo","injected":true,"x":"bar\baz'
+    api_call POST "/api/ban" "$MASTER_KEY" \
+        "$(jq -nc --arg g "$INJ_GROUP_NAME" --arg c "$HOSTILE_CAUSE" '{
+            target_address: "45.0.113.199",
+            group_name: $g,
+            cause: $c
+        }')"
+    check "200" "#38b ban IP with JSON-breaking quotes and backslashes in cause"
+
+    INJ_HITS=0
+    for _ in $(seq 1 30); do
+        INJ_HITS=$(grep -c '"/json-injection-probe"' "$RECEIVER_LOG" 2>/dev/null || echo 0)
+        [ "$INJ_HITS" -ge 1 ] && break
+        sleep 0.2
+    done
+    check_local "$INJ_HITS" "1" "#38b local python webhook receiver captured the dispatch"
+
+    INJ_PARSE_OK=$(python3 - "$RECEIVER_LOG" "$HOSTILE_CAUSE" "$INJ_GROUP_NAME" <<'PY'
+import json, sys
+log_path, expected_cause, expected_group = sys.argv[1], sys.argv[2], sys.argv[3]
+matched = False
+with open(log_path) as f:
+    for line in f:
+        rec = json.loads(line)
+        if rec.get("path") == "/json-injection-probe":
+            body = json.loads(rec["body"])
+            if (
+                "injected" not in body
+                and set(body.keys()) == {"ip", "group", "cause"}
+                and body["cause"] == expected_cause
+                and body["group"] == expected_group
+            ):
+                matched = True
+print("1" if matched else "0")
+PY
+)
+    check_local "$INJ_PARSE_OK" "1" \
+        "#38b received webhook body is valid JSON without an 'injected' key and preserves exact cause & group_name"
+
+    api_call DELETE "/api/webhooks/$INJ_HOOK_ID" "$MASTER_KEY"
+    check "204" "#38b clean up JSON injection safety webhook"
+    api_call DELETE "/api/groups/$INJ_GROUP_ID" "$MASTER_KEY"
+    check "204" "#38b clean up JSON injection safety group"
+fi
+
+# 38c. Extended bogon / CGNAT / multicast / NAT64 / doc IPv6 rejections.
+for bogon_ip in "100.64.0.1" "100.127.255.254" "224.0.0.1" "240.0.0.1" "198.18.0.1" "ff00::1" "ff02::1" "64:ff9b::1" "100::1" "::ffff:100.64.0.1"; do
+    api_call POST "/api/ban" "$MASTER_KEY" \
+        "{\"target_address\":\"$bogon_ip\",\"group_name\":\"edge-cipher-webhook-group\",\"cause\":\"bogon test\"}"
+    check "400" "#38c POST /api/ban rejects extended bogon/reserved address $bogon_ip with 400"
+done
+
+for bogon_batch in "100.64.0.1" "ff00::1" "64:ff9b::1"; do
+    api_call POST "/api/records/batch" "$MASTER_KEY" \
+        "{\"group_name\":\"edge-cipher-webhook-group\",\"mode\":\"upsert\",\"records\":[{\"target_address\":\"$bogon_batch\",\"cause\":\"batch bogon\"}]}"
+    check "400" "#38c POST /api/records/batch rejects extended bogon/reserved address $bogon_batch with 400"
+    check_true '.error | contains("Cannot ban")' "#38c batch rejection for $bogon_batch comes from guard_bannable_address"
+done
+
+# Webhook URL validation: invalid scheme / malformed URL rejected with 400 at creation time, and
+# SSRF blocklist (100.64.0.1, ff00::1, 2001:db8::1, 64:ff9b::1) rejected when ALLOW_PRIVATE_WEBHOOKS=false.
+for bad_wh_url in "ftp://100.64.0.1/hook" "file:///etc/passwd" "not-a-valid-url"; do
+    api_call POST "/api/webhooks" "$MASTER_KEY" \
+        "{\"name\":\"bad-url-wh-$RANDOM\",\"target_url\":\"$bad_wh_url\",\"secret_token\":\"s\",\"group_id\":\"$EDGE_CIPHER_GROUP_ID\",\"payload_template\":\"{}\"}"
+    check "400" "#38c POST /api/webhooks rejects malformed/non-http target_url '$bad_wh_url' with 400"
+done
+
+EDGE_SSRF_PORT=$((VAULT_PORT + 79))
+EDGE_SSRF_DB="$WORK_DIR/edge_ssrf_vault.db"
+EDGE_SSRF_LOG="$WORK_DIR/edge_ssrf_vault.log"
+
+DATABASE_URL="sqlite://$EDGE_SSRF_DB?mode=rwc" RUST_LOG=info \
+    INITIAL_MASTER_KEY="$MASTER_KEY" \
+    INITIAL_MASTER_SIGNING_SECRET="$MASTER_SIGNING_SECRET" \
+    VAULT_ENCRYPTION_KEY="$E2E_ENCRYPTION_KEY" \
+    ALLOW_PRIVATE_WEBHOOKS=false \
+    PORT="$EDGE_SSRF_PORT" \
+    "$PROJECT_ROOT/target/debug/simply_ip_vault" >"$EDGE_SSRF_LOG" 2>&1 &
+EDGE_SSRF_VAULT_PID=$!
+
+EDGE_SSRF_READY=0
+for _ in $(seq 1 60); do
+    if ! kill -0 "$EDGE_SSRF_VAULT_PID" 2>/dev/null; then break; fi
+    SC=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$EDGE_SSRF_PORT/ready" 2>/dev/null)
+    if [ "$SC" == "200" ]; then EDGE_SSRF_READY=1; break; fi
+    sleep 0.25
+done
+check_local "$EDGE_SSRF_READY" "1" "#38c isolated SSRF-enforcing simply_ip_vault (ALLOW_PRIVATE_WEBHOOKS=false) boots"
+
+if [ "$EDGE_SSRF_READY" == "1" ]; then
+    SAVED_VAULT_BASE_URL="$BASE_URL"
+    BASE_URL="http://127.0.0.1:$EDGE_SSRF_PORT"
+
+    api_call POST "/api/groups" "$MASTER_KEY" '{"name":"ssrf-url-check-group","group_type":"banlist"}'
+    check "200" "#38c create group on SSRF-enforcing vault instance"
+    SSRF_CHECK_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    for ssrf_target in "http://100.64.0.1/hook" "http://[ff00::1]/hook" "http://[2001:db8::1]/hook" "http://[64:ff9b::1]/hook"; do
+        api_call POST "/api/webhooks" "$MASTER_KEY" \
+            "{\"name\":\"ssrf-wh-$RANDOM\",\"target_url\":\"$ssrf_target\",\"secret_token\":\"ssrf-sec\",\"group_id\":\"$SSRF_CHECK_GROUP_ID\",\"payload_template\":\"{}\"}"
+        check "200" "#38c create webhook targeting $ssrf_target"
+        SSRF_WH_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+        api_call POST "/api/webhooks/$SSRF_WH_ID/test" "$MASTER_KEY"
+        check "200" "#38c test dispatch against $ssrf_target returns structured result"
+        check_jq ".success" "false" "#38c test dispatch to $ssrf_target is refused"
+        check_jq ".blocked_by_ssrf_filter" "true" "#38c $ssrf_target is flagged blocked_by_ssrf_filter=true"
+    done
+
+    BASE_URL="$SAVED_VAULT_BASE_URL"
+fi
+
+if [ -n "$EDGE_SSRF_VAULT_PID" ] && kill -0 "$EDGE_SSRF_VAULT_PID" 2>/dev/null; then
+    kill "$EDGE_SSRF_VAULT_PID" 2>/dev/null || true
+    wait "$EDGE_SSRF_VAULT_PID" 2>/dev/null || true
+    EDGE_SSRF_VAULT_PID=""
+fi
+
+api_call DELETE "/api/groups/$EDGE_CIPHER_GROUP_ID" "$MASTER_KEY"
+check "204" "#38c clean up edge-cipher-webhook-group"
+
+# 38d. Audit log pagination/boundaries + retention smoke.
+api_call GET "/api/audit-logs?limit=2&offset=0" "$MASTER_KEY"
+check "200" "#38d GET /api/audit-logs?limit=2&offset=0 returns page 1"
+check_jq "length" "2" "#38d page 1 contains 2 entries"
+PAGE1_ID0=$(echo "$RESP_BODY" | jq -r '.[0].id')
+PAGE1_ID1=$(echo "$RESP_BODY" | jq -r '.[1].id')
+PAGE1_TS0=$(echo "$RESP_BODY" | jq -r '.[0].timestamp')
+
+api_call GET "/api/audit-logs?limit=2&offset=2" "$MASTER_KEY"
+check "200" "#38d GET /api/audit-logs?limit=2&offset=2 returns page 2"
+check_jq "length" "2" "#38d page 2 contains 2 entries"
+check_true "all(.[]; .id != \"$PAGE1_ID0\" and .id != \"$PAGE1_ID1\")" \
+    "#38d page 2 entries are disjoint from page 1"
+
+BOUNDARY_RFC3339="${PAGE1_TS0%Z}Z"
+api_call GET "/api/audit-logs?until=$BOUNDARY_RFC3339&limit=20" "$MASTER_KEY"
+check "200" "#38d GET /api/audit-logs?until=<exact-timestamp> succeeds"
+check_true "any(.[]; .id == \"$PAGE1_ID0\")" \
+    "#38d /api/audit-logs 'until' boundary is inclusive (<= includes row at exact timestamp)"
+
+api_call GET "/api/audit-logs?since=$BOUNDARY_RFC3339&until=$BOUNDARY_RFC3339" "$MASTER_KEY"
+check "200" "#38d GET /api/audit-logs with identical since & until timestamp succeeds"
+check_true "any(.[]; .id == \"$PAGE1_ID0\")" \
+    "#38d identical since and until bounds return the row at that exact instant"
+
+api_call GET "/api/audit-logs?until=not-an-rfc3339-date" "$MASTER_KEY"
+check "400" "#38d malformed 'until' timestamp is rejected with 400"
+api_call GET "/api/audit-logs?since=not-an-rfc3339-date" "$MASTER_KEY"
+check "400" "#38d malformed 'since' timestamp is rejected with 400"
+
+# Retention smoke: settings exposes audit_log_count + retention settings, purge endpoint runs cleanly,
+# and startup log confirms the audit log retention worker booted.
+api_call GET "/api/settings" "$MASTER_KEY"
+check "200" "#38d GET /api/settings succeeds"
+check_true '(.audit_log_count | type == "number") and .audit_log_count >= 1' \
+    "#38d GET /api/settings includes integer audit_log_count >= 1"
+
+api_call POST "/api/system/purge-ips" "$MASTER_KEY"
+check "200" "#38d POST /api/system/purge-ips retention purge endpoint executes cleanly"
+
+if grep -q "Audit log retention worker started" "$SERVER_LOG" 2>/dev/null; then
+    check_local "started" "started" "#38d Audit log retention worker started cleanly at boot"
+else
+    check_local "missing" "started" "#38d Audit log retention worker started cleanly at boot"
+fi
+
+log_section "39. Banlist Private IP Policy and Whitelist Exclusions"
+
+policy_ban() {
+    api_call POST "/api/ban" "$MASTER_KEY" \
+        "{\"group_name\":\"$1\",\"target_address\":\"$2\"}"
+}
+
+policy_batch_one() {
+    api_call POST "/api/records/batch" "$MASTER_KEY" \
+        "{\"group_name\":\"$1\",\"mode\":\"upsert\",\"records\":[{\"target_address\":\"$2\"}]}"
+}
+
+api_call POST "/api/groups" "$MASTER_KEY" '{"name":"policy-default","group_type":"banlist"}'
+check "200" "#39 create a banlist with the default policy"
+check_true '.allow_private_ips == false' "#39 private IPs are disabled by default"
+
+api_call POST "/api/groups" "$MASTER_KEY" \
+    '{"name":"policy-private-batch","group_type":"banlist","allow_private_ips":true}'
+check "200" "#39 create a private-enabled batch banlist"
+check_true '.allow_private_ips == true' "#39 create persists the private IP policy"
+api_call POST "/api/groups" "$MASTER_KEY" '{"name":"policy-private","group_type":"banlist"}'
+check "200" "#39 create a banlist for policy updates"
+POLICY_PRIVATE_ID=$(jq -r '.id' <<<"$RESP_BODY")
+api_call PUT "/api/groups/$POLICY_PRIVATE_ID" "$MASTER_KEY" '{"allow_private_ips":true}'
+check "200" "#39 enable private IPs by PUT"
+check_true '.allow_private_ips == true' "#39 PUT persists the private IP policy"
+
+for policy_ip in 10.0.0.1 172.16.0.1 192.168.1.1 100.64.0.1 fc00::1; do
+    policy_ban policy-default "$policy_ip"
+    check "400" "#39 default single ban rejects $policy_ip"
+    policy_batch_one policy-default "$policy_ip"
+    check "400" "#39 default batch ban rejects $policy_ip"
+    policy_ban policy-private "$policy_ip"
+    check "200" "#39 private-enabled single ban accepts $policy_ip"
+    policy_batch_one policy-private-batch "$policy_ip"
+    check "200" "#39 private-enabled batch ban accepts $policy_ip"
+done
+
+for policy_ip in 127.0.0.1 ::1 ::ffff:127.0.0.1 169.254.169.254 fe80::1 224.0.0.1 ff00::1 2001:db8::1 192.0.2.1; do
+    policy_ban policy-private "$policy_ip"
+    check "400" "#39 private-enabled single ban still rejects $policy_ip"
+    policy_batch_one policy-private-batch "$policy_ip"
+    check "400" "#39 private-enabled batch ban still rejects $policy_ip"
+done
+
+api_call POST "/api/groups" "$MASTER_KEY" '{"name":"policy-protected","group_type":"whitelist"}'
+check "200" "#39 create the protected whitelist"
+POLICY_WHITE_ID=$(jq -r '.id' <<<"$RESP_BODY")
+
+api_call POST "/api/groups" "$MASTER_KEY" \
+    '{"name":"policy-invalid-private","group_type":"whitelist","allow_private_ips":true}'
+check "400" "#39 whitelist creation rejects the private-IP flag"
+api_call POST "/api/groups" "$MASTER_KEY" \
+    "{\"name\":\"policy-invalid-exclusions\",\"group_type\":\"whitelist\",\"excluded_whitelist_ids\":[\"$POLICY_WHITE_ID\"]}"
+check "400" "#39 whitelist creation rejects exclusion IDs"
+api_call PUT "/api/groups/$POLICY_WHITE_ID" "$MASTER_KEY" '{"allow_private_ips":true}'
+check "400" "#39 whitelist update rejects the private-IP flag"
+api_call POST "/api/groups" "$MASTER_KEY" '{"name":"policy-replacement","group_type":"whitelist"}'
+check "200" "#39 create another whitelist for exclusion replacement"
+POLICY_REPLACEMENT_ID=$(jq -r '.id' <<<"$RESP_BODY")
+api_call PUT "/api/groups/$POLICY_WHITE_ID" "$MASTER_KEY" \
+    "{\"excluded_whitelist_ids\":[\"$POLICY_REPLACEMENT_ID\"]}"
+check "400" "#39 whitelist update rejects exclusion IDs"
+
+api_call POST "/api/groups" "$MASTER_KEY" \
+    "{\"name\":\"policy-exclusions\",\"excluded_whitelist_ids\":[\"$POLICY_WHITE_ID\"]}"
+check "200" "#39 create the banlist with a whitelist exclusion"
+POLICY_BAN_ID=$(jq -r '.id' <<<"$RESP_BODY")
+check_true '.excluded_whitelist_names == ["policy-protected"]' "#39 create returns the configured whitelist name"
+
+for policy_ip in 45.33.32.0/24 198.41.0.41/32; do
+    api_call POST "/api/white" "$MASTER_KEY" \
+        "{\"group_name\":\"policy-protected\",\"target_address\":\"$policy_ip\"}"
+    check "200" "#39 protect $policy_ip with the original whitelist"
+done
+
+for policy_ip in 45.33.32.41/32 198.41.0.0/24; do
+    policy_ban policy-exclusions "$policy_ip"
+    check "409" "#39 overlapping IPv4 CIDR $policy_ip is blocked"
+    check_true '.error | contains("policy-protected")' "#39 conflict names the original whitelist"
+done
+
+api_call POST "/api/white" "$MASTER_KEY" \
+    '{"group_name":"policy-replacement","target_address":"2001:4860:4860::/64"}'
+check "200" "#39 protect an IPv6 subnet in the replacement whitelist"
+api_call PUT "/api/groups/$POLICY_BAN_ID" "$MASTER_KEY" \
+    "{\"excluded_whitelist_ids\":[\"$POLICY_REPLACEMENT_ID\"]}"
+check "200" "#39 replace the banlist exclusions by PUT"
+check_true '.excluded_whitelist_names == ["policy-replacement"]' "#39 PUT returns only the replacement whitelist"
+policy_ban policy-exclusions 45.33.32.41/32
+check "200" "#39 membership in the previously excluded whitelist no longer blocks a ban"
+policy_ban policy-exclusions 2001:4860:4860::41/128
+check "409" "#39 overlapping IPv6 CIDR is blocked"
+check_true '.error | contains("policy-replacement")' "#39 IPv6 conflict names the replacement whitelist"
+
+api_call POST "/api/records/batch" "$MASTER_KEY" \
+    '{"group_name":"policy-exclusions","mode":"upsert","records":[{"target_address":"2001:4860:4860::42/128"},{"target_address":"45.33.32.42"}]}'
+check "200" "#39 batch succeeds with excluded and non-excluded IPs"
+check_true '.skipped_excluded >= 1 and .created == 1' "#39 batch skips the excluded IP and creates the other IP"
+api_call GET "/api/ips?groups=policy-exclusions" "$MASTER_KEY"
+check "200" "#39 list committed banlist records"
+check_true '(map(.target_address) | sort) == ["45.33.32.41", "45.33.32.42"]' \
+    "#39 only the non-excluded batch IP was committed"
+
+api_call DELETE "/api/ips" "$MASTER_KEY" \
+    '{"group_name":"policy-replacement","target_address":"2001:4860:4860::/64"}'
+check "204" "#39 soft-delete the protected whitelist record"
+policy_ban policy-exclusions 2001:4860:4860::42/128
+check "200" "#39 a soft-deleted whitelist record no longer blocks a ban"
+
+api_call POST "/api/ips/restore" "$MASTER_KEY" \
+    '{"group_name":"policy-replacement","target_address":"2001:4860:4860::/64"}'
+check "200" "#39 restore the whitelist record before testing group deletion"
+policy_ban policy-exclusions 2001:4860:4860::43/128
+check "409" "#39 the restored whitelist record blocks bans again"
+api_call DELETE "/api/groups/$POLICY_REPLACEMENT_ID" "$MASTER_KEY"
+check "204" "#39 deleting a referenced whitelist succeeds"
+api_call GET "/api/groups" "$MASTER_KEY"
+check "200" "#39 list groups after whitelist deletion"
+check_true 'any(.[]; .name == "policy-exclusions" and .excluded_whitelist_ids == [] and .excluded_whitelist_names == [])' \
+    "#39 deleting the whitelist cascades the exclusion link"
+policy_ban policy-exclusions 2001:4860:4860::43/128
+check "200" "#39 the ban succeeds after deleting the excluded whitelist"
 
 log_section "Summary"
 echo -e "$(ts) ${GREEN}Passed: $PASS_COUNT${RESET}   ${RED}Failed: $FAIL_COUNT${RESET}" >&2

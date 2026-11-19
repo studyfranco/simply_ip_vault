@@ -77,7 +77,9 @@ async fn fresh_db(tmp: &TempDb) -> DatabaseConnection {
     simply_ip_vault::db::run_migrations_isolated(&tmp.url())
         .await
         .expect("every migration applies on the isolated pool");
-    simply_ip_vault::db::connect(&tmp.url()).await.expect("a file-backed sqlite pool opens")
+    simply_ip_vault::db::connect(&tmp.url())
+        .await
+        .expect("a file-backed sqlite pool opens")
 }
 
 /// A single-connection, file-backed pool for tests that drive `Migrator::up` to a partial version
@@ -136,6 +138,7 @@ async fn seed_group(db: &DatabaseConnection, name: &str, owner: Option<Uuid>) ->
     ip_group::Entity::insert(ip_group::ActiveModel {
         id: Set(id),
         name: Set(name.to_owned()),
+        allow_private_ips: sea_orm::NotSet,
         group_type: Set("blacklist".to_owned()),
         description: Set(None),
         owner_key_id: Set(owner),
@@ -224,7 +227,12 @@ async fn seed_permission(db: &DatabaseConnection, key: Uuid, group: Uuid) -> Uui
 }
 
 /// Seeds a webhook config bound to `group`.
-async fn seed_webhook(db: &DatabaseConnection, name: &str, group: Uuid, owner: Option<Uuid>) -> Uuid {
+async fn seed_webhook(
+    db: &DatabaseConnection,
+    name: &str,
+    group: Uuid,
+    owner: Option<Uuid>,
+) -> Uuid {
     let id = Uuid::new_v4();
     webhook_config::Entity::insert(webhook_config::ActiveModel {
         id: Set(id),
@@ -319,12 +327,18 @@ async fn deleting_an_api_key_cascades_to_its_group_permissions() {
     seed_permission(&db, bystander, group).await;
 
     assert_eq!(
-        api_key_group_permission::Entity::find().count(&db).await.unwrap(),
+        api_key_group_permission::Entity::find()
+            .count(&db)
+            .await
+            .unwrap(),
         2,
         "both grants exist before the delete"
     );
 
-    api_key::Entity::delete_by_id(doomed).exec(&db).await.expect("the key deletes");
+    api_key::Entity::delete_by_id(doomed)
+        .exec(&db)
+        .await
+        .expect("the key deletes");
 
     assert_eq!(
         api_key_group_permission::Entity::find()
@@ -356,7 +370,7 @@ async fn deleting_an_api_key_cascades_to_its_group_permissions() {
 /// deleting their own credential — the single cheapest way to destroy the evidence of what they did.
 ///
 /// The denormalized `api_key_name` and `api_key_prefix` are asserted to survive too. They are why the
-/// nulled FK is acceptable: the trail stays legible as a point-in-time snapshot ("key 'worker_bot'
+/// nulled FK is acceptable: the trail stays legible as a point-in-time snapshot ("key '`worker_bot`'
 /// did this") rather than degrading to an anonymous row once the join target is gone.
 #[tokio::test]
 async fn deleting_an_api_key_preserves_its_audit_trail_and_nulls_the_reference() {
@@ -366,7 +380,10 @@ async fn deleting_an_api_key_preserves_its_audit_trail_and_nulls_the_reference()
     let key = seed_key(&db, "worker_bot", None).await;
     let entry = seed_audit_log(&db, key, "worker_bot", "IP_ADD").await;
 
-    api_key::Entity::delete_by_id(key).exec(&db).await.expect("the key deletes");
+    api_key::Entity::delete_by_id(key)
+        .exec(&db)
+        .await
+        .expect("the key deletes");
 
     let row = audit_log::Entity::find_by_id(entry)
         .one(&db)
@@ -374,10 +391,12 @@ async fn deleting_an_api_key_preserves_its_audit_trail_and_nulls_the_reference()
         .unwrap()
         .expect("the audit row must survive the deletion of the key that wrote it");
 
-    assert_eq!(row.api_key_id, None, "the dangling reference is nulled, not left pointing nowhere");
     assert_eq!(
-        row.api_key_name,
-        "worker_bot",
+        row.api_key_id, None,
+        "the dangling reference is nulled, not left pointing nowhere"
+    );
+    assert_eq!(
+        row.api_key_name, "worker_bot",
         "the denormalized name survives — this is what keeps the trail readable after the join \
          target is gone"
     );
@@ -406,7 +425,10 @@ async fn deleting_a_parent_key_does_not_touch_its_daughters_at_the_database_laye
     let parent = seed_key(&db, "parent", None).await;
     let daughter = seed_key(&db, "daughter", Some(parent)).await;
 
-    api_key::Entity::delete_by_id(parent).exec(&db).await.expect("the parent deletes");
+    api_key::Entity::delete_by_id(parent)
+        .exec(&db)
+        .await
+        .expect("the parent deletes");
 
     let row = api_key::Entity::find_by_id(daughter)
         .one(&db)
@@ -453,7 +475,10 @@ async fn deleting_a_group_cascades_to_permissions_memberships_and_webhooks() {
     // The record also belongs to the surviving group, so its own row must outlive the delete.
     seed_membership(&db, record, survivor).await;
 
-    ip_group::Entity::delete_by_id(doomed).exec(&db).await.expect("the group deletes");
+    ip_group::Entity::delete_by_id(doomed)
+        .exec(&db)
+        .await
+        .expect("the group deletes");
 
     assert_eq!(
         api_key_group_permission::Entity::find()
@@ -484,7 +509,11 @@ async fn deleting_a_group_cascades_to_permissions_memberships_and_webhooks() {
     );
 
     assert!(
-        ip_record::Entity::find_by_id(record).one(&db).await.unwrap().is_some(),
+        ip_record::Entity::find_by_id(record)
+            .one(&db)
+            .await
+            .unwrap()
+            .is_some(),
         "the IP record itself survives: it is a member of another group, and an address is not \
          owned by any one collection"
     );
@@ -533,24 +562,42 @@ async fn deleting_a_webhook_cascades_to_its_execution_history() {
     let doomed_execution = seed_execution(&db, doomed_webhook).await;
     let surviving_execution = seed_execution(&db, surviving_webhook).await;
 
-    webhook_config::Entity::delete_by_id(doomed_webhook).exec(&db).await.expect("the webhook deletes");
+    webhook_config::Entity::delete_by_id(doomed_webhook)
+        .exec(&db)
+        .await
+        .expect("the webhook deletes");
 
     assert!(
-        webhook_execution::Entity::find_by_id(doomed_execution).one(&db).await.unwrap().is_none(),
+        webhook_execution::Entity::find_by_id(doomed_execution)
+            .one(&db)
+            .await
+            .unwrap()
+            .is_none(),
         "an execution row belonging to a webhook that no longer exists must not survive it — with \
          foreign_keys off it would, orphaned and unreachable by any owner"
     );
     assert!(
-        webhook_execution::Entity::find_by_id(surviving_execution).one(&db).await.unwrap().is_some(),
+        webhook_execution::Entity::find_by_id(surviving_execution)
+            .one(&db)
+            .await
+            .unwrap()
+            .is_some(),
         "an unrelated webhook's execution history is untouched: the cascade is scoped to the \
          deleted webhook, not a table wipe"
     );
 
     // Transitive case: deleting the *group* cascades to `surviving_hook` (proven above) and, one
     // level further, to that webhook's own execution history.
-    ip_group::Entity::delete_by_id(group).exec(&db).await.expect("the group deletes");
+    ip_group::Entity::delete_by_id(group)
+        .exec(&db)
+        .await
+        .expect("the group deletes");
     assert!(
-        webhook_execution::Entity::find_by_id(surviving_execution).one(&db).await.unwrap().is_none(),
+        webhook_execution::Entity::find_by_id(surviving_execution)
+            .one(&db)
+            .await
+            .unwrap()
+            .is_none(),
         "deleting a group must cascade through its webhooks to their execution history too, not \
          stop one level short at the webhook_configs row"
     );
@@ -570,7 +617,10 @@ async fn deleting_an_ip_record_cascades_to_its_group_memberships() {
     let group = seed_group(&db, "blocked", None).await;
     let record = seed_record_in_group(&db, "198.51.100.20", group).await;
 
-    ip_record::Entity::delete_by_id(record).exec(&db).await.expect("the record deletes");
+    ip_record::Entity::delete_by_id(record)
+        .exec(&db)
+        .await
+        .expect("the record deletes");
 
     assert_eq!(
         ip_record_group_membership::Entity::find()
@@ -582,7 +632,11 @@ async fn deleting_an_ip_record_cascades_to_its_group_memberships() {
         "memberships of a deleted record are removed"
     );
     assert!(
-        ip_group::Entity::find_by_id(group).one(&db).await.unwrap().is_some(),
+        ip_group::Entity::find_by_id(group)
+            .one(&db)
+            .await
+            .unwrap()
+            .is_some(),
         "the group survives: a cascade travels from the referenced row to the referencing one, \
          never the other way"
     );
@@ -594,7 +648,7 @@ async fn deleting_an_ip_record_cascades_to_its_group_memberships() {
 
 /// **ADVERSARIAL.** An orphan cannot be written, even by a writer that bypasses the entity layer.
 ///
-/// Every other test in this file deletes through SeaORM and checks the aftermath, which proves the
+/// Every other test in this file deletes through `SeaORM` and checks the aftermath, which proves the
 /// constraints fire but not that they cannot be *evaded*. This one goes around the entity API
 /// entirely and issues the `INSERT` as raw SQL — the shape a restore script, a migration, or a second
 /// process sharing the file would take. A constraint that only holds for cooperative writers is not a
@@ -633,7 +687,10 @@ async fn raw_sql_cannot_write_a_row_referencing_a_nonexistent_parent() {
             ),
         ))
         .await;
-    assert!(orphan_membership.is_err(), "a membership naming neither a record nor a group is refused");
+    assert!(
+        orphan_membership.is_err(),
+        "a membership naming neither a record nor a group is refused"
+    );
 
     let orphan_webhook = db
         .execute_raw(Statement::from_string(
@@ -648,7 +705,10 @@ async fn raw_sql_cannot_write_a_row_referencing_a_nonexistent_parent() {
             ),
         ))
         .await;
-    assert!(orphan_webhook.is_err(), "a webhook bound to a group that does not exist is refused");
+    assert!(
+        orphan_webhook.is_err(),
+        "a webhook bound to a group that does not exist is refused"
+    );
 }
 
 /// A freshly migrated database contains no violated references, by the engine's own reckoning.
@@ -711,8 +771,14 @@ async fn deletes_across_the_whole_schema_leave_no_orphans() {
     seed_audit_log(&db, daughter, "daughter", "IP_DELETE").await;
 
     // Delete from the middle: a group with dependents, then a key with grants and audit rows.
-    ip_group::Entity::delete_by_id(group_a).exec(&db).await.expect("the group deletes");
-    api_key::Entity::delete_by_id(daughter).exec(&db).await.expect("the key deletes");
+    ip_group::Entity::delete_by_id(group_a)
+        .exec(&db)
+        .await
+        .expect("the group deletes");
+    api_key::Entity::delete_by_id(daughter)
+        .exec(&db)
+        .await
+        .expect("the key deletes");
 
     let violations = db
         .query_all_raw(Statement::from_string(
@@ -772,21 +838,41 @@ async fn join_table_orphans(db: &DatabaseConnection) -> Vec<String> {
         .map(|r| r.id)
         .collect();
 
-    for perm in api_key_group_permission::Entity::find().all(db).await.unwrap() {
+    for perm in api_key_group_permission::Entity::find()
+        .all(db)
+        .await
+        .unwrap()
+    {
         if !key_ids.contains(&perm.api_key_id) {
-            orphans.push(format!("api_key_group_permissions {} -> missing key {}", perm.id, perm.api_key_id));
+            orphans.push(format!(
+                "api_key_group_permissions {} -> missing key {}",
+                perm.id, perm.api_key_id
+            ));
         }
         if !group_ids.contains(&perm.group_id) {
-            orphans.push(format!("api_key_group_permissions {} -> missing group {}", perm.id, perm.group_id));
+            orphans.push(format!(
+                "api_key_group_permissions {} -> missing group {}",
+                perm.id, perm.group_id
+            ));
         }
     }
 
-    for m in ip_record_group_membership::Entity::find().all(db).await.unwrap() {
+    for m in ip_record_group_membership::Entity::find()
+        .all(db)
+        .await
+        .unwrap()
+    {
         if !record_ids.contains(&m.ip_record_id) {
-            orphans.push(format!("ip_record_group_memberships -> missing record {}", m.ip_record_id));
+            orphans.push(format!(
+                "ip_record_group_memberships -> missing record {}",
+                m.ip_record_id
+            ));
         }
         if !group_ids.contains(&m.group_id) {
-            orphans.push(format!("ip_record_group_memberships -> missing group {}", m.group_id));
+            orphans.push(format!(
+                "ip_record_group_memberships -> missing group {}",
+                m.group_id
+            ));
         }
     }
 
@@ -821,42 +907,78 @@ async fn deleting_a_key_and_a_group_leaves_no_orphans_in_either_join_table() {
     let record = seed_record_in_group(&db, "198.51.100.40", doomed_group).await;
     seed_membership(&db, record, surviving_group).await;
 
-    assert_eq!(api_key_group_permission::Entity::find().count(&db).await.unwrap(), 4);
-    assert_eq!(ip_record_group_membership::Entity::find().count(&db).await.unwrap(), 2);
-    assert!(join_table_orphans(&db).await.is_empty(), "the fixture starts clean");
+    assert_eq!(
+        api_key_group_permission::Entity::find()
+            .count(&db)
+            .await
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        ip_record_group_membership::Entity::find()
+            .count(&db)
+            .await
+            .unwrap(),
+        2
+    );
+    assert!(
+        join_table_orphans(&db).await.is_empty(),
+        "the fixture starts clean"
+    );
 
-    api_key::Entity::delete_by_id(doomed_key).exec(&db).await.expect("the key deletes");
+    api_key::Entity::delete_by_id(doomed_key)
+        .exec(&db)
+        .await
+        .expect("the key deletes");
     assert_eq!(
         join_table_orphans(&db).await,
         Vec::<String>::new(),
         "deleting a key must leave no grant pointing at it"
     );
     assert_eq!(
-        api_key_group_permission::Entity::find().count(&db).await.unwrap(),
+        api_key_group_permission::Entity::find()
+            .count(&db)
+            .await
+            .unwrap(),
         2,
         "exactly the two grants belonging to the deleted key are gone"
     );
 
-    ip_group::Entity::delete_by_id(doomed_group).exec(&db).await.expect("the group deletes");
+    ip_group::Entity::delete_by_id(doomed_group)
+        .exec(&db)
+        .await
+        .expect("the group deletes");
     assert_eq!(
         join_table_orphans(&db).await,
         Vec::<String>::new(),
         "deleting a group must leave no grant and no membership pointing at it"
     );
     assert_eq!(
-        api_key_group_permission::Entity::find().count(&db).await.unwrap(),
+        api_key_group_permission::Entity::find()
+            .count(&db)
+            .await
+            .unwrap(),
         1,
         "only the surviving key's grant on the surviving group remains"
     );
     assert_eq!(
-        ip_record_group_membership::Entity::find().count(&db).await.unwrap(),
+        ip_record_group_membership::Entity::find()
+            .count(&db)
+            .await
+            .unwrap(),
         1,
         "only the membership in the surviving group remains"
     );
 
     // The record itself is untouched by either delete: an address is not owned by a key, and it
     // belongs to more than one group.
-    assert!(ip_record::Entity::find_by_id(record).one(&db).await.unwrap().is_some());
+    assert!(
+        ip_record::Entity::find_by_id(record)
+            .one(&db)
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 /// Deleting a key does **not** disturb `ip_record_group_memberships`.
@@ -876,10 +998,16 @@ async fn deleting_a_key_does_not_touch_ip_record_memberships() {
     seed_permission(&db, key, group).await;
     let record = seed_record_in_group(&db, "198.51.100.50", group).await;
 
-    api_key::Entity::delete_by_id(key).exec(&db).await.expect("the key deletes");
+    api_key::Entity::delete_by_id(key)
+        .exec(&db)
+        .await
+        .expect("the key deletes");
 
     assert_eq!(
-        api_key_group_permission::Entity::find().count(&db).await.unwrap(),
+        api_key_group_permission::Entity::find()
+            .count(&db)
+            .await
+            .unwrap(),
         0,
         "the key's own grant is gone"
     );
@@ -892,8 +1020,20 @@ async fn deleting_a_key_does_not_touch_ip_record_memberships() {
         1,
         "the membership survives: deleting a credential must never erase the banlist it maintained"
     );
-    assert!(ip_record::Entity::find_by_id(record).one(&db).await.unwrap().is_some());
-    assert!(ip_group::Entity::find_by_id(group).one(&db).await.unwrap().is_some());
+    assert!(
+        ip_record::Entity::find_by_id(record)
+            .one(&db)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        ip_group::Entity::find_by_id(group)
+            .one(&db)
+            .await
+            .unwrap()
+            .is_some()
+    );
     assert!(join_table_orphans(&db).await.is_empty());
 }
 
@@ -930,7 +1070,9 @@ async fn with_foreign_keys_off_the_same_delete_leaves_dangling_rows() {
         .await
         .expect("the pool opens");
     let db = sea_orm::SqlxSqliteConnector::from_sqlx_sqlite_pool(pool);
-    simply_ip_vault::db::run_migrations(&db).await.expect("every migration applies");
+    simply_ip_vault::db::run_migrations(&db)
+        .await
+        .expect("every migration applies");
 
     // Sanity: the switch really is off. Without this the test could pass because the fixture broke.
     let pragma = db
@@ -952,15 +1094,24 @@ async fn with_foreign_keys_off_the_same_delete_leaves_dangling_rows() {
     seed_permission(&db, key, group).await;
     seed_record_in_group(&db, "198.51.100.60", group).await;
 
-    ip_group::Entity::delete_by_id(group).exec(&db).await.expect("the group deletes");
+    ip_group::Entity::delete_by_id(group)
+        .exec(&db)
+        .await
+        .expect("the group deletes");
 
     assert_eq!(
-        api_key_group_permission::Entity::find().count(&db).await.unwrap(),
+        api_key_group_permission::Entity::find()
+            .count(&db)
+            .await
+            .unwrap(),
         1,
         "with foreign keys off the grant survives its group — this is the orphan the pragma prevents"
     );
     assert_eq!(
-        ip_record_group_membership::Entity::find().count(&db).await.unwrap(),
+        ip_record_group_membership::Entity::find()
+            .count(&db)
+            .await
+            .unwrap(),
         1,
         "and so does the membership"
     );
@@ -1003,11 +1154,25 @@ async fn audit_attribution_columns_reject_null_from_raw_sql() {
              VALUES (x'{}', x'{}', {}, {}, {}, 'IP_ADD', '2026-01-01 00:00:00')",
             Uuid::new_v4().simple(),
             key.simple(),
-            if column == "api_key_name" { "NULL" } else { "'n'" },
-            if column == "api_key_prefix" { "NULL" } else { "'p'" },
-            if column == "client_ip" { "NULL" } else { "'203.0.113.1'" },
+            if column == "api_key_name" {
+                "NULL"
+            } else {
+                "'n'"
+            },
+            if column == "api_key_prefix" {
+                "NULL"
+            } else {
+                "'p'"
+            },
+            if column == "client_ip" {
+                "NULL"
+            } else {
+                "'203.0.113.1'"
+            },
         );
-        let outcome = db.execute_raw(Statement::from_string(DatabaseBackend::Sqlite, sql)).await;
+        let outcome = db
+            .execute_raw(Statement::from_string(DatabaseBackend::Sqlite, sql))
+            .await;
         assert!(
             outcome.is_err(),
             "a NULL {column} must be refused — an audit row with no actor records an action nobody \
@@ -1029,7 +1194,10 @@ async fn audit_attribution_columns_reject_null_from_raw_sql() {
             ),
         ))
         .await;
-    assert!(ok.is_ok(), "a fully attributed row must still insert: {ok:?}");
+    assert!(
+        ok.is_ok(),
+        "a fully attributed row must still insert: {ok:?}"
+    );
 }
 
 /// The rebuild preserved `ON DELETE SET NULL` on `api_key_id`.
@@ -1046,7 +1214,10 @@ async fn the_audit_rebuild_preserved_the_set_null_cascade() {
     let key = seed_key(&db, "worker_bot", None).await;
     let entry = seed_audit_log(&db, key, "worker_bot", "IP_ADD").await;
 
-    api_key::Entity::delete_by_id(key).exec(&db).await.expect("the key deletes");
+    api_key::Entity::delete_by_id(key)
+        .exec(&db)
+        .await
+        .expect("the key deletes");
 
     let row = audit_log::Entity::find_by_id(entry)
         .one(&db)
@@ -1075,7 +1246,9 @@ async fn the_audit_rebuild_preserved_both_indexes() {
     // this test exercises the code path that actually runs at boot on every backend.
     for index in ["idx-audit_logs-action", "idx-audit_logs-timestamp"] {
         assert!(
-            simply_ip_vault::db::has_index(&db, "audit_logs", index).await.unwrap(),
+            simply_ip_vault::db::has_index(&db, "audit_logs", index)
+                .await
+                .unwrap(),
             "{index} did not survive the table rebuild"
         );
     }
@@ -1144,7 +1317,10 @@ async fn list_ips_query_plan_uses_indexes_not_a_temp_b_tree_or_table_scan() {
     )
     .await;
     assert!(
-        scoped_plan.iter().any(|l| l.contains("idx_memberships_active_last_seen") || l.contains("idx_memberships_group_is_deleted_last_seen")),
+        scoped_plan
+            .iter()
+            .any(|l| l.contains("idx_memberships_active_last_seen")
+                || l.contains("idx_memberships_group_is_deleted_last_seen")),
         "a group-scoped listing must use the partial (group_id, last_seen_at) index or covering group is_deleted index: {scoped_plan:?}"
     );
     assert!(
@@ -1153,7 +1329,9 @@ async fn list_ips_query_plan_uses_indexes_not_a_temp_b_tree_or_table_scan() {
          group-scoped case: {scoped_plan:?}"
     );
     assert!(
-        !scoped_plan.iter().any(|l| l.starts_with("SCAN ip_record_group_memberships")),
+        !scoped_plan
+            .iter()
+            .any(|l| l.starts_with("SCAN ip_record_group_memberships")),
         "the membership table may not be reached by a full SCAN: {scoped_plan:?}"
     );
 
@@ -1184,7 +1362,9 @@ async fn list_ips_query_plan_uses_indexes_not_a_temp_b_tree_or_table_scan() {
     assert!(
         unfiltered_plan
             .iter()
-            .any(|l| l.contains("idx-irgm-last_seen_at") || l.contains("idx_memberships_global_active_last_seen") || l.contains("idx_memberships_is_deleted_last_seen")),
+            .any(|l| l.contains("idx-irgm-last_seen_at")
+                || l.contains("idx_memberships_global_active_last_seen")
+                || l.contains("idx_memberships_is_deleted_last_seen")),
         "the unfiltered master listing must be ordered by idx-irgm-last_seen_at or idx_memberships_is_deleted_last_seen: {unfiltered_plan:?}"
     );
 
@@ -1219,7 +1399,7 @@ async fn list_ips_query_plan_uses_indexes_not_a_temp_b_tree_or_table_scan() {
 ///
 /// The reported production symptom was 20-42 *seconds*, not milliseconds — which means the bound
 /// worth asserting is "unmistakably fast", not a specific fractional-millisecond figure. A literal
-/// sub-millisecond assertion would be dishonest here: this path runs through SeaORM's query
+/// sub-millisecond assertion would be dishonest here: this path runs through `SeaORM`'s query
 /// builder, sqlx's async row mapping, and a pooled connection acquisition, all of which cost more
 /// than the index lookup itself does.
 ///
@@ -1239,12 +1419,14 @@ async fn list_ips_query_plan_uses_indexes_not_a_temp_b_tree_or_table_scan() {
 /// than lost in fixed overhead.
 #[tokio::test]
 async fn list_ips_query_completes_quickly_at_realistic_scale() {
-    let tmp = TempDb::new();
-    let db = fresh_db(&tmp).await;
+    use sea_orm::{ColumnTrait, QueryFilter, QueryOrder, QuerySelect};
 
     const GROUPS: usize = 10;
     const RECORDS_PER_GROUP: usize = 5_000;
     const BULK_CHUNK: usize = 500; // sqlite's default bound on bound parameters per statement.
+
+    let tmp = TempDb::new();
+    let db = fresh_db(&tmp).await;
 
     let mut group_ids = Vec::with_capacity(GROUPS);
     for g in 0..GROUPS {
@@ -1261,7 +1443,8 @@ async fn list_ips_query_completes_quickly_at_realistic_scale() {
             // `WHERE is_deleted = false ORDER BY updated_at DESC` actually has to sort/filter
             // through, rather than a pathological all-identical-value case an index could shortcut
             // in a way real data never does.
-            let last_seen = now - chrono::Duration::seconds((g * RECORDS_PER_GROUP + i) as i64);
+            let last_seen =
+                now - chrono::Duration::seconds(i64::try_from(g * RECORDS_PER_GROUP + i).unwrap());
             record_models.push(ip_record::ActiveModel {
                 id: Set(id),
                 target_address: Set(format!("10.{g}.{}.{}", i / 250, i % 250)),
@@ -1281,7 +1464,10 @@ async fn list_ips_query_completes_quickly_at_realistic_scale() {
         }
     }
     for chunk in record_models.chunks(BULK_CHUNK) {
-        ip_record::Entity::insert_many(chunk.to_vec()).exec(&db).await.expect("bulk record insert");
+        ip_record::Entity::insert_many(chunk.to_vec())
+            .exec(&db)
+            .await
+            .expect("bulk record insert");
     }
     for chunk in membership_models.chunks(BULK_CHUNK) {
         ip_record_group_membership::Entity::insert_many(chunk.to_vec())
@@ -1293,7 +1479,6 @@ async fn list_ips_query_completes_quickly_at_realistic_scale() {
     // The exact shape `list_ips` builds: `find_also_related` + `filter(IsDeleted)` +
     // `order_by_desc(UpdatedAt)` + `limit`/`offset` — reproduced via the same SeaORM query builder
     // `list_ips` itself calls, not hand-written SQL, so this exercises the real ORM/async path.
-    use sea_orm::{ColumnTrait, QueryFilter, QueryOrder, QuerySelect};
 
     let started = std::time::Instant::now();
     let page = ip_record_group_membership::Entity::find()
@@ -1358,55 +1543,19 @@ async fn list_ips_query_completes_quickly_at_realistic_scale() {
 /// `list_ips_query_completes_quickly_at_realistic_scale` above.
 #[tokio::test]
 async fn list_ips_include_total_count_scales_with_the_callers_own_rows_not_the_whole_table() {
-    use sea_orm::{sea_query::{Expr, Func}, ColumnTrait, Condition, JoinType, QueryFilter, QuerySelect, RelationTrait};
-
-    let tmp = TempDb::new();
-    let db = fresh_db(&tmp).await;
+    use sea_orm::{
+        ColumnTrait, Condition, JoinType, QueryFilter, QuerySelect, RelationTrait,
+        sea_query::{Expr, Func},
+    };
 
     const GROUPS: usize = 10;
     const RECORDS_PER_GROUP: usize = 5_000;
     const BULK_CHUNK: usize = 500;
 
-    let mut group_ids = Vec::with_capacity(GROUPS);
-    for g in 0..GROUPS {
-        group_ids.push(seed_group(&db, &format!("count-bench-group-{g}"), None).await);
-    }
+    let tmp = TempDb::new();
+    let db = fresh_db(&tmp).await;
 
-    let now = Utc::now().naive_utc();
-    let mut record_models = Vec::with_capacity(GROUPS * RECORDS_PER_GROUP);
-    let mut membership_models = Vec::with_capacity(GROUPS * RECORDS_PER_GROUP);
-    for (g, &group_id) in group_ids.iter().enumerate() {
-        for i in 0..RECORDS_PER_GROUP {
-            let id = Uuid::new_v4();
-            let last_seen = now - chrono::Duration::seconds((g * RECORDS_PER_GROUP + i) as i64);
-            record_models.push(ip_record::ActiveModel {
-                id: Set(id),
-                target_address: Set(format!("10.{g}.{}.{}", i / 250, i % 250)),
-                created_at: Set(last_seen),
-            });
-            membership_models.push(ip_record_group_membership::ActiveModel {
-                id: Set(Uuid::new_v4()),
-                ip_record_id: Set(id),
-                group_id: Set(group_id),
-                is_locked: Set(false),
-                created_at: Set(last_seen),
-                last_seen_at: Set(last_seen),
-                is_deleted: Set(i % 10 == 0),
-                deleted_at: Set(None),
-                deleted_by: Set(None),
-            });
-        }
-    }
-    for chunk in record_models.chunks(BULK_CHUNK) {
-        ip_record::Entity::insert_many(chunk.to_vec()).exec(&db).await.expect("bulk record insert");
-    }
-    for chunk in membership_models.chunks(BULK_CHUNK) {
-        ip_record_group_membership::Entity::insert_many(chunk.to_vec())
-            .exec(&db)
-            .await
-            .expect("bulk membership insert");
-    }
-
+    let group_ids = seed_count_benchmark(&db, GROUPS, RECORDS_PER_GROUP, BULK_CHUNK).await;
     let typed_count = |gids: Vec<Uuid>| {
         let db = db.clone();
         async move {
@@ -1414,7 +1563,10 @@ async fn list_ips_include_total_count_scales_with_the_callers_own_rows_not_the_w
                 .add(ip_record_group_membership::Column::IsDeleted.eq(false))
                 .add(ip_record_group_membership::Column::GroupId.is_in(gids));
             ip_record_group_membership::Entity::find()
-                .join(JoinType::LeftJoin, ip_record_group_membership::Relation::IpRecord.def())
+                .join(
+                    JoinType::LeftJoin,
+                    ip_record_group_membership::Relation::IpRecord.def(),
+                )
                 .filter(condition)
                 .select_only()
                 .expr_as(
@@ -1437,7 +1589,10 @@ async fn list_ips_include_total_count_scales_with_the_callers_own_rows_not_the_w
     let single_group_total = typed_count(vec![group_ids[0]]).await;
     let single_group_elapsed = started.elapsed();
     println!("include_total count, 1 group (~4,500 matching rows): {single_group_elapsed:?}");
-    assert_eq!(single_group_total, 4_500, "9/10 of 5,000 seeded records in the group are live");
+    assert_eq!(
+        single_group_total, 4_500,
+        "9/10 of 5,000 seeded records in the group are live"
+    );
     assert!(
         single_group_elapsed < std::time::Duration::from_millis(50),
         "a single-group-scoped count took {single_group_elapsed:?} against 4,500 matching rows — \
@@ -1451,13 +1606,68 @@ async fn list_ips_include_total_count_scales_with_the_callers_own_rows_not_the_w
     let all_groups_total = typed_count(group_ids.clone()).await;
     let all_groups_elapsed = started.elapsed();
     println!("include_total count, 10 groups (~45,000 matching rows): {all_groups_elapsed:?}");
-    assert_eq!(all_groups_total, 45_000, "9/10 of 50,000 seeded records across all groups are live");
+    assert_eq!(
+        all_groups_total, 45_000,
+        "9/10 of 50,000 seeded records across all groups are live"
+    );
     assert!(
         all_groups_elapsed < std::time::Duration::from_secs(2),
         "a full-table-scoped count took {all_groups_elapsed:?} against 45,000 matching rows — \
          measured at ~200ms on this machine; 2s is a generous margin against CI variance, and even \
          that is three orders of magnitude below the reported 15-37s symptom"
     );
+}
+
+async fn seed_count_benchmark(
+    db: &DatabaseConnection,
+    groups: usize,
+    records_per_group: usize,
+    bulk_chunk: usize,
+) -> Vec<Uuid> {
+    let mut group_ids = Vec::with_capacity(groups);
+    for g in 0..groups {
+        group_ids.push(seed_group(db, &format!("count-bench-group-{g}"), None).await);
+    }
+
+    let now = Utc::now().naive_utc();
+    let mut record_models = Vec::with_capacity(groups * records_per_group);
+    let mut membership_models = Vec::with_capacity(groups * records_per_group);
+    for (g, &group_id) in group_ids.iter().enumerate() {
+        for i in 0..records_per_group {
+            let id = Uuid::new_v4();
+            let last_seen =
+                now - chrono::Duration::seconds(i64::try_from(g * records_per_group + i).unwrap());
+            record_models.push(ip_record::ActiveModel {
+                id: Set(id),
+                target_address: Set(format!("10.{g}.{}.{}", i / 250, i % 250)),
+                created_at: Set(last_seen),
+            });
+            membership_models.push(ip_record_group_membership::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                ip_record_id: Set(id),
+                group_id: Set(group_id),
+                is_locked: Set(false),
+                created_at: Set(last_seen),
+                last_seen_at: Set(last_seen),
+                is_deleted: Set(i % 10 == 0),
+                deleted_at: Set(None),
+                deleted_by: Set(None),
+            });
+        }
+    }
+    for chunk in record_models.chunks(bulk_chunk) {
+        ip_record::Entity::insert_many(chunk.to_vec())
+            .exec(db)
+            .await
+            .expect("bulk record insert");
+    }
+    for chunk in membership_models.chunks(bulk_chunk) {
+        ip_record_group_membership::Entity::insert_many(chunk.to_vec())
+            .exec(db)
+            .await
+            .expect("bulk membership insert");
+    }
+    group_ids
 }
 
 /// **`include_total=true` combined with `groups`, `since`, and the default `is_deleted=false`
@@ -1474,23 +1684,33 @@ async fn list_ips_include_total_count_scales_with_the_callers_own_rows_not_the_w
 /// logging state to coordinate across a parallel test run.
 #[tokio::test]
 async fn list_ips_complex_filters_produce_one_group_id_predicate_not_several() {
-    use sea_orm::{sea_query::{Expr, Func}, ColumnTrait, Condition, DbBackend, JoinType, QueryFilter, QueryOrder, QuerySelect, QueryTrait, RelationTrait};
+    use sea_orm::{
+        ColumnTrait, Condition, DbBackend, JoinType, QueryFilter, QueryOrder, QuerySelect,
+        QueryTrait, RelationTrait,
+        sea_query::{Expr, Func},
+    };
 
-    let accessible_groups: std::collections::HashSet<Uuid> = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()].into();
-    let requested_groups: std::collections::HashSet<Uuid> = [*accessible_groups.iter().next().unwrap()].into();
+    let accessible_groups: std::collections::HashSet<Uuid> =
+        [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()].into();
+    let requested_groups: std::collections::HashSet<Uuid> =
+        [*accessible_groups.iter().next().unwrap()].into();
 
     // The exact reduction `list_ips` performs: collect every group_id source as a set, intersect,
     // and add exactly one `.is_in(...)` — never one `.filter()` call per source.
     let mut intersected = accessible_groups.clone();
     intersected.retain(|g| requested_groups.contains(g));
-    assert!(!intersected.is_empty(), "the test's own fixture must actually overlap");
+    assert!(
+        !intersected.is_empty(),
+        "the test's own fixture must actually overlap"
+    );
 
     let since_threshold = Utc::now().naive_utc() - chrono::Duration::seconds(3600);
     let condition = Condition::all()
         .add(ip_record_group_membership::Column::IsDeleted.eq(false))
         .add(ip_record_group_membership::Column::GroupId.is_in(intersected))
         .add(
-            Condition::any().add(ip_record_group_membership::Column::LastSeenAt.gte(since_threshold)),
+            Condition::any()
+                .add(ip_record_group_membership::Column::LastSeenAt.gte(since_threshold)),
         );
 
     let data_sql = ip_record_group_membership::Entity::find()
@@ -1503,7 +1723,10 @@ async fn list_ips_complex_filters_produce_one_group_id_predicate_not_several() {
         .sql;
 
     let count_sql = ip_record_group_membership::Entity::find()
-        .join(JoinType::LeftJoin, ip_record_group_membership::Relation::IpRecord.def())
+        .join(
+            JoinType::LeftJoin,
+            ip_record_group_membership::Relation::IpRecord.def(),
+        )
         .filter(condition)
         .select_only()
         .expr_as(
@@ -1539,7 +1762,9 @@ async fn rows_written_before_the_constraint_are_backfilled_not_dropped() {
     let db = partial_migration_db(&tmp).await;
 
     // Everything up to and including m20260808_000009, but not m20260811_000010.
-    simply_ip_vault::migration::Migrator::up(&db, Some(9)).await.expect("nine migrations apply");
+    simply_ip_vault::migration::Migrator::up(&db, Some(9))
+        .await
+        .expect("nine migrations apply");
 
     let key = seed_key(&db, "legacy", None).await;
     let legacy = Uuid::new_v4();
@@ -1556,7 +1781,9 @@ async fn rows_written_before_the_constraint_are_backfilled_not_dropped() {
     .expect("the old schema permitted unattributed rows");
 
     // Now the constraint lands.
-    simply_ip_vault::migration::Migrator::up(&db, None).await.expect("the backfill migration applies");
+    simply_ip_vault::migration::Migrator::up(&db, None)
+        .await
+        .expect("the backfill migration applies");
 
     let row = audit_log::Entity::find_by_id(legacy)
         .one(&db)
@@ -1567,7 +1794,10 @@ async fn rows_written_before_the_constraint_are_backfilled_not_dropped() {
     assert_eq!(row.api_key_name, "(unknown)");
     assert_eq!(row.api_key_prefix, "(unknown)");
     assert_eq!(row.client_ip, "(unknown)");
-    assert_eq!(row.action, "IP_ADD", "the rest of the row is carried across untouched");
+    assert_eq!(
+        row.action, "IP_ADD",
+        "the rest of the row is carried across untouched"
+    );
     assert_eq!(row.api_key_id, Some(key), "including the foreign key");
     assert!(
         row.client_ip.parse::<std::net::IpAddr>().is_err(),
@@ -1602,15 +1832,172 @@ async fn upgrading_a_populated_database_backfills_every_membership_including_mul
     let db = partial_migration_db(&tmp).await;
 
     // Everything up to and including m20260824_150000 (the 16th migration), but not this one.
-    simply_ip_vault::migration::Migrator::up(&db, Some(16)).await.expect("sixteen migrations apply");
+    simply_ip_vault::migration::Migrator::up(&db, Some(16))
+        .await
+        .expect("sixteen migrations apply");
 
     let group_a = seed_group(&db, "prod-group-a", None).await;
     let group_b = seed_group(&db, "prod-group-b", None).await;
 
+    let (shared, solo) = seed_legacy_shared_and_solo_records(&db, group_a, group_b).await;
+    // The upgrade.
+    simply_ip_vault::migration::Migrator::up(&db, None)
+        .await
+        .expect("the membership-timestamp migration applies");
+
+    for id in [group_a, group_b] {
+        let group = ip_group::Entity::find_by_id(id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !group.allow_private_ips,
+            "existing groups default to public-only bans"
+        );
+    }
+
+    // Nothing lost, nothing duplicated: exactly the three memberships seeded above, still linking
+    // the same (record, group) pairs.
+    let all_memberships = simply_ip_vault::entities::ip_record_group_membership::Entity::find()
+        .all(&db)
+        .await
+        .expect("memberships are still queryable through the new entity shape");
+    assert_eq!(
+        all_memberships.len(),
+        3,
+        "no membership row was lost or duplicated by the rebuild"
+    );
+
+    let shared_memberships: Vec<_> = all_memberships
+        .iter()
+        .filter(|m| m.ip_record_id == shared.id)
+        .collect();
+    assert_eq!(
+        shared_memberships.len(),
+        2,
+        "the multi-group record must still hold both of its memberships"
+    );
+    let shared_groups: std::collections::HashSet<Uuid> =
+        shared_memberships.iter().map(|m| m.group_id).collect();
+    assert_eq!(
+        shared_groups,
+        [group_a, group_b].into(),
+        "linked to exactly the two groups seeded, no others"
+    );
+
+    // The multi-group case this test exists for: BOTH of the shared record's memberships were
+    // backfilled from that same record, and therefore agree with each other and with the record.
+    // The old per-group `updated_at` is now `last_seen_at`.
+    for m in &shared_memberships {
+        assert_eq!(
+            m.created_at, shared.created,
+            "backfilled created_at must match the record's own, for group {}",
+            m.group_id
+        );
+        assert_eq!(
+            m.last_seen_at, shared.updated,
+            "backfilled last_seen_at must match the record's updated_at, for group {}",
+            m.group_id
+        );
+        assert!(!m.is_deleted, "a live record's memberships migrate live");
+    }
+
+    let solo_membership = all_memberships
+        .iter()
+        .find(|m| m.ip_record_id == solo.id)
+        .expect("the single-group record's membership survives too");
+    assert_eq!(solo_membership.group_id, group_a);
+    assert_eq!(solo_membership.created_at, solo.created);
+    assert_eq!(solo_membership.last_seen_at, solo.updated);
+
+    // The record's cause moved onto each of its memberships as an append-only history row; the
+    // record with no cause produced none.
+    let cause_rows = ip_record_cause::Entity::find()
+        .all(&db)
+        .await
+        .expect("causes are queryable");
+    assert_eq!(
+        cause_rows.len(),
+        2,
+        "one cause row per membership of the record that had a cause"
+    );
+    let cause_membership_ids: std::collections::HashSet<Uuid> =
+        cause_rows.iter().map(|c| c.membership_id).collect();
+    let shared_membership_ids: std::collections::HashSet<Uuid> =
+        shared_memberships.iter().map(|m| m.id).collect();
+    assert_eq!(
+        cause_membership_ids, shared_membership_ids,
+        "the causes attach to the shared record's memberships"
+    );
+    assert!(cause_rows.iter().all(|c| c.cause == "production seed"));
+
+    assert_membership_upgrade_cascade_and_indexes(&db, shared).await;
+}
+
+async fn assert_membership_upgrade_cascade_and_indexes(
+    db: &DatabaseConnection,
+    shared: LegacyRecordTimes,
+) {
+    // Foreign keys still function post-rebuild: deleting the shared record must cascade and leave
+    // group_b with none of its memberships, not an orphaned row.
+    simply_ip_vault::entities::ip_record::Entity::delete_by_id(shared.id)
+        .exec(db)
+        .await
+        .expect("the delete succeeds");
+    let remaining = simply_ip_vault::entities::ip_record_group_membership::Entity::find()
+        .filter(
+            simply_ip_vault::entities::ip_record_group_membership::Column::IpRecordId.eq(shared.id),
+        )
+        .all(db)
+        .await
+        .expect("query succeeds");
+    assert!(
+        remaining.is_empty(),
+        "ON DELETE CASCADE must still cascade after the rebuild"
+    );
+
+    // The index swap actually happened: the new composite exists, and the one built solely for the
+    // record-level sort this migration retires does not.
+    assert!(
+        simply_ip_vault::db::has_index(
+            db,
+            "ip_record_group_memberships",
+            "idx_memberships_active_last_seen"
+        )
+        .await
+        .unwrap(),
+        "the partial (group_id, last_seen_at) index must exist after the upgrade"
+    );
+    assert!(
+        simply_ip_vault::db::has_index(
+            db,
+            "ip_record_group_memberships",
+            "idx_group_memberships_lookup"
+        )
+        .await
+        .unwrap(),
+        "the pre-existing group_id lookup index must survive the rebuild"
+    );
+    assert!(
+        !simply_ip_vault::db::has_index(db, "ip_records", "idx_ip_records_deleted_updated")
+            .await
+            .unwrap(),
+        "the index built for the record-level sort this migration retires must be gone, not just unused"
+    );
+}
+
+async fn seed_legacy_shared_and_solo_records(
+    db: &DatabaseConnection,
+    group_a: Uuid,
+    group_b: Uuid,
+) -> (LegacyRecordTimes, LegacyRecordTimes) {
     // A record that has existed for a while and was touched more recently — distinct, recognizable
     // values so a wrong column (or a transposition) would be visible, not coincidentally correct.
-    let shared_created = chrono::NaiveDateTime::parse_from_str("2026-06-01 08:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
-    let shared_updated = chrono::NaiveDateTime::parse_from_str("2026-08-15 12:30:00", "%Y-%m-%d %H:%M:%S").unwrap();
+    let shared_created =
+        chrono::NaiveDateTime::parse_from_str("2026-06-01 08:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+    let shared_updated =
+        chrono::NaiveDateTime::parse_from_str("2026-08-15 12:30:00", "%Y-%m-%d %H:%M:%S").unwrap();
     // Raw SQL throughout the pre-refactor fixture: the current entity no longer has these columns,
     // and the table as it stands at this version still does.
     let shared_record = Uuid::new_v4();
@@ -1629,8 +2016,10 @@ async fn upgrading_a_populated_database_backfills_every_membership_including_mul
 
     // A second, single-group record, so the test also covers the ordinary case alongside the
     // multi-group one rather than only the latter.
-    let solo_created = chrono::NaiveDateTime::parse_from_str("2026-07-01 09:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
-    let solo_updated = chrono::NaiveDateTime::parse_from_str("2026-08-20 16:45:00", "%Y-%m-%d %H:%M:%S").unwrap();
+    let solo_created =
+        chrono::NaiveDateTime::parse_from_str("2026-07-01 09:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+    let solo_updated =
+        chrono::NaiveDateTime::parse_from_str("2026-08-20 16:45:00", "%Y-%m-%d %H:%M:%S").unwrap();
     let solo_record = Uuid::new_v4();
     db.execute_raw(Statement::from_string(
         DatabaseBackend::Sqlite,
@@ -1648,7 +2037,11 @@ async fn upgrading_a_populated_database_backfills_every_membership_including_mul
     // Three membership rows, under the OLD two-column shape — raw SQL because the current
     // `ip_record_group_membership::ActiveModel` already requires `created_at`/`updated_at` and
     // cannot express a row the pre-migration schema would accept.
-    for (record, group) in [(shared_record, group_a), (shared_record, group_b), (solo_record, group_a)] {
+    for (record, group) in [
+        (shared_record, group_a),
+        (shared_record, group_b),
+        (solo_record, group_a),
+    ] {
         db.execute_raw(Statement::from_string(
             DatabaseBackend::Sqlite,
             format!(
@@ -1660,82 +2053,18 @@ async fn upgrading_a_populated_database_backfills_every_membership_including_mul
         .await
         .expect("the old schema accepts a membership row with no timestamps");
     }
-
-    // The upgrade.
-    simply_ip_vault::migration::Migrator::up(&db, None).await.expect("the membership-timestamp migration applies");
-
-    // Nothing lost, nothing duplicated: exactly the three memberships seeded above, still linking
-    // the same (record, group) pairs.
-    let all_memberships = simply_ip_vault::entities::ip_record_group_membership::Entity::find()
-        .all(&db)
-        .await
-        .expect("memberships are still queryable through the new entity shape");
-    assert_eq!(all_memberships.len(), 3, "no membership row was lost or duplicated by the rebuild");
-
-    let shared_memberships: Vec<_> = all_memberships.iter().filter(|m| m.ip_record_id == shared_record).collect();
-    assert_eq!(shared_memberships.len(), 2, "the multi-group record must still hold both of its memberships");
-    let shared_groups: std::collections::HashSet<Uuid> = shared_memberships.iter().map(|m| m.group_id).collect();
-    assert_eq!(shared_groups, [group_a, group_b].into(), "linked to exactly the two groups seeded, no others");
-
-    // The multi-group case this test exists for: BOTH of the shared record's memberships were
-    // backfilled from that same record, and therefore agree with each other and with the record.
-    // The old per-group `updated_at` is now `last_seen_at`.
-    for m in &shared_memberships {
-        assert_eq!(m.created_at, shared_created, "backfilled created_at must match the record's own, for group {}", m.group_id);
-        assert_eq!(m.last_seen_at, shared_updated, "backfilled last_seen_at must match the record's updated_at, for group {}", m.group_id);
-        assert!(!m.is_deleted, "a live record's memberships migrate live");
-    }
-
-    let solo_membership = all_memberships
-        .iter()
-        .find(|m| m.ip_record_id == solo_record)
-        .expect("the single-group record's membership survives too");
-    assert_eq!(solo_membership.group_id, group_a);
-    assert_eq!(solo_membership.created_at, solo_created);
-    assert_eq!(solo_membership.last_seen_at, solo_updated);
-
-    // The record's cause moved onto each of its memberships as an append-only history row; the
-    // record with no cause produced none.
-    let cause_rows = ip_record_cause::Entity::find().all(&db).await.expect("causes are queryable");
-    assert_eq!(cause_rows.len(), 2, "one cause row per membership of the record that had a cause");
-    let cause_membership_ids: std::collections::HashSet<Uuid> = cause_rows.iter().map(|c| c.membership_id).collect();
-    let shared_membership_ids: std::collections::HashSet<Uuid> = shared_memberships.iter().map(|m| m.id).collect();
-    assert_eq!(cause_membership_ids, shared_membership_ids, "the causes attach to the shared record's memberships");
-    assert!(cause_rows.iter().all(|c| c.cause == "production seed"));
-
-    // Foreign keys still function post-rebuild: deleting the shared record must cascade and leave
-    // group_b with none of its memberships, not an orphaned row.
-    simply_ip_vault::entities::ip_record::Entity::delete_by_id(shared_record)
-        .exec(&db)
-        .await
-        .expect("the delete succeeds");
-    let remaining = simply_ip_vault::entities::ip_record_group_membership::Entity::find()
-        .filter(simply_ip_vault::entities::ip_record_group_membership::Column::IpRecordId.eq(shared_record))
-        .all(&db)
-        .await
-        .expect("query succeeds");
-    assert!(remaining.is_empty(), "ON DELETE CASCADE must still cascade after the rebuild");
-
-    // The index swap actually happened: the new composite exists, and the one built solely for the
-    // record-level sort this migration retires does not.
-    assert!(
-        simply_ip_vault::db::has_index(&db, "ip_record_group_memberships", "idx_memberships_active_last_seen")
-            .await
-            .unwrap(),
-        "the partial (group_id, last_seen_at) index must exist after the upgrade"
-    );
-    assert!(
-        simply_ip_vault::db::has_index(&db, "ip_record_group_memberships", "idx_group_memberships_lookup")
-            .await
-            .unwrap(),
-        "the pre-existing group_id lookup index must survive the rebuild"
-    );
-    assert!(
-        !simply_ip_vault::db::has_index(&db, "ip_records", "idx_ip_records_deleted_updated")
-            .await
-            .unwrap(),
-        "the index built for the record-level sort this migration retires must be gone, not just unused"
-    );
+    (
+        LegacyRecordTimes {
+            id: shared_record,
+            created: shared_created,
+            updated: shared_updated,
+        },
+        LegacyRecordTimes {
+            id: solo_record,
+            created: solo_created,
+            updated: solo_updated,
+        },
+    )
 }
 
 /// The copy is by column name, not by position.
@@ -1749,7 +2078,9 @@ async fn the_audit_rebuild_did_not_transpose_columns() {
 
     let tmp = TempDb::new();
     let db = partial_migration_db(&tmp).await;
-    simply_ip_vault::migration::Migrator::up(&db, Some(9)).await.expect("nine migrations apply");
+    simply_ip_vault::migration::Migrator::up(&db, Some(9))
+        .await
+        .expect("nine migrations apply");
 
     let key = seed_key(&db, "before", None).await;
     let id = Uuid::new_v4();
@@ -1768,9 +2099,15 @@ async fn the_audit_rebuild_did_not_transpose_columns() {
     .await
     .expect("the row inserts");
 
-    simply_ip_vault::migration::Migrator::up(&db, None).await.expect("the rebuild applies");
+    simply_ip_vault::migration::Migrator::up(&db, None)
+        .await
+        .expect("the rebuild applies");
 
-    let row = audit_log::Entity::find_by_id(id).one(&db).await.unwrap().expect("row survives");
+    let row = audit_log::Entity::find_by_id(id)
+        .one(&db)
+        .await
+        .unwrap()
+        .expect("row survives");
     assert_eq!(row.api_key_name, "NAME");
     assert_eq!(row.api_key_prefix, "PREFIX");
     assert_eq!(row.client_ip, "198.51.100.7");
@@ -1808,7 +2145,9 @@ async fn the_delta_sync_columns_are_indexed() {
         "idx_memberships_group_is_deleted_last_seen",
     ] {
         assert!(
-            simply_ip_vault::db::has_index(&db, "ip_record_group_memberships", index).await.unwrap(),
+            simply_ip_vault::db::has_index(&db, "ip_record_group_memberships", index)
+                .await
+                .unwrap(),
             "{index} is missing — a delta query on that column scans the whole table"
         );
     }
@@ -1854,7 +2193,10 @@ async fn every_spelling_of_one_ipv6_host_is_one_record() {
     ];
 
     let canonical = normalize_ip_or_cidr(spellings[0]);
-    assert_eq!(canonical, "2001:db8::1", "the canonical form drops /128 and compresses");
+    assert_eq!(
+        canonical, "2001:db8::1",
+        "the canonical form drops /128 and compresses"
+    );
     for spelling in spellings {
         assert_eq!(
             normalize_ip_or_cidr(spelling),
@@ -1948,7 +2290,10 @@ async fn test_cidr_deduplication_different_host_bits() {
     })
     .exec(&db)
     .await;
-    assert!(collision.is_err(), "the second spelling must collide, not create a second row");
+    assert!(
+        collision.is_err(),
+        "the second spelling must collide, not create a second row"
+    );
 
     // Lookup by either spelling finds the one record — the property a caller actually depends on
     // when it bans through one form and unbans through another.
@@ -1962,7 +2307,11 @@ async fn test_cidr_deduplication_different_host_bits() {
         assert_eq!(found.id, id, "{spelling} resolves to the same row");
     }
 
-    assert_eq!(ip_record::Entity::find().all(&db).await.unwrap().len(), 1, "exactly one row");
+    assert_eq!(
+        ip_record::Entity::find().all(&db).await.unwrap().len(),
+        1,
+        "exactly one row"
+    );
 }
 
 /// IPv6 subnets are masked on the same rule as IPv4.
@@ -1980,9 +2329,15 @@ async fn test_ipv6_cidr_host_bit_normalization() {
 
     assert_eq!(normalize_ip_or_cidr("2001:db8::fe/64"), "2001:db8::/64");
     // Host bits above the low byte, and a prefix that is not a multiple of 16.
-    assert_eq!(normalize_ip_or_cidr("2001:db8:0:0:dead:beef:0:1/64"), "2001:db8::/64");
+    assert_eq!(
+        normalize_ip_or_cidr("2001:db8:0:0:dead:beef:0:1/64"),
+        "2001:db8::/64"
+    );
     assert_eq!(normalize_ip_or_cidr("2001:db8::1234/56"), "2001:db8::/56");
-    assert_eq!(normalize_ip_or_cidr("2001:db8:abcd:ef01::1/60"), "2001:db8:abcd:ef00::/60");
+    assert_eq!(
+        normalize_ip_or_cidr("2001:db8:abcd:ef01::1/60"),
+        "2001:db8:abcd:ef00::/60"
+    );
 
     // A /128 stays an exact host, as does a bare address.
     assert_eq!(normalize_ip_or_cidr("2001:db8::fe/128"), "2001:db8::fe");
@@ -2014,12 +2369,17 @@ async fn every_foreign_key_child_column_is_indexed() {
         ("webhook_executions", "idx_webhook_exec_lookup"),
         ("api_key_group_permissions", "idx-akgp-group_id"),
         ("api_key_group_permissions", "idx-akgp-api_key_id-group_id"),
-        ("ip_record_group_memberships", "idx_group_memberships_lookup"),
+        (
+            "ip_record_group_memberships",
+            "idx_group_memberships_lookup",
+        ),
         ("ip_record_group_memberships", "idx_memberships_ip_group"),
         ("ip_record_causes", "idx_causes_membership_created"),
     ] {
         assert!(
-            simply_ip_vault::db::has_index(&db, table, index).await.unwrap(),
+            simply_ip_vault::db::has_index(&db, table, index)
+                .await
+                .unwrap(),
             "foreign-key child {table} must be indexed by {index}"
         );
     }
@@ -2044,7 +2404,9 @@ async fn every_foreign_key_child_column_also_has_a_plain_single_column_index() {
         ("ip_record_causes", "idx-irc-created_at"),
     ] {
         assert!(
-            simply_ip_vault::db::has_index(&db, table, index).await.unwrap(),
+            simply_ip_vault::db::has_index(&db, table, index)
+                .await
+                .unwrap(),
             "foreign-key child {table} must have its own plain index {index}, not only a composite \
              that happens to lead with it"
         );
@@ -2059,14 +2421,25 @@ async fn query_optimization_indexes_exist() {
     let db = fresh_db(&tmp).await;
 
     for (table, index) in [
-        ("webhook_executions", "idx_webhook_executions_success_created"),
-        ("webhook_executions", "idx_webhook_executions_status_code_created"),
-        ("webhook_executions", "idx_webhook_executions_event_type_created"),
+        (
+            "webhook_executions",
+            "idx_webhook_executions_success_created",
+        ),
+        (
+            "webhook_executions",
+            "idx_webhook_executions_status_code_created",
+        ),
+        (
+            "webhook_executions",
+            "idx_webhook_executions_event_type_created",
+        ),
         ("ip_groups", "idx-ip_groups-group_type"),
         ("audit_logs", "idx_audit_logs_api_key_timestamp"),
     ] {
         assert!(
-            simply_ip_vault::db::has_index(&db, table, index).await.unwrap(),
+            simply_ip_vault::db::has_index(&db, table, index)
+                .await
+                .unwrap(),
             "table {table} must have optimization index {index}"
         );
     }
@@ -2100,7 +2473,11 @@ async fn columns_live_on_the_right_table_after_the_refactor() {
 
     let mut records = column_names(&db, "ip_records").await;
     records.sort();
-    assert_eq!(records, ["created_at", "id", "target_address"], "ip_records holds the address only");
+    assert_eq!(
+        records,
+        ["created_at", "id", "target_address"],
+        "ip_records holds the address only"
+    );
 
     let memberships = column_names(&db, "ip_record_group_memberships").await;
     for column in [
@@ -2114,7 +2491,10 @@ async fn columns_live_on_the_right_table_after_the_refactor() {
         "deleted_at",
         "deleted_by",
     ] {
-        assert!(memberships.iter().any(|c| c == column), "memberships must have column {column}: {memberships:?}");
+        assert!(
+            memberships.iter().any(|c| c == column),
+            "memberships must have column {column}: {memberships:?}"
+        );
     }
     assert!(
         !memberships.iter().any(|c| c == "updated_at"),
@@ -2143,9 +2523,18 @@ async fn the_active_membership_index_is_partial_over_last_seen_at() {
         .expect("the partial index exists after Migrator::up");
     let sql: String = row.try_get("", "sql").expect("the definition is text");
 
-    assert!(sql.contains("last_seen_at"), "the index is over last_seen_at: {sql}");
-    assert!(sql.contains("is_deleted"), "the index's WHERE clause names is_deleted: {sql}");
-    assert!(sql.contains("WHERE"), "the index is partial, not a full index over every row: {sql}");
+    assert!(
+        sql.contains("last_seen_at"),
+        "the index is over last_seen_at: {sql}"
+    );
+    assert!(
+        sql.contains("is_deleted"),
+        "the index's WHERE clause names is_deleted: {sql}"
+    );
+    assert!(
+        sql.contains("WHERE"),
+        "the index is partial, not a full index over every row: {sql}"
+    );
 }
 
 /// Deleting a membership removes its cause history, and only that membership's.
@@ -2167,7 +2556,11 @@ async fn ip_record_causes_cascade_with_their_membership() {
     seed_cause(&db, membership, "first report").await;
     seed_cause(&db, membership, "second report").await;
     seed_cause(&db, sibling, "sibling report").await;
-    assert_eq!(ip_record_cause::Entity::find().count(&db).await.unwrap(), 3, "fixture starts with three causes");
+    assert_eq!(
+        ip_record_cause::Entity::find().count(&db).await.unwrap(),
+        3,
+        "fixture starts with three causes"
+    );
 
     ip_record_group_membership::Entity::delete_by_id(membership)
         .exec(&db)
@@ -2237,11 +2630,28 @@ async fn one_address_in_two_groups_has_independent_lock_and_delete_state() {
     .await
     .expect("the group-a membership updates");
 
-    let a = ip_record_group_membership::Entity::find_by_id(in_a).one(&db).await.unwrap().unwrap();
-    let b = ip_record_group_membership::Entity::find_by_id(in_b).one(&db).await.unwrap().unwrap();
-    assert!(a.is_deleted && a.is_locked, "the group-a membership carries the change");
+    let a = ip_record_group_membership::Entity::find_by_id(in_a)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    let b = ip_record_group_membership::Entity::find_by_id(in_b)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        a.is_deleted && a.is_locked,
+        "the group-a membership carries the change"
+    );
     assert!(
         !b.is_deleted && !b.is_locked && b.deleted_at.is_none() && b.deleted_by.is_none(),
         "the group-b membership of the same address is untouched by a change in group a: {b:?}"
     );
+}
+
+struct LegacyRecordTimes {
+    id: Uuid,
+    created: chrono::NaiveDateTime,
+    updated: chrono::NaiveDateTime,
 }

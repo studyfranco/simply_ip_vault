@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 
 /// A single (API key, IP group) permission grant.
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "SeaORM DeriveEntityModel requires flat 1:1 fields for SQL BOOLEAN columns"
+)]
 #[sea_orm(table_name = "api_key_group_permissions")]
 pub struct Model {
     /// Unique identifier for the permission grant.

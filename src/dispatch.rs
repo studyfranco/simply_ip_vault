@@ -13,19 +13,28 @@
 //! imported wrongly — and, worse, *reviewed* wrongly, because a diff header reading `webhooks.rs`
 //! does not say which of the two security models applies.
 
-use std::time::Duration;
-use std::str::FromStr;
-use std::net::IpAddr;
-use crate::entities::{prelude::*, webhook_config::{self, AuthMode, DEFAULT_HMAC_TEMPLATE}, webhook_execution};
+use crate::entities::{
+    prelude::*,
+    webhook_config::{self, AuthMode, DEFAULT_HMAC_TEMPLATE},
+    webhook_execution,
+};
 use crate::state::WebhookEvent;
-use reqwest::{Client, header::{HeaderMap, HeaderName, HeaderValue}};
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use hmac::{Hmac, KeyInit, Mac};
+use reqwest::{
+    Client,
+    header::{HeaderMap, HeaderName, HeaderValue},
+};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
+};
 use serde::Serialize;
+use sha2::Sha256;
+use std::net::IpAddr;
+use std::str::FromStr;
+use std::time::Duration;
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
-use hmac::{Hmac, Mac, KeyInit};
-use sha2::Sha256;
 use uuid::Uuid;
 
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -60,6 +69,7 @@ fn is_blocked_address(ip: IpAddr) -> bool {
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_broadcast()
+                || v4.is_multicast()
                 || v4.is_documentation()
                 // 100.64.0.0/10 — CGNAT space, routinely used for internal service meshes.
                 || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]))
@@ -68,13 +78,28 @@ fn is_blocked_address(ip: IpAddr) -> bool {
                 // 192.0.0.0/24 (IETF protocol assignments) and 198.18.0.0/15 (benchmarking).
                 || v4.octets()[..3] == [192, 0, 0]
                 || (v4.octets()[0] == 198 && (v4.octets()[1] & 0xfe) == 18)
+                // 240.0.0.0/4 — reserved / future use.
+                || v4.octets()[0] >= 240
         }
         IpAddr::V6(v6) => {
+            let segs = v6.segments();
             v6.is_loopback()
                 || v6.is_unspecified()
+                || v6.is_multicast()
                 // fc00::/7 unique-local and fe80::/10 link-local.
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || (segs[0] & 0xfe00) == 0xfc00
+                || (segs[0] & 0xffc0) == 0xfe80
+                // 100::/64 — discard-only (RFC 6666).
+                || (segs[0] == 0x0100 && segs[1] == 0 && segs[2] == 0 && segs[3] == 0)
+                // 2001:db8::/32 — documentation (RFC 3849).
+                || (segs[0] == 0x2001 && segs[1] == 0x0db8)
+                // 64:ff9b::/96 — NAT64 well-known prefix (RFC 6052).
+                || (segs[0] == 0x0064
+                    && segs[1] == 0xff9b
+                    && segs[2] == 0
+                    && segs[3] == 0
+                    && segs[4] == 0
+                    && segs[5] == 0)
         }
     }
 }
@@ -90,11 +115,12 @@ fn is_blocked_address(ip: IpAddr) -> bool {
 /// Closing that requires resolving once and pinning the socket address, i.e. a custom `reqwest`
 /// connector — see the SSRF entry in `AGENT_NOTES.MD`.
 async fn is_url_safe(url_str: &str, allow_private: bool) -> bool {
-    if allow_private { return true; }
+    if allow_private {
+        return true;
+    }
 
-    let url = match reqwest::Url::parse(url_str) {
-        Ok(u) => u,
-        Err(_) => return false,
+    let Ok(url) = reqwest::Url::parse(url_str) else {
+        return false;
     };
 
     // Only http/https can be dispatched at all; anything else fails closed rather than relying on
@@ -103,9 +129,8 @@ async fn is_url_safe(url_str: &str, allow_private: bool) -> bool {
         return false;
     }
 
-    let host_str = match url.host_str() {
-        Some(h) => h,
-        None => return false,
+    let Some(host_str) = url.host_str() else {
+        return false;
     };
 
     let port = url.port_or_known_default().unwrap_or(80);
@@ -145,6 +170,7 @@ async fn is_url_safe(url_str: &str, allow_private: bool) -> bool {
 /// A literal path written into the template (e.g. `{method}\n/api/hooks/42/execute\n{timestamp}\n{body}`)
 /// therefore overrides the `{path}` derived from `target_url` with no extra machinery — the receiver
 /// behind a path-rewriting reverse proxy sees, and signs over, the path *it* was handed.
+#[must_use]
 pub fn resolve_hmac_template(
     template: &str,
     method: &str,
@@ -191,18 +217,15 @@ pub fn resolve_hmac_template(
             continue;
         }
 
-        match PLACEHOLDERS
+        if let Some(i) = PLACEHOLDERS
             .iter()
             .position(|placeholder| rest.starts_with(placeholder))
         {
-            Some(i) => {
-                out.push_str(values[i]);
-                rest = &rest[PLACEHOLDERS[i].len()..];
-            }
-            None => {
-                out.push('{');
-                rest = &rest[1..];
-            }
+            out.push_str(values[i]);
+            rest = &rest[PLACEHOLDERS[i].len()..];
+        } else {
+            out.push('{');
+            rest = &rest[1..];
         }
     }
 
@@ -224,7 +247,21 @@ pub fn resolve_hmac_template(
 /// No placeholder here may be a prefix of another (`$ip` vs `$ip_v6`, say) — `find`-then-`starts_with`
 /// resolves ties by iteration order, not longest-match, so a prefix relationship would make the
 /// shorter placeholder shadow the longer one. The fixed set in [`resolve_event_variables`] has none.
-fn substitute_placeholders(template: &str, substitutions: &[(&str, &str)]) -> String {
+/// Escapes a string so it can be embedded safely inside a JSON string literal (`"..."`) without
+/// breaking JSON structure or injecting extra keys (`"`/`\`/control characters escaped).
+fn escape_json_string_content(value: &str) -> String {
+    let serialized = serde_json::to_string(value).unwrap_or_default();
+    serialized
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .map_or_else(String::new, str::to_owned)
+}
+
+fn substitute_placeholders(
+    template: &str,
+    substitutions: &[(&str, &str)],
+    escape_json: bool,
+) -> String {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
 
@@ -236,47 +273,53 @@ fn substitute_placeholders(template: &str, substitutions: &[(&str, &str)]) -> St
         out.push_str(&rest[..idx]);
         rest = &rest[idx..];
 
-        match substitutions.iter().find(|(placeholder, _)| rest.starts_with(placeholder)) {
-            Some((placeholder, value)) => {
+        if let Some((placeholder, value)) = substitutions
+            .iter()
+            .find(|(placeholder, _)| rest.starts_with(placeholder))
+        {
+            if escape_json {
+                out.push_str(&escape_json_string_content(value));
+            } else {
                 out.push_str(value);
-                rest = &rest[placeholder.len()..];
             }
-            None => {
-                out.push('$');
-                rest = &rest[1..];
-            }
+            rest = &rest[placeholder.len()..];
+        } else {
+            out.push('$');
+            rest = &rest[1..];
         }
     }
 
     out
 }
 
-/// The one evaluator behind both `payload_template` and `target_url` — so a webhook's destination
-/// can route on the same event data its body carries, and so a change to what a variable means
-/// never has to be made twice.
-///
-/// Available variables: `$target_address`/`$ip` (the address the event concerns — for a non-whitelist
-/// bare IPv6 host ban, the full canonicalized host IPv6 address when `send_normalized_ipv6` is
-/// `false`, or the `/48`-truncated subnet when `send_normalized_ipv6` is `true`),
-/// `$normalized_address` (always the `/48`-truncated subnet for non-whitelist bare IPv6 host bans,
-/// or `$target_address` otherwise), `$action`/`$event`
-/// (`IP_ADD`/`IP_UPDATE`/`IP_DELETE`/`TEST`), `$cause` (the freeform reason, or `"Unknown"` if none
-/// was given), `$group_name` (the target group's name, or empty if the event has none),
-/// `$group_id` (the target group's UUID, or empty), and `$timestamp` (the dispatch's Unix
-/// timestamp, in seconds — the same value `CANONICAL_V1` signs and sends as `X-Timestamp`, so a
-/// receiver correlating the two sees one number, not two that merely happen to be close).
-///
-/// **On using an event-derived variable in `target_url`'s host/authority**: every dispatch
-/// re-screens its *resolved* URL through [`is_url_safe`] before connecting, so a hostile `$cause`
-/// steering a naively-templated host cannot reach a private or link-local address — but it can
-/// still redirect the request to a different *public* host than the operator intended. Variables
-/// are safest confined to the path or query; putting one in the host trades some of the operator's
-/// own control over the destination to whoever can set that variable's source field.
+/// Expands event placeholders (`$target_address`, `$ip`, `$cause`, `$group_name`, etc.) for
+/// JSON webhook payloads, escaping substituted values for safe embedding in JSON string fields.
 fn resolve_event_variables(
     template: &str,
     event: &WebhookEvent,
     timestamp: &str,
     send_normalized_ipv6: bool,
+) -> String {
+    resolve_event_variables_with_mode(template, event, timestamp, send_normalized_ipv6, true)
+}
+
+/// Expands event placeholders for non-JSON targets such as `target_url` without adding JSON
+/// backslash escapes.
+fn resolve_event_url(
+    template: &str,
+    event: &WebhookEvent,
+    timestamp: &str,
+    send_normalized_ipv6: bool,
+) -> String {
+    resolve_event_variables_with_mode(template, event, timestamp, send_normalized_ipv6, false)
+}
+
+fn resolve_event_variables_with_mode(
+    template: &str,
+    event: &WebhookEvent,
+    timestamp: &str,
+    send_normalized_ipv6: bool,
+    escape_json: bool,
 ) -> String {
     let group_id = event.group_id.map(|g| g.to_string()).unwrap_or_default();
     let group_name = event.group_name.as_deref().unwrap_or("");
@@ -302,6 +345,7 @@ fn resolve_event_variables(
             ("$group_id", group_id.as_str()),
             ("$timestamp", timestamp),
         ],
+        escape_json,
     )
 }
 
@@ -354,7 +398,33 @@ struct PreparedDispatch {
 /// all (an unusable header name/value, an HMAC key that cannot be constructed, an unparseable target
 /// URL for `CANONICAL_V1`'s path derivation). None of these depend on the network, so they are
 /// distinguished from a delivery failure — there is no request to have failed yet.
+#[cfg(test)]
 fn prepare_dispatch(
+    config: &webhook_config::Model,
+    event: &WebhookEvent,
+) -> Result<PreparedDispatch, String> {
+    prepare_dispatch_with_cipher(&crate::crypto::SecretCipher::Plaintext, config, event)
+}
+
+fn dispatch_headers(config: &webhook_config::Model) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert("Content-Type", HeaderValue::from_static("application/json"));
+
+    if let Some(hjson) = &config.headers_json
+        && let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, String>>(hjson)
+    {
+        for (k, v) in map {
+            if let (Ok(h_name), Ok(h_val)) = (HeaderName::from_str(&k), HeaderValue::from_str(&v)) {
+                headers.insert(h_name, h_val);
+            }
+        }
+    }
+
+    headers
+}
+
+fn prepare_dispatch_with_cipher(
+    cipher: &crate::crypto::SecretCipher,
     config: &webhook_config::Model,
     event: &WebhookEvent,
 ) -> Result<PreparedDispatch, String> {
@@ -374,22 +444,14 @@ fn prepare_dispatch(
     // `CANONICAL_V1` path derivation below must all see the real destination, not the unexpanded
     // template — a signature computed over `{path}` derived from the template would not match the
     // path the receiver actually gets on the wire.
-    let target_url =
-        resolve_event_variables(&config.target_url, event, &timestamp, config.send_normalized_ipv6);
+    let target_url = resolve_event_url(
+        &config.target_url,
+        event,
+        &timestamp,
+        config.send_normalized_ipv6,
+    );
 
-    let mut headers = HeaderMap::new();
-    headers.insert("Content-Type", HeaderValue::from_static("application/json"));
-
-    if let Some(hjson) = &config.headers_json
-        && let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, String>>(hjson)
-    {
-        for (k, v) in map {
-            if let (Ok(h_name), Ok(h_val)) = (HeaderName::from_str(&k), HeaderValue::from_str(&v)) {
-                headers.insert(h_name, h_val);
-            }
-        }
-    }
-
+    let mut headers = dispatch_headers(config);
     let mode = AuthMode::from_stored(&config.auth_mode);
 
     // NULL means "this service's standard", resolved here rather than backfilled into every row —
@@ -411,11 +473,16 @@ fn prepare_dispatch(
     // covered by nothing and can never be confused for one; a blank column means "no such header"
     // rather than an empty one, which some receivers treat as a real (and failing) credential.
     if mode.sends_api_key()
-        && let Some(api_key) = config.api_key.as_deref().filter(|k| !k.is_empty())
+        && let Some(raw_api_key) = config.api_key.as_deref().filter(|k| !k.is_empty())
     {
-        let hv = HeaderValue::from_str(api_key)
-            .map_err(|e| format!("webhook api_key is not a valid header value: {e}"))?;
-        headers.insert("X-API-Key", hv);
+        let api_key = cipher
+            .open_legacy_or_sealed(raw_api_key)
+            .map_err(|e| format!("failed to decrypt webhook api_key: {e}"))?;
+        if !api_key.is_empty() {
+            let hv = HeaderValue::from_str(&api_key)
+                .map_err(|e| format!("webhook api_key is not a valid header value: {e}"))?;
+            headers.insert("X-API-Key", hv);
+        }
     }
 
     let signature = match mode {
@@ -424,10 +491,17 @@ fn prepare_dispatch(
         // defining property of HMAC_ONLY, not an oversight. A receiver that chose signature-only
         // authentication must not be handed a reusable bearer secret it never asked for.
         AuthMode::HmacOnly => {
-            let mut mac = Hmac::<Sha256>::new_from_slice(config.secret_token.as_bytes())
+            let secret = cipher
+                .open_legacy_or_sealed(&config.secret_token)
+                .map_err(|e| format!("failed to decrypt webhook secret_token: {e}"))?;
+            let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
                 .map_err(|e| format!("failed to create HMAC key: {e}"))?;
             mac.update(payload.as_bytes());
-            Some(format!("{}{}", signature_prefix, hex::encode(mac.finalize().into_bytes())))
+            Some(format!(
+                "{}{}",
+                signature_prefix,
+                hex::encode(mac.finalize().into_bytes())
+            ))
         }
         // CANONICAL_V1: sign the resolved hmac_template and send the timestamp alongside, so the
         // receiver can run its own anti-replay check. Prefixed `sha256=`, exactly like HMAC_ONLY
@@ -446,17 +520,27 @@ fn prepare_dispatch(
                 .map_err(|e| format!("unparseable webhook target URL: {e}"))?
                 .path()
                 .to_owned();
-            let template = config.hmac_template.as_deref().unwrap_or(DEFAULT_HMAC_TEMPLATE);
+            let template = config
+                .hmac_template
+                .as_deref()
+                .unwrap_or(DEFAULT_HMAC_TEMPLATE);
             let message = resolve_hmac_template(template, "POST", &path, &timestamp, &payload);
 
-            let mut mac = Hmac::<Sha256>::new_from_slice(config.secret_token.as_bytes())
+            let secret = cipher
+                .open_legacy_or_sealed(&config.secret_token)
+                .map_err(|e| format!("failed to decrypt webhook secret_token: {e}"))?;
+            let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
                 .map_err(|e| format!("failed to create canonical webhook HMAC key: {e}"))?;
             mac.update(message.as_bytes());
 
             if let Ok(hv) = HeaderValue::from_str(&timestamp) {
                 headers.insert("X-Timestamp", hv);
             }
-            Some(format!("{}{}", signature_prefix, hex::encode(mac.finalize().into_bytes())))
+            Some(format!(
+                "{}{}",
+                signature_prefix,
+                hex::encode(mac.finalize().into_bytes())
+            ))
         }
         // No signature to compute: the key header above (API_KEY_ONLY) or nothing at all (NONE) is
         // the whole credential.
@@ -467,14 +551,19 @@ fn prepare_dispatch(
         // The header name is caller-configurable, so it is parsed rather than assumed: an unusable
         // name must fail the whole prepare step, not send the signature under a name the receiver
         // will not read.
-        let name = HeaderName::from_bytes(signature_header.as_bytes())
-            .map_err(|_| format!("signature header '{signature_header}' is not a valid HTTP header name"))?;
+        let name = HeaderName::from_bytes(signature_header.as_bytes()).map_err(|_| {
+            format!("signature header '{signature_header}' is not a valid HTTP header name")
+        })?;
         let hv = HeaderValue::from_str(&sig_val)
             .map_err(|e| format!("computed signature is not a valid header value: {e}"))?;
         headers.insert(name, hv);
     }
 
-    Ok(PreparedDispatch { target_url, headers, payload })
+    Ok(PreparedDispatch {
+        target_url,
+        headers,
+        payload,
+    })
 }
 
 /// Truncates a response body to [`RESPONSE_SNIPPET_MAX_BYTES`] for logging or the "Test Webhook" UI,
@@ -516,26 +605,60 @@ async fn attempt_delivery(
     headers: HeaderMap,
     payload: String,
 ) -> (DispatchOutcome, Option<String>) {
-    match client.post(target_url).headers(headers).body(payload).send().await {
+    match client
+        .post(target_url)
+        .headers(headers)
+        .body(payload)
+        .send()
+        .await
+    {
         Ok(resp) => {
             let status = resp.status();
             let is_success = status.is_success();
-            let body = resp.text().await.ok().filter(|b| !b.is_empty()).map(|b| snippet(&b));
+            let body = resp
+                .text()
+                .await
+                .ok()
+                .filter(|b| !b.is_empty())
+                .map(|b| snippet(&b));
             if is_success {
-                return (DispatchOutcome::Success { status: status.as_u16() }, body);
+                return (
+                    DispatchOutcome::Success {
+                        status: status.as_u16(),
+                    },
+                    body,
+                );
             }
             let reason = format!("HTTP {status}");
             if status.is_server_error() {
-                (DispatchOutcome::Transient { status: Some(status.as_u16()), reason }, body)
+                (
+                    DispatchOutcome::Transient {
+                        status: Some(status.as_u16()),
+                        reason,
+                    },
+                    body,
+                )
             } else {
-                (DispatchOutcome::Permanent { status: Some(status.as_u16()), reason }, body)
+                (
+                    DispatchOutcome::Permanent {
+                        status: Some(status.as_u16()),
+                        reason,
+                    },
+                    body,
+                )
             }
         }
         // Every network-level failure — timeout, connection refused, DNS resolution failure, TLS
         // handshake failure — is transient: none of them says anything about whether the *request*
         // was acceptable, only that this attempt could not complete one. `reqwest::Error` carries no
         // status in this branch by construction (a status implies a response was received).
-        Err(e) => (DispatchOutcome::Transient { status: None, reason: e.to_string() }, None),
+        Err(e) => (
+            DispatchOutcome::Transient {
+                status: None,
+                reason: e.to_string(),
+            },
+            None,
+        ),
     }
 }
 
@@ -576,7 +699,7 @@ async fn dispatch_with_retries(
         crate::config::webhook_retry_backoff_ms(),
         db,
     )
-    .await
+    .await;
 }
 
 /// Persists one `webhook_executions` row for a single HTTP attempt — success, transient, or
@@ -631,14 +754,18 @@ async fn dispatch_with_retries_config(
     base_backoff_ms: u64,
     db: DatabaseConnection,
 ) {
-    let PreparedDispatch { target_url, headers, payload } = prepared;
+    let PreparedDispatch {
+        target_url,
+        headers,
+        payload,
+    } = prepared;
 
     let mut attempt: u32 = 1;
     loop {
         let started = std::time::Instant::now();
         let (outcome, body) =
             attempt_delivery(&client, &target_url, headers.clone(), payload.clone()).await;
-        let duration_ms = started.elapsed().as_millis() as i64;
+        let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
 
         match outcome {
             DispatchOutcome::Success { status } => {
@@ -646,8 +773,16 @@ async fn dispatch_with_retries_config(
                     webhook = %ctx.webhook_name, url = %target_url, status, attempt,
                     body = %body.as_deref().unwrap_or(""), "Webhook delivered"
                 );
-                log_execution(&db, &ctx, &target_url, Some(status), true, duration_ms, body.as_deref())
-                    .await;
+                log_execution(
+                    &db,
+                    &ctx,
+                    &target_url,
+                    Some(status),
+                    true,
+                    duration_ms,
+                    body.as_deref(),
+                )
+                .await;
                 return;
             }
             DispatchOutcome::Permanent { status, reason } => {
@@ -741,10 +876,34 @@ pub async fn send_test_dispatch(
     config: &webhook_config::Model,
     event: &WebhookEvent,
 ) -> WebhookTestResult {
-    send_test_dispatch_with_privacy(db, config, event, allow_private_webhooks()).await
+    let cipher =
+        crate::crypto::SecretCipher::from_env().unwrap_or(crate::crypto::SecretCipher::Plaintext);
+    send_test_dispatch_with_privacy(db, &cipher, config, event, allow_private_webhooks()).await
 }
 
-/// The testable core of [`send_test_dispatch`], taking the private-network allowance as a parameter
+/// Variant of [`send_test_dispatch`] that unseals webhook credentials with `cipher`.
+pub async fn send_test_dispatch_with_cipher(
+    db: &DatabaseConnection,
+    cipher: &crate::crypto::SecretCipher,
+    config: &webhook_config::Model,
+    event: &WebhookEvent,
+) -> WebhookTestResult {
+    send_test_dispatch_with_privacy(db, cipher, config, event, allow_private_webhooks()).await
+}
+
+/// Variant of [`send_test_dispatch_with_cipher`] allowing an explicit per-state privacy override.
+pub async fn send_test_dispatch_with_cipher_and_override(
+    db: &DatabaseConnection,
+    cipher: &crate::crypto::SecretCipher,
+    config: &webhook_config::Model,
+    event: &WebhookEvent,
+    allow_private_override: Option<bool>,
+) -> WebhookTestResult {
+    let allow_private = allow_private_override.unwrap_or_else(allow_private_webhooks);
+    send_test_dispatch_with_privacy(db, cipher, config, event, allow_private).await
+}
+
+/// Prepares a test request and applies its private-network allowance
 /// instead of reading `ALLOW_PRIVATE_WEBHOOKS` internally.
 ///
 /// Split out for the same reason `dispatch_with_retries_config` is: `std::env::set_var` is
@@ -752,29 +911,29 @@ pub async fn send_test_dispatch(
 /// *different* value of this setting cannot both mutate the real environment variable without racing
 /// each other. Taking the value as an argument sidesteps that entirely rather than serializing tests
 /// against a lock.
-async fn send_test_dispatch_with_privacy(
-    db: &DatabaseConnection,
+async fn prepare_test_dispatch(
+    cipher: &crate::crypto::SecretCipher,
     config: &webhook_config::Model,
     event: &WebhookEvent,
     allow_private: bool,
-) -> WebhookTestResult {
-    let prepared = match prepare_dispatch(config, event) {
+) -> Result<(PreparedDispatch, reqwest::Client), WebhookTestResult> {
+    let prepared = match prepare_dispatch_with_cipher(cipher, config, event) {
         Ok(p) => p,
         Err(reason) => {
-            return WebhookTestResult {
+            return Err(WebhookTestResult {
                 success: false,
                 status: None,
                 headers: None,
                 body: None,
                 error: Some(reason),
                 blocked_by_ssrf_filter: false,
-            };
+            });
         }
     };
 
     if !is_url_safe(&prepared.target_url, allow_private).await {
         warn!(url = %prepared.target_url, webhook = %config.name, "Test dispatch blocked by SSRF protection");
-        return WebhookTestResult {
+        return Err(WebhookTestResult {
             success: false,
             status: None,
             headers: None,
@@ -784,21 +943,37 @@ async fn send_test_dispatch_with_privacy(
                     .to_owned(),
             ),
             blocked_by_ssrf_filter: true,
-        };
+        });
     }
 
     let client = match build_webhook_client() {
         Ok(c) => c,
         Err(e) => {
-            return WebhookTestResult {
+            return Err(WebhookTestResult {
                 success: false,
                 status: None,
                 headers: None,
                 body: None,
                 error: Some(format!("failed to build HTTP client: {e}")),
                 blocked_by_ssrf_filter: false,
-            };
+            });
         }
+    };
+
+    Ok((prepared, client))
+}
+
+async fn send_test_dispatch_with_privacy(
+    db: &DatabaseConnection,
+    cipher: &crate::crypto::SecretCipher,
+    config: &webhook_config::Model,
+    event: &WebhookEvent,
+    allow_private: bool,
+) -> WebhookTestResult {
+    let (prepared, client) = match prepare_test_dispatch(cipher, config, event, allow_private).await
+    {
+        Ok(prepared) => prepared,
+        Err(result) => return result,
     };
 
     let ctx = DispatchContext {
@@ -810,8 +985,13 @@ async fn send_test_dispatch_with_privacy(
     };
 
     let started = std::time::Instant::now();
-    let outcome = client.post(&prepared.target_url).headers(prepared.headers).body(prepared.payload).send().await;
-    let duration_ms = started.elapsed().as_millis() as i64;
+    let outcome = client
+        .post(&prepared.target_url)
+        .headers(prepared.headers)
+        .body(prepared.payload)
+        .send()
+        .await;
+    let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
 
     match outcome {
         Ok(resp) => {
@@ -819,16 +999,38 @@ async fn send_test_dispatch_with_privacy(
             let headers = resp
                 .headers()
                 .iter()
-                .map(|(k, v)| (k.as_str().to_owned(), v.to_str().unwrap_or("<binary>").to_owned()))
+                .map(|(k, v)| {
+                    (
+                        k.as_str().to_owned(),
+                        v.to_str().unwrap_or("<binary>").to_owned(),
+                    )
+                })
                 .collect();
             let success = status.is_success();
-            let body = resp.text().await.ok().filter(|b| !b.is_empty()).map(|b| snippet(&b));
-            let error = if success { None } else { Some(format!("receiver responded with HTTP {status}")) };
+            let body = resp
+                .text()
+                .await
+                .ok()
+                .filter(|b| !b.is_empty())
+                .map(|b| snippet(&b));
+            let error = if success {
+                None
+            } else {
+                Some(format!("receiver responded with HTTP {status}"))
+            };
             // Whatever the receiver said back, on success or failure alike — not the computed
             // `error` summary, which the body (when present) is strictly more informative than.
             let detail = body.as_deref().or(error.as_deref());
-            log_execution(db, &ctx, &prepared.target_url, Some(status.as_u16()), success, duration_ms, detail)
-                .await;
+            log_execution(
+                db,
+                &ctx,
+                &prepared.target_url,
+                Some(status.as_u16()),
+                success,
+                duration_ms,
+                detail,
+            )
+            .await;
             WebhookTestResult {
                 success,
                 status: Some(status.as_u16()),
@@ -840,7 +1042,16 @@ async fn send_test_dispatch_with_privacy(
         }
         Err(e) => {
             let reason = e.to_string();
-            log_execution(db, &ctx, &prepared.target_url, None, false, duration_ms, Some(&reason)).await;
+            log_execution(
+                db,
+                &ctx,
+                &prepared.target_url,
+                None,
+                false,
+                duration_ms,
+                Some(&reason),
+            )
+            .await;
             WebhookTestResult {
                 success: false,
                 status: None,
@@ -855,29 +1066,60 @@ async fn send_test_dispatch_with_privacy(
 
 /// Runs the background webhook worker, processing events and dispatching HTTP requests
 pub async fn run_webhook_worker(db: DatabaseConnection, rx: Receiver<WebhookEvent>) {
+    let cipher = std::sync::Arc::new(
+        crate::crypto::SecretCipher::from_env().unwrap_or(crate::crypto::SecretCipher::Plaintext),
+    );
+    run_webhook_worker_with_cipher(db, cipher, rx).await;
+}
+
+/// Runs the background webhook worker using the supplied at-rest `cipher` to decrypt stored
+/// `webhook_configs.{secret_token, api_key}` values.
+pub async fn run_webhook_worker_with_cipher(
+    db: DatabaseConnection,
+    cipher: std::sync::Arc<crate::crypto::SecretCipher>,
+    rx: Receiver<WebhookEvent>,
+) {
+    run_webhook_worker_with_privacy(db, cipher, rx, None).await;
+}
+
+/// Runs the background webhook worker with an explicit `allow_private` SSRF setting (for tests).
+pub async fn run_webhook_worker_allowing_private(
+    db: DatabaseConnection,
+    rx: Receiver<WebhookEvent>,
+    allow_private: bool,
+) {
+    let cipher = std::sync::Arc::new(
+        crate::crypto::SecretCipher::from_env().unwrap_or(crate::crypto::SecretCipher::Plaintext),
+    );
+    run_webhook_worker_with_privacy(db, cipher, rx, Some(allow_private)).await;
+}
+
+async fn run_webhook_worker_with_privacy(
+    db: DatabaseConnection,
+    cipher: std::sync::Arc<crate::crypto::SecretCipher>,
+    rx: Receiver<WebhookEvent>,
+    allow_private_override: Option<bool>,
+) {
     let workers = crate::config::webhook_workers();
     let interval = crate::config::webhook_dispatch_interval();
 
-    // One receiver, many consumers. `mpsc::Receiver` is not clonable — deliberately, since an mpsc
-    // channel has exactly one consumer by definition — so the workers share it behind a mutex and
-    // take turns calling `recv`. The lock is held only across the `recv` itself and released before
-    // any dispatch, so the workers serialise on *picking up* an event and run its HTTP calls
-    // concurrently. That is the intended shape: the queue is the contended resource, the network is
-    // not.
     let shared = std::sync::Arc::new(tokio::sync::Mutex::new(rx));
     let mut pool = JoinSet::new();
 
     info!(
         workers,
-        interval_ms = interval.as_millis() as u64,
+        interval_ms = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX),
         capacity = crate::config::webhook_queue_capacity(),
         "Starting webhook dispatch pool"
     );
 
     for id in 0..workers {
         let db = db.clone();
+        let cipher = cipher.clone();
         let shared = shared.clone();
-        pool.spawn(async move { dispatch_worker(id, db, shared, interval).await });
+        pool.spawn(async move {
+            dispatch_worker(id, db, cipher, shared, interval, allow_private_override).await;
+        });
     }
 
     while pool.join_next().await.is_some() {}
@@ -885,20 +1127,21 @@ pub async fn run_webhook_worker(db: DatabaseConnection, rx: Receiver<WebhookEven
 }
 
 /// One worker: take an event, dispatch it, pause, repeat.
-///
-/// The pause is **after** the work rather than before it, so a service that receives one event an
-/// hour never waits for it. Throttling exists to flatten bursts, not to add latency to a quiet
-/// system, and `interval == 0` skips the sleep entirely.
 async fn dispatch_worker(
     id: usize,
     db: DatabaseConnection,
+    cipher: std::sync::Arc<crate::crypto::SecretCipher>,
     rx: std::sync::Arc<tokio::sync::Mutex<Receiver<WebhookEvent>>>,
     interval: Duration,
+    allow_private_override: Option<bool>,
 ) {
     let client = match build_webhook_client() {
         Ok(c) => c,
         Err(e) => {
-            error!("Failed to build webhook HTTP client, worker will not start: {}", e);
+            error!(
+                "Failed to build webhook HTTP client, worker will not start: {}",
+                e
+            );
             return;
         }
     };
@@ -921,15 +1164,16 @@ async fn dispatch_worker(
 
         info!(address = %event.address, action = %event.action, "Processing event for webhooks");
 
-        let gid = match event.group_id {
-            Some(id) => id,
-            None => continue,
+        let Some(gid) = event.group_id else {
+            continue;
         };
 
         let configs = match WebhookConfig::find()
             .filter(webhook_config::Column::GroupId.eq(gid))
             .filter(webhook_config::Column::IsActive.eq(true))
-            .all(&db).await {
+            .all(&db)
+            .await
+        {
             Ok(c) => c,
             Err(e) => {
                 error!("Failed to fetch webhook configs: {}", e);
@@ -941,7 +1185,7 @@ async fn dispatch_worker(
             // `events` is `None` for "all events" (the historical default); when set, it's a
             // comma-separated allowlist of actions this specific webhook cares about.
             if let Some(events) = &config.events {
-                let subscribed = events.split(',').map(|s| s.trim()).any(|a| a == event.action);
+                let subscribed = events.split(',').map(str::trim).any(|a| a == event.action);
                 if !subscribed {
                     continue;
                 }
@@ -951,7 +1195,7 @@ async fn dispatch_worker(
                 let _ = join_set.join_next().await;
             }
 
-            let prepared = match prepare_dispatch(&config, &event) {
+            let prepared = match prepare_dispatch_with_cipher(cipher.as_ref(), &config, &event) {
                 Ok(p) => p,
                 Err(reason) => {
                     error!(webhook = %config.name, reason = %reason, "Webhook dispatch could not be prepared; skipping");
@@ -970,7 +1214,8 @@ async fn dispatch_worker(
             let exec_db = db.clone();
 
             join_set.spawn(async move {
-                if !is_url_safe(&prepared.target_url, allow_private_webhooks()).await {
+                let allow_private = allow_private_override.unwrap_or_else(allow_private_webhooks);
+                if !is_url_safe(&prepared.target_url, allow_private).await {
                     warn!(url = %prepared.target_url, webhook = %ctx.webhook_name, "Webhook blocked by SSRF protection");
                     return;
                 }
@@ -978,7 +1223,7 @@ async fn dispatch_worker(
             });
         }
 
-        while let Some(Ok(_)) = join_set.try_join_next() {}
+        while let Some(Ok(())) = join_set.try_join_next() {}
 
         // Paces this worker's *events*. One event may still fan out to several configs
         // concurrently, so the aggregate ceiling is `WEBHOOK_WORKERS / interval` events per second.
@@ -987,7 +1232,10 @@ async fn dispatch_worker(
         }
     }
 
-    info!(worker = id, "Webhook channel closed, draining pending tasks...");
+    info!(
+        worker = id,
+        "Webhook channel closed, draining pending tasks..."
+    );
     while join_set.join_next().await.is_some() {}
     info!(worker = id, "Webhook worker shut down.");
 }
@@ -999,7 +1247,8 @@ mod tests {
 
     #[test]
     fn default_template_reproduces_the_canonical_v1_string() {
-        let resolved = resolve_hmac_template(DEFAULT_HMAC_TEMPLATE, "POST", "/api/ban", "1700", "{}");
+        let resolved =
+            resolve_hmac_template(DEFAULT_HMAC_TEMPLATE, "POST", "/api/ban", "1700", "{}");
         assert_eq!(resolved, "POST\n/api/ban\n1700\n{}");
 
         // The whole point of CANONICAL_V1 mode: the bytes a dispatch signs are the bytes an inbound
@@ -1022,11 +1271,17 @@ mod tests {
 
     #[test]
     fn escapes_are_expanded_and_unknown_ones_kept_verbatim() {
-        assert_eq!(resolve_hmac_template(r"a\nb\tc\rd", "", "", "", ""), "a\nb\tc\rd");
+        assert_eq!(
+            resolve_hmac_template(r"a\nb\tc\rd", "", "", "", ""),
+            "a\nb\tc\rd"
+        );
         // `\\n` is an escaped backslash followed by `n`, NOT a newline.
         assert_eq!(resolve_hmac_template(r"a\\nb", "", "", "", ""), r"a\nb");
         assert_eq!(resolve_hmac_template(r"a\db", "", "", "", ""), r"a\db");
-        assert_eq!(resolve_hmac_template(r"trailing\", "", "", "", ""), r"trailing\");
+        assert_eq!(
+            resolve_hmac_template(r"trailing\", "", "", "", ""),
+            r"trailing\"
+        );
     }
 
     #[test]
@@ -1043,7 +1298,8 @@ mod tests {
         // rescanned, a caller controlling the `cause` field of an IP record could inject the
         // method/path/timestamp of their choosing into what the receiver verifies.
         let hostile = r"{path}\n{timestamp}";
-        let resolved = resolve_hmac_template(DEFAULT_HMAC_TEMPLATE, "POST", "/api/ban", "1700", hostile);
+        let resolved =
+            resolve_hmac_template(DEFAULT_HMAC_TEMPLATE, "POST", "/api/ban", "1700", hostile);
         assert_eq!(resolved, format!("POST\n/api/ban\n1700\n{hostile}"));
         assert!(resolved.ends_with(r"{path}\n{timestamp}"));
     }
@@ -1052,7 +1308,10 @@ mod tests {
     fn field_order_and_separators_are_load_bearing() {
         let a = resolve_hmac_template(DEFAULT_HMAC_TEMPLATE, "POST", "/api/ban", "1700", "x");
         let b = resolve_hmac_template(DEFAULT_HMAC_TEMPLATE, "POST", "/api/ba", "n1700", "x");
-        assert_ne!(a, b, "the \\n delimiter must keep adjacent fields unambiguous");
+        assert_ne!(
+            a, b,
+            "the \\n delimiter must keep adjacent fields unambiguous"
+        );
     }
 
     fn sample_event() -> WebhookEvent {
@@ -1109,10 +1368,10 @@ mod tests {
     fn substitute_placeholders_never_rescans_an_inserted_value() {
         let mut event = sample_event();
         event.cause = Some("$group_name".to_owned());
-        let resolved = resolve_event_variables("cause=$cause group=$group_name", &event, "1700", false);
+        let resolved =
+            resolve_event_variables("cause=$cause group=$group_name", &event, "1700", false);
         assert_eq!(
-            resolved,
-            "cause=$group_name group=hijack-group",
+            resolved, "cause=$group_name group=hijack-group",
             "the literal text a caller wrote into `cause` must survive verbatim, not be expanded a \
              second time because it happens to match another placeholder"
         );
@@ -1145,7 +1404,10 @@ mod tests {
         let event = sample_event();
 
         let prepared = prepare_dispatch(&config, &event).expect("a plain-text target resolves");
-        assert_eq!(prepared.target_url, "https://x.example/hooks/IP_ADD?ip=203.0.113.42");
+        assert_eq!(
+            prepared.target_url,
+            "https://x.example/hooks/IP_ADD?ip=203.0.113.42"
+        );
     }
 
     /// `CANONICAL_V1` must sign the path of the *resolved* target URL. Before this, the path fed to
@@ -1177,7 +1439,11 @@ mod tests {
         let event = sample_event();
 
         let prepared_add = prepare_dispatch(&config, &event).expect("resolves");
-        let sig_add = prepared_add.headers.get("X-Signature-256").expect("signed").clone();
+        let sig_add = prepared_add
+            .headers
+            .get("X-Signature-256")
+            .expect("signed")
+            .clone();
 
         // A different action resolves to a different path — `/hooks/IP_DELETE`, not `/hooks/IP_ADD`
         // — so if the signature covered the unresolved template (constant regardless of `$action`),
@@ -1186,7 +1452,11 @@ mod tests {
         let mut delete_event = event.clone();
         delete_event.action = "IP_DELETE".to_owned();
         let prepared_delete = prepare_dispatch(&config, &delete_event).expect("resolves");
-        let sig_delete = prepared_delete.headers.get("X-Signature-256").expect("signed").clone();
+        let sig_delete = prepared_delete
+            .headers
+            .get("X-Signature-256")
+            .expect("signed")
+            .clone();
 
         assert_ne!(
             sig_add, sig_delete,
@@ -1212,27 +1482,40 @@ mod tests {
             "192.168.1.1",
             "0.0.0.0",
             "0.0.0.1",
-            "100.64.0.1",   // CGNAT
-            "100.127.0.1",  // CGNAT upper bound
-            "192.0.0.1",    // IETF protocol assignments
-            "198.18.0.1",   // benchmarking range
+            "100.64.0.1",  // CGNAT
+            "100.127.0.1", // CGNAT upper bound
+            "192.0.0.1",   // IETF protocol assignments
+            "198.18.0.1",  // benchmarking range
             "255.255.255.255",
             "::1",
             "::",
-            "fd00::1",           // unique-local
-            "fe80::1",           // link-local
-            "::ffff:127.0.0.1",  // IPv4-mapped loopback — false for Ipv6Addr::is_loopback
+            "fd00::1",          // unique-local
+            "fe80::1",          // link-local
+            "::ffff:127.0.0.1", // IPv4-mapped loopback — false for Ipv6Addr::is_loopback
             "::ffff:169.254.169.254",
             "::ffff:10.0.0.1",
         ] {
             let ip: IpAddr = blocked.parse().expect("test address literal parses");
-            assert!(is_blocked_address(ip), "{blocked} must be blocked as an SSRF target");
+            assert!(
+                is_blocked_address(ip),
+                "{blocked} must be blocked as an SSRF target"
+            );
         }
 
         // Ordinary public addresses must still be dispatchable, or the feature is useless.
-        for allowed in ["1.1.1.1", "8.8.8.8", "93.184.216.34", "172.32.0.1", "100.63.255.255", "2606:4700::1111"] {
+        for allowed in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "93.184.216.34",
+            "172.32.0.1",
+            "100.63.255.255",
+            "2606:4700::1111",
+        ] {
             let ip: IpAddr = allowed.parse().expect("test address literal parses");
-            assert!(!is_blocked_address(ip), "{allowed} is public and must be allowed");
+            assert!(
+                !is_blocked_address(ip),
+                "{allowed} is public and must be allowed"
+            );
         }
     }
 
@@ -1275,36 +1558,24 @@ mod tests {
     /// block for as long as the slow receiver takes to answer. It does not.
     #[tokio::test]
     async fn the_db_connection_is_released_before_the_slow_http_call_returns() {
+        const SLOW_RESPONSE_DELAY: Duration = Duration::from_secs(2);
         use sea_orm::{ActiveModelTrait, Database, Set};
         use sea_orm_migration::MigratorTrait;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
 
-        let db = Database::connect("sqlite::memory:").await.expect("in-memory sqlite opens");
-        crate::migration::Migrator::up(&db, None).await.expect("migrations apply");
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite opens");
+        crate::migration::Migrator::up(&db, None)
+            .await
+            .expect("migrations apply");
 
-        // A receiver that accepts the connection, reads the request, then sits on its hands for
-        // far longer than a healthy pool acquisition should ever take before answering. The delay
-        // is the whole point: if the dispatcher's DB connection were still checked out while this
-        // is in flight, the concurrent query below would be made to wait for it too.
-        const SLOW_RESPONSE_DELAY: Duration = Duration::from_secs(2);
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("loopback listener binds");
-        let addr = listener.local_addr().expect("listener has a local address");
-        tokio::spawn(async move {
-            if let Ok((mut socket, _)) = listener.accept().await {
-                let mut buf = [0u8; 1024];
-                let _ = socket.read(&mut buf).await;
-                tokio::time::sleep(SLOW_RESPONSE_DELAY).await;
-                let _ = socket
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                    .await;
-            }
-        });
+        let addr = spawn_delayed_receiver(SLOW_RESPONSE_DELAY).await;
 
         let group_id = uuid::Uuid::new_v4();
         crate::entities::ip_group::ActiveModel {
             id: Set(group_id),
             name: Set("dispatch-release-test-group".to_owned()),
+            allow_private_ips: Set(false),
             group_type: Set("banlist".to_owned()),
             owner_key_id: Set(None),
             description: Set(None),
@@ -1337,17 +1608,16 @@ mod tests {
         .await
         .expect("webhook config inserts");
 
-        // The target is loopback, which the SSRF filter blocks by default — this is the documented
-        // escape hatch `dispatch_worker` reads once at startup, not a security-relevant bypass of
-        // anything this test is checking.
-        // SAFETY: no other test in this binary spawns `run_webhook_worker`, so nothing else reads
-        // or writes this variable concurrently.
-        unsafe { std::env::set_var("ALLOW_PRIVATE_WEBHOOKS", "true") };
-
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         let worker_db = db.clone();
         let worker = tokio::spawn(async move {
-            run_webhook_worker(worker_db, rx).await;
+            run_webhook_worker_with_privacy(
+                worker_db,
+                std::sync::Arc::new(crate::crypto::SecretCipher::Plaintext),
+                rx,
+                Some(true),
+            )
+            .await;
         });
 
         tx.send(WebhookEvent {
@@ -1374,9 +1644,6 @@ mod tests {
         .await;
         let concurrent_elapsed = concurrent_query_started.elapsed();
 
-        // SAFETY: same single-writer justification as the `set_var` above.
-        unsafe { std::env::remove_var("ALLOW_PRIVATE_WEBHOOKS") };
-
         assert!(
             concurrent_result.is_ok(),
             "a concurrent, unrelated query on the same 1-connection pool timed out after {concurrent_elapsed:?} \
@@ -1394,6 +1661,32 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), worker).await;
     }
 
+    async fn spawn_delayed_receiver(response_delay: Duration) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // A receiver that accepts the connection, reads the request, then sits on its hands for
+        // far longer than a healthy pool acquisition should ever take before answering. The delay
+        // is the whole point: if the dispatcher's DB connection were still checked out while this
+        // is in flight, the concurrent query below would be made to wait for it too.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener binds");
+        let addr = listener.local_addr().expect("listener has a local address");
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                tokio::time::sleep(response_delay).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+
+        addr
+    }
+
     /// A tiny raw-socket HTTP server that answers each accepted connection with the next status
     /// code from `statuses` (repeating the last one once exhausted) and always closes the
     /// connection. Every retry attempt therefore opens a fresh connection, which is what makes the
@@ -1402,24 +1695,31 @@ mod tests {
     /// both assert against directly, rather than inferring attempt count from timing.
     async fn spawn_status_sequence_server(
         statuses: Vec<u16>,
-    ) -> (std::net::SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("loopback listener binds");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener binds");
         let addr = listener.local_addr().expect("listener has a local address");
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_accept = counter.clone();
 
         tokio::spawn(async move {
             loop {
-                let Ok((mut socket, _)) = listener.accept().await else { break };
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
                 let n = counter_accept.fetch_add(1, Ordering::SeqCst);
-                let status = *statuses.get(n).unwrap_or_else(|| {
-                    statuses.last().expect("at least one status configured")
-                });
+                let status = *statuses
+                    .get(n)
+                    .unwrap_or_else(|| statuses.last().expect("at least one status configured"));
                 let reason = match status {
                     200 => "OK",
                     403 => "Forbidden",
@@ -1431,8 +1731,9 @@ mod tests {
                 tokio::spawn(async move {
                     let mut buf = [0u8; 1024];
                     let _ = socket.read(&mut buf).await;
-                    let response =
-                        format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
                     let _ = socket.write_all(response.as_bytes()).await;
                 });
             }
@@ -1442,7 +1743,11 @@ mod tests {
     }
 
     fn dummy_prepared(target_url: String) -> PreparedDispatch {
-        PreparedDispatch { target_url, headers: HeaderMap::new(), payload: "{}".to_owned() }
+        PreparedDispatch {
+            target_url,
+            headers: HeaderMap::new(),
+            payload: "{}".to_owned(),
+        }
     }
 
     /// A minimal [`DispatchContext`] for tests that only care about the retry loop's behaviour, not
@@ -1460,17 +1765,23 @@ mod tests {
     /// Like [`spawn_status_sequence_server`] but answers with a real body instead of
     /// `Content-Length: 0` — the counterpart needed to prove a receiver's actual reply survives into
     /// `webhook_executions.response_body`, not just the status code.
-    async fn spawn_body_sequence_server(responses: Vec<(u16, &'static str)>) -> std::net::SocketAddr {
+    async fn spawn_body_sequence_server(
+        responses: Vec<(u16, &'static str)>,
+    ) -> std::net::SocketAddr {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("loopback listener binds");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener binds");
         let addr = listener.local_addr().expect("listener has a local address");
 
         tokio::spawn(async move {
             let mut n = 0usize;
             loop {
-                let Ok((mut socket, _)) = listener.accept().await else { break };
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
                 let (status, body) = *responses
                     .get(n)
                     .unwrap_or_else(|| responses.last().expect("at least one response configured"));
@@ -1499,6 +1810,7 @@ mod tests {
         crate::entities::ip_group::ActiveModel {
             id: Set(group_id),
             name: Set(format!("exec-log-test-{group_id}")),
+            allow_private_ips: Set(false),
             group_type: Set("banlist".to_owned()),
             owner_key_id: Set(None),
             description: Set(None),
@@ -1547,8 +1859,12 @@ mod tests {
 
     async fn migrated_memory_db() -> DatabaseConnection {
         use sea_orm_migration::MigratorTrait;
-        let db = sea_orm::Database::connect("sqlite::memory:").await.expect("in-memory sqlite opens");
-        crate::migration::Migrator::up(&db, None).await.expect("migrations apply");
+        let db = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite opens");
+        crate::migration::Migrator::up(&db, None)
+            .await
+            .expect("migrations apply");
         db
     }
 
@@ -1561,25 +1877,60 @@ mod tests {
         let client = build_webhook_client().expect("client builds");
 
         let (addr, _) = spawn_status_sequence_server(vec![200]).await;
-        let (outcome, _) =
-            attempt_delivery(&client, &format!("http://{addr}/"), HeaderMap::new(), String::new()).await;
+        let (outcome, _) = attempt_delivery(
+            &client,
+            &format!("http://{addr}/"),
+            HeaderMap::new(),
+            String::new(),
+        )
+        .await;
         assert!(matches!(outcome, DispatchOutcome::Success { status: 200 }));
 
         let (addr, _) = spawn_status_sequence_server(vec![403]).await;
-        let (outcome, _) =
-            attempt_delivery(&client, &format!("http://{addr}/"), HeaderMap::new(), String::new()).await;
-        assert!(matches!(outcome, DispatchOutcome::Permanent { status: Some(403), .. }));
+        let (outcome, _) = attempt_delivery(
+            &client,
+            &format!("http://{addr}/"),
+            HeaderMap::new(),
+            String::new(),
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            DispatchOutcome::Permanent {
+                status: Some(403),
+                ..
+            }
+        ));
 
         let (addr, _) = spawn_status_sequence_server(vec![503]).await;
-        let (outcome, _) =
-            attempt_delivery(&client, &format!("http://{addr}/"), HeaderMap::new(), String::new()).await;
-        assert!(matches!(outcome, DispatchOutcome::Transient { status: Some(503), .. }));
+        let (outcome, _) = attempt_delivery(
+            &client,
+            &format!("http://{addr}/"),
+            HeaderMap::new(),
+            String::new(),
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            DispatchOutcome::Transient {
+                status: Some(503),
+                ..
+            }
+        ));
 
         // No response at all — nothing is listening on this port — is transient too: a network-level
         // failure says nothing about whether the request itself was acceptable.
-        let (outcome, _) =
-            attempt_delivery(&client, "http://127.0.0.1:1", HeaderMap::new(), String::new()).await;
-        assert!(matches!(outcome, DispatchOutcome::Transient { status: None, .. }));
+        let (outcome, _) = attempt_delivery(
+            &client,
+            "http://127.0.0.1:1",
+            HeaderMap::new(),
+            String::new(),
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            DispatchOutcome::Transient { status: None, .. }
+        ));
     }
 
     /// A receiver's actual reply must come back on **every** outcome that reached the network —
@@ -1590,15 +1941,31 @@ mod tests {
         let client = build_webhook_client().expect("client builds");
 
         let addr = spawn_body_sequence_server(vec![(200, "{\"received\":true}")]).await;
-        let (outcome, body) =
-            attempt_delivery(&client, &format!("http://{addr}/"), HeaderMap::new(), String::new()).await;
+        let (outcome, body) = attempt_delivery(
+            &client,
+            &format!("http://{addr}/"),
+            HeaderMap::new(),
+            String::new(),
+        )
+        .await;
         assert!(matches!(outcome, DispatchOutcome::Success { status: 200 }));
         assert_eq!(body.as_deref(), Some("{\"received\":true}"));
 
         let addr = spawn_body_sequence_server(vec![(500, "downstream exploded")]).await;
-        let (outcome, body) =
-            attempt_delivery(&client, &format!("http://{addr}/"), HeaderMap::new(), String::new()).await;
-        assert!(matches!(outcome, DispatchOutcome::Transient { status: Some(500), .. }));
+        let (outcome, body) = attempt_delivery(
+            &client,
+            &format!("http://{addr}/"),
+            HeaderMap::new(),
+            String::new(),
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            DispatchOutcome::Transient {
+                status: Some(500),
+                ..
+            }
+        ));
         assert_eq!(body.as_deref(), Some("downstream exploded"));
     }
 
@@ -1773,7 +2140,10 @@ mod tests {
             .await
             .expect("querying execution rows succeeds");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].resolved_target_url.as_deref(), Some(resolved_url.as_str()));
+        assert_eq!(
+            rows[0].resolved_target_url.as_deref(),
+            Some(resolved_url.as_str())
+        );
         assert_eq!(rows[0].target_address.as_deref(), Some("203.0.113.99"));
         assert_eq!(rows[0].cause.as_deref(), Some("port scan"));
     }
@@ -1852,9 +2222,20 @@ mod tests {
         // public `send_test_dispatch`: the env var is process-wide and this binary's tests run
         // concurrently, so a test needing it "true" and one needing it unset (see the SSRF test
         // below) would race on the same global. Passing the value directly sidesteps that.
-        let result = send_test_dispatch_with_privacy(&db, &config, &event, true).await;
+        let result = send_test_dispatch_with_privacy(
+            &db,
+            &crate::crypto::SecretCipher::Plaintext,
+            &config,
+            &event,
+            true,
+        )
+        .await;
 
-        assert!(result.success, "a 200 response must report success: {:?}", result.error);
+        assert!(
+            result.success,
+            "a 200 response must report success: {:?}",
+            result.error
+        );
         assert_eq!(result.status, Some(200));
         assert!(result.error.is_none());
 
@@ -1863,7 +2244,11 @@ mod tests {
             .all(&db)
             .await
             .expect("querying execution rows succeeds");
-        assert_eq!(rows.len(), 1, "the live test dispatch is recorded as one execution");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the live test dispatch is recorded as one execution"
+        );
         assert_eq!(rows[0].event_type, "TEST");
         assert_eq!(rows[0].status_code, Some(200));
         assert!(rows[0].is_success);
@@ -1906,11 +2291,24 @@ mod tests {
 
         // `_with_privacy(..., false)` — the default, production posture — for the same
         // race-avoidance reason as the success test above.
-        let result = send_test_dispatch_with_privacy(&db, &config, &event, false).await;
+        let result = send_test_dispatch_with_privacy(
+            &db,
+            &crate::crypto::SecretCipher::Plaintext,
+            &config,
+            &event,
+            false,
+        )
+        .await;
 
         assert!(!result.success);
-        assert!(result.blocked_by_ssrf_filter, "a loopback target must be reported as SSRF-blocked");
-        assert!(result.status.is_none(), "a blocked target must never have been dialed at all");
+        assert!(
+            result.blocked_by_ssrf_filter,
+            "a loopback target must be reported as SSRF-blocked"
+        );
+        assert!(
+            result.status.is_none(),
+            "a blocked target must never have been dialed at all"
+        );
         assert_eq!(
             execution_count(&db, webhook_id).await,
             0,
@@ -1931,7 +2329,8 @@ mod tests {
             signature_header: None,
             signature_prefix: None,
             headers_json: None,
-            payload_template: r#"{"target":"$target_address","ip":"$ip","norm":"$normalized_address"}"#.to_owned(),
+            payload_template:
+                r#"{"target":"$target_address","ip":"$ip","norm":"$normalized_address"}"#.to_owned(),
             group_id: Uuid::new_v4(),
             is_active: true,
             send_normalized_ipv6: false,
@@ -1951,7 +2350,10 @@ mod tests {
 
         // Default (`false`): `$target_address` & `$ip` stay full host IPv6 (e.g. AbuseIPDB).
         let prepared_full = prepare_dispatch(&config, &host_ban).expect("full mode resolves");
-        assert_eq!(prepared_full.target_url, "https://x.example/hook?ip=2001:db8:1234:5678::1");
+        assert_eq!(
+            prepared_full.target_url,
+            "https://x.example/hook?ip=2001:db8:1234:5678::1"
+        );
         assert_eq!(
             prepared_full.payload,
             r#"{"target":"2001:db8:1234:5678::1","ip":"2001:db8:1234:5678::1","norm":"2001:db8:1234::/48"}"#
@@ -1960,7 +2362,10 @@ mod tests {
         // Explicit (`true`): `$target_address` & `$ip` resolve to `/48` (e.g. launch.block.ip).
         config.send_normalized_ipv6 = true;
         let prepared_norm = prepare_dispatch(&config, &host_ban).expect("normalized mode resolves");
-        assert_eq!(prepared_norm.target_url, "https://x.example/hook?ip=2001:db8:1234::/48");
+        assert_eq!(
+            prepared_norm.target_url,
+            "https://x.example/hook?ip=2001:db8:1234::/48"
+        );
         assert_eq!(
             prepared_norm.payload,
             r#"{"target":"2001:db8:1234::/48","ip":"2001:db8:1234::/48","norm":"2001:db8:1234::/48"}"#
@@ -1981,7 +2386,134 @@ mod tests {
                 cause: None,
             };
             let p = prepare_dispatch(&config, &ev).expect("variant resolves");
-            assert_eq!(p.target_url, format!("https://x.example/hook?ip={expected}"));
+            assert_eq!(
+                p.target_url,
+                format!("https://x.example/hook?ip={expected}")
+            );
         }
+    }
+
+    #[test]
+    fn blocked_addresses_include_multicast_reserved_nat64_discard_and_v6_doc() {
+        for blocked in [
+            "224.0.0.1",
+            "239.255.255.250",
+            "240.0.0.1",
+            "ff02::1",
+            "2001:db8::1",
+            "64:ff9b::1",
+            "100::1",
+        ] {
+            let ip: IpAddr = blocked.parse().expect("valid IP literal");
+            assert!(
+                is_blocked_address(ip),
+                "{blocked} must be blocked as SSRF target"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_event_variables_escapes_json_in_cause_and_group_name() {
+        let event = WebhookEvent {
+            action: "IP_ADD".to_owned(),
+            address: "198.51.100.7".to_owned(),
+            is_whitelist: false,
+            group_id: Some(Uuid::nil()),
+            group_name: Some("grp\"\\line1\nline2".to_owned()),
+            cause: Some("attacker\", \"admin\": true, \"x\":\"".to_owned()),
+        };
+        let payload = resolve_event_variables(
+            r#"{"ip":"$ip","group":"$group_name","cause":"$cause"}"#,
+            &event,
+            "1700",
+            false,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("escaped payload must stay valid JSON");
+        assert_eq!(parsed["group"], "grp\"\\line1\nline2");
+        assert_eq!(parsed["cause"], "attacker\", \"admin\": true, \"x\":\"");
+        assert!(
+            parsed.get("admin").is_none(),
+            "JSON key injection must be prevented"
+        );
+
+        let url = resolve_event_url("https://x.example/h?q=$group_name", &event, "1700", false);
+        assert!(
+            url.contains("grp\"\\"),
+            "target_url must not receive JSON backslash escapes"
+        );
+    }
+
+    #[test]
+    fn prepare_dispatch_with_cipher_unseals_sealed_and_legacy_credentials() {
+        let cipher = crate::crypto::SecretCipher::from_hex_key(
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        )
+        .expect("valid key");
+        let sealed_config = webhook_config::Model {
+            id: Uuid::new_v4(),
+            name: "sealed-hook".to_owned(),
+            target_url: "https://x.example/hook".to_owned(),
+            secret_token: cipher.seal("real-secret").expect("seal"),
+            auth_mode: AuthMode::CanonicalV1.as_str().to_owned(),
+            api_key: Some(cipher.seal("remote-api-key").expect("seal")),
+            hmac_template: None,
+            signature_header: None,
+            signature_prefix: None,
+            headers_json: None,
+            payload_template: r#"{"ip":"$ip"}"#.to_owned(),
+            group_id: Uuid::new_v4(),
+            is_active: true,
+            send_normalized_ipv6: false,
+            events: None,
+            owner_key_id: None,
+            created_at: chrono::Utc::now().naive_utc(),
+        };
+        let event = sample_event();
+        let prepared = prepare_dispatch_with_cipher(&cipher, &sealed_config, &event)
+            .expect("sealed credentials must decrypt");
+        assert_eq!(
+            prepared
+                .headers
+                .get("X-API-Key")
+                .and_then(|v| v.to_str().ok()),
+            Some("remote-api-key")
+        );
+        let ts = prepared
+            .headers
+            .get("X-Timestamp")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let expected_sig = crate::crypto::compute_signature(
+            "real-secret",
+            "POST",
+            "/hook",
+            ts,
+            prepared.payload.as_bytes(),
+        )
+        .expect("sign");
+        assert_eq!(
+            prepared
+                .headers
+                .get("X-Signature-256")
+                .and_then(|v| v.to_str().ok()),
+            Some(expected_sig.as_str())
+        );
+
+        let legacy_config = webhook_config::Model {
+            secret_token: "legacy-raw-secret".to_owned(),
+            api_key: Some("legacy-raw-key".to_owned()),
+            ..sealed_config
+        };
+        let legacy_prepared = prepare_dispatch_with_cipher(&cipher, &legacy_config, &event)
+            .expect("legacy unprefixed credentials must remain supported");
+        assert_eq!(
+            legacy_prepared
+                .headers
+                .get("X-API-Key")
+                .and_then(|v| v.to_str().ok()),
+            Some("legacy-raw-key")
+        );
     }
 }

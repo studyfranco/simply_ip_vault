@@ -34,7 +34,6 @@
 //! throughout, and `scripts/verify_convergence.sh` asserts that the prefix is mandatory rather than
 //! stripped-if-present. A per-row algorithm column would be the one place that could quietly opt out.
 
-use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use sea_orm_migration::prelude::*;
 
 /// The value replacing `BODY_ONLY` in `webhook_configs.auth_mode`.
@@ -49,6 +48,7 @@ pub struct Migration;
 #[derive(DeriveIden)]
 enum WebhookConfigs {
     Table,
+    AuthMode,
     SignatureHeader,
     SignaturePrefix,
 }
@@ -56,7 +56,10 @@ enum WebhookConfigs {
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        for column in [WebhookConfigs::SignatureHeader, WebhookConfigs::SignaturePrefix] {
+        for column in [
+            WebhookConfigs::SignatureHeader,
+            WebhookConfigs::SignaturePrefix,
+        ] {
             manager
                 .alter_table(
                     Table::alter()
@@ -77,9 +80,17 @@ impl MigrationTrait for Migration {
         // Data first, then the columns it might have referenced — the reverse of `up`.
         rewrite_mode(manager, HMAC_ONLY, BODY_ONLY).await?;
 
-        for column in [WebhookConfigs::SignatureHeader, WebhookConfigs::SignaturePrefix] {
+        for column in [
+            WebhookConfigs::SignatureHeader,
+            WebhookConfigs::SignaturePrefix,
+        ] {
             manager
-                .alter_table(Table::alter().table(WebhookConfigs::Table).drop_column(column).to_owned())
+                .alter_table(
+                    Table::alter()
+                        .table(WebhookConfigs::Table)
+                        .drop_column(column)
+                        .to_owned(),
+                )
                 .await?;
         }
         Ok(())
@@ -92,14 +103,13 @@ impl MigrationTrait for Migration {
 /// rather than interpolated anyway, because a migration is exactly the place where a habit of
 /// interpolating "obviously safe" values gets copied into one that is not.
 async fn rewrite_mode(manager: &SchemaManager<'_>, from: &str, to: &str) -> Result<(), DbErr> {
-    let backend = manager.get_database_backend();
-    let sql = match backend {
-        DatabaseBackend::Postgres => "UPDATE webhook_configs SET auth_mode = $1 WHERE auth_mode = $2",
-        _ => "UPDATE webhook_configs SET auth_mode = ? WHERE auth_mode = ?",
-    };
     manager
-        .get_connection()
-        .execute_raw(Statement::from_sql_and_values(backend, sql, [to.into(), from.into()]))
-        .await?;
-    Ok(())
+        .exec_stmt(
+            Query::update()
+                .table(WebhookConfigs::Table)
+                .value(WebhookConfigs::AuthMode, to)
+                .and_where(Expr::col(WebhookConfigs::AuthMode).eq(from))
+                .to_owned(),
+        )
+        .await
 }

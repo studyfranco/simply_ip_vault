@@ -66,7 +66,7 @@
 //! meaningful as "when any field on this address last changed" — only the index built for a query
 //! shape that no longer exists is removed.
 
-use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+use sea_orm::DatabaseBackend;
 use sea_orm_migration::prelude::*;
 
 #[derive(DeriveMigrationName)]
@@ -92,6 +92,7 @@ enum IpRecords {
     Table,
     Id,
     IsDeleted,
+    CreatedAt,
     UpdatedAt,
 }
 
@@ -106,7 +107,7 @@ const GROUP_UPDATED_INDEX: &str = "idx_membership_group_updated";
 const DELETED_UPDATED_INDEX: &str = "idx_ip_records_deleted_updated";
 
 /// Recreates both indexes `ip_record_group_memberships` needs — the pre-existing group lookup
-/// (`m20260824_150000`) and the new group+updated_at composite this migration adds — after
+/// (`m20260824_150000`) and the new `group+updated_at` composite this migration adds — after
 /// whichever path (rebuild or plain `ADD COLUMN`) just ran.
 async fn recreate_indexes(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     manager
@@ -136,16 +137,22 @@ async fn recreate_indexes(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 /// Copies every existing row's `created_at`/`updated_at` from its `ip_records` counterpart. Used
 /// both by the SQLite rebuild's `INSERT ... SELECT` and, on other backends, by a correlated
 /// `UPDATE` against the nullable columns `ADD COLUMN` just created.
-fn backfill_select_columns() -> &'static str {
-    "ip_record_id, group_id, \
-     (SELECT r.created_at FROM ip_records r WHERE r.id = ip_record_group_memberships.ip_record_id), \
-     (SELECT r.updated_at FROM ip_records r WHERE r.id = ip_record_group_memberships.ip_record_id)"
+fn record_timestamp(column: IpRecords) -> Expr {
+    Expr::from(
+        Query::select()
+            .column(column)
+            .from(IpRecords::Table)
+            .and_where(Expr::col((IpRecords::Table, IpRecords::Id)).eq(Expr::col((
+                IpRecordGroupMemberships::Table,
+                IpRecordGroupMemberships::IpRecordId,
+            ))))
+            .to_owned(),
+    )
 }
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let db = manager.get_connection();
         let backend = manager.get_database_backend();
 
         // `idx_ip_records_deleted_updated` (`m20260824_150000`) existed solely to serve
@@ -155,66 +162,17 @@ impl MigrationTrait for Migration {
         // all, so keeping this index would be exactly the "costs every future write, buys nothing"
         // anti-pattern `m20260824_150000`'s own header warns against for its own candidates.
         manager
-            .drop_index(Index::drop().if_exists().name(DELETED_UPDATED_INDEX).table(IpRecords::Table).to_owned())
+            .drop_index(
+                Index::drop()
+                    .if_exists()
+                    .name(DELETED_UPDATED_INDEX)
+                    .table(IpRecords::Table)
+                    .to_owned(),
+            )
             .await?;
 
         if backend == DatabaseBackend::Sqlite {
-            // The lookup index is dropped along with the old table; recreated below.
-            manager
-                .create_table(
-                    Table::create()
-                        .table(IpRecordGroupMembershipsRebuild::Table)
-                        .col(ColumnDef::new(IpRecordGroupMemberships::IpRecordId).uuid().not_null())
-                        .col(ColumnDef::new(IpRecordGroupMemberships::GroupId).uuid().not_null())
-                        .col(ColumnDef::new(IpRecordGroupMemberships::CreatedAt).date_time().not_null())
-                        .col(ColumnDef::new(IpRecordGroupMemberships::UpdatedAt).date_time().not_null())
-                        .primary_key(
-                            Index::create()
-                                .name("pk-ip_record_group_memberships")
-                                .col(IpRecordGroupMemberships::IpRecordId)
-                                .col(IpRecordGroupMemberships::GroupId),
-                        )
-                        .foreign_key(
-                            ForeignKey::create()
-                                .name("fk-irgm-ip_record_id")
-                                .from(IpRecordGroupMembershipsRebuild::Table, IpRecordGroupMemberships::IpRecordId)
-                                .to(IpRecords::Table, IpRecords::Id)
-                                .on_delete(ForeignKeyAction::Cascade)
-                                .on_update(ForeignKeyAction::Cascade),
-                        )
-                        .foreign_key(
-                            ForeignKey::create()
-                                .name("fk-irgm-group_id")
-                                .from(IpRecordGroupMembershipsRebuild::Table, IpRecordGroupMemberships::GroupId)
-                                .to(IpGroups::Table, IpGroups::Id)
-                                .on_delete(ForeignKeyAction::Cascade)
-                                .on_update(ForeignKeyAction::Cascade),
-                        )
-                        .to_owned(),
-                )
-                .await?;
-
-            db.execute_raw(Statement::from_string(
-                backend,
-                format!(
-                    "INSERT INTO ip_record_group_memberships_rebuild \
-                     (ip_record_id, group_id, created_at, updated_at) \
-                     SELECT {} FROM ip_record_group_memberships",
-                    backfill_select_columns()
-                ),
-            ))
-            .await?;
-
-            manager.drop_table(Table::drop().table(IpRecordGroupMemberships::Table).to_owned()).await?;
-            manager
-                .rename_table(
-                    Table::rename()
-                        .table(IpRecordGroupMembershipsRebuild::Table, IpRecordGroupMemberships::Table)
-                        .to_owned(),
-                )
-                .await?;
-
-            return recreate_indexes(manager).await;
+            return add_sqlite_membership_timestamps(manager).await;
         }
 
         // PostgreSQL / MySQL: add nullable, backfill via a correlated UPDATE, then tighten.
@@ -235,16 +193,26 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        db.execute_raw(Statement::from_string(
-            backend,
-            "UPDATE ip_record_group_memberships SET \
-             created_at = (SELECT r.created_at FROM ip_records r WHERE r.id = ip_record_group_memberships.ip_record_id), \
-             updated_at = (SELECT r.updated_at FROM ip_records r WHERE r.id = ip_record_group_memberships.ip_record_id)"
-                .to_owned(),
-        ))
-        .await?;
+        manager
+            .exec_stmt(
+                Query::update()
+                    .table(IpRecordGroupMemberships::Table)
+                    .value(
+                        IpRecordGroupMemberships::CreatedAt,
+                        record_timestamp(IpRecords::CreatedAt),
+                    )
+                    .value(
+                        IpRecordGroupMemberships::UpdatedAt,
+                        record_timestamp(IpRecords::UpdatedAt),
+                    )
+                    .to_owned(),
+            )
+            .await?;
 
-        for column in [IpRecordGroupMemberships::CreatedAt, IpRecordGroupMemberships::UpdatedAt] {
+        for column in [
+            IpRecordGroupMemberships::CreatedAt,
+            IpRecordGroupMemberships::UpdatedAt,
+        ] {
             manager
                 .alter_table(
                     Table::alter()
@@ -260,7 +228,12 @@ impl MigrationTrait for Migration {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
-            .drop_index(Index::drop().name(GROUP_UPDATED_INDEX).table(IpRecordGroupMemberships::Table).to_owned())
+            .drop_index(
+                Index::drop()
+                    .name(GROUP_UPDATED_INDEX)
+                    .table(IpRecordGroupMemberships::Table)
+                    .to_owned(),
+            )
             .await?;
 
         // Restores exactly what `m20260824_150000` created, so a rollback leaves the schema as it
@@ -278,67 +251,7 @@ impl MigrationTrait for Migration {
             .await?;
 
         if manager.get_database_backend() == DatabaseBackend::Sqlite {
-            manager
-                .create_table(
-                    Table::create()
-                        .table(IpRecordGroupMembershipsRebuild::Table)
-                        .col(ColumnDef::new(IpRecordGroupMemberships::IpRecordId).uuid().not_null())
-                        .col(ColumnDef::new(IpRecordGroupMemberships::GroupId).uuid().not_null())
-                        .primary_key(
-                            Index::create()
-                                .name("pk-ip_record_group_memberships")
-                                .col(IpRecordGroupMemberships::IpRecordId)
-                                .col(IpRecordGroupMemberships::GroupId),
-                        )
-                        .foreign_key(
-                            ForeignKey::create()
-                                .name("fk-irgm-ip_record_id")
-                                .from(IpRecordGroupMembershipsRebuild::Table, IpRecordGroupMemberships::IpRecordId)
-                                .to(IpRecords::Table, IpRecords::Id)
-                                .on_delete(ForeignKeyAction::Cascade)
-                                .on_update(ForeignKeyAction::Cascade),
-                        )
-                        .foreign_key(
-                            ForeignKey::create()
-                                .name("fk-irgm-group_id")
-                                .from(IpRecordGroupMembershipsRebuild::Table, IpRecordGroupMemberships::GroupId)
-                                .to(IpGroups::Table, IpGroups::Id)
-                                .on_delete(ForeignKeyAction::Cascade)
-                                .on_update(ForeignKeyAction::Cascade),
-                        )
-                        .to_owned(),
-                )
-                .await?;
-
-            let db = manager.get_connection();
-            db.execute_raw(Statement::from_string(
-                manager.get_database_backend(),
-                "INSERT INTO ip_record_group_memberships_rebuild (ip_record_id, group_id) \
-                 SELECT ip_record_id, group_id FROM ip_record_group_memberships"
-                    .to_owned(),
-            ))
-            .await?;
-
-            manager.drop_table(Table::drop().table(IpRecordGroupMemberships::Table).to_owned()).await?;
-            manager
-                .rename_table(
-                    Table::rename()
-                        .table(IpRecordGroupMembershipsRebuild::Table, IpRecordGroupMemberships::Table)
-                        .to_owned(),
-                )
-                .await?;
-
-            return manager
-                .create_index(
-                    Index::create()
-                        .if_not_exists()
-                        .name(LOOKUP_INDEX)
-                        .table(IpRecordGroupMemberships::Table)
-                        .col(IpRecordGroupMemberships::GroupId)
-                        .col(IpRecordGroupMemberships::IpRecordId)
-                        .to_owned(),
-                )
-                .await;
+            return remove_sqlite_membership_timestamps(manager).await;
         }
 
         manager
@@ -358,4 +271,209 @@ impl MigrationTrait for Migration {
             )
             .await
     }
+}
+
+async fn add_sqlite_membership_timestamps(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    // The lookup index is dropped along with the old table; recreated below.
+    manager
+        .create_table(
+            Table::create()
+                .table(IpRecordGroupMembershipsRebuild::Table)
+                .col(
+                    ColumnDef::new(IpRecordGroupMemberships::IpRecordId)
+                        .uuid()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(IpRecordGroupMemberships::GroupId)
+                        .uuid()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(IpRecordGroupMemberships::CreatedAt)
+                        .date_time()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(IpRecordGroupMemberships::UpdatedAt)
+                        .date_time()
+                        .not_null(),
+                )
+                .primary_key(
+                    Index::create()
+                        .name("pk-ip_record_group_memberships")
+                        .col(IpRecordGroupMemberships::IpRecordId)
+                        .col(IpRecordGroupMemberships::GroupId),
+                )
+                .foreign_key(
+                    ForeignKey::create()
+                        .name("fk-irgm-ip_record_id")
+                        .from(
+                            IpRecordGroupMembershipsRebuild::Table,
+                            IpRecordGroupMemberships::IpRecordId,
+                        )
+                        .to(IpRecords::Table, IpRecords::Id)
+                        .on_delete(ForeignKeyAction::Cascade)
+                        .on_update(ForeignKeyAction::Cascade),
+                )
+                .foreign_key(
+                    ForeignKey::create()
+                        .name("fk-irgm-group_id")
+                        .from(
+                            IpRecordGroupMembershipsRebuild::Table,
+                            IpRecordGroupMemberships::GroupId,
+                        )
+                        .to(IpGroups::Table, IpGroups::Id)
+                        .on_delete(ForeignKeyAction::Cascade)
+                        .on_update(ForeignKeyAction::Cascade),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .exec_stmt(
+            Query::insert()
+                .into_table(IpRecordGroupMembershipsRebuild::Table)
+                .columns([
+                    IpRecordGroupMemberships::IpRecordId,
+                    IpRecordGroupMemberships::GroupId,
+                    IpRecordGroupMemberships::CreatedAt,
+                    IpRecordGroupMemberships::UpdatedAt,
+                ])
+                .select_from(
+                    Query::select()
+                        .columns([
+                            IpRecordGroupMemberships::IpRecordId,
+                            IpRecordGroupMemberships::GroupId,
+                        ])
+                        .expr(record_timestamp(IpRecords::CreatedAt))
+                        .expr(record_timestamp(IpRecords::UpdatedAt))
+                        .from(IpRecordGroupMemberships::Table)
+                        .to_owned(),
+                )
+                .map_err(|e| DbErr::Custom(e.to_string()))?
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .drop_table(
+            Table::drop()
+                .table(IpRecordGroupMemberships::Table)
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .rename_table(
+            Table::rename()
+                .table(
+                    IpRecordGroupMembershipsRebuild::Table,
+                    IpRecordGroupMemberships::Table,
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    recreate_indexes(manager).await
+}
+
+async fn remove_sqlite_membership_timestamps(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table(IpRecordGroupMembershipsRebuild::Table)
+                .col(
+                    ColumnDef::new(IpRecordGroupMemberships::IpRecordId)
+                        .uuid()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(IpRecordGroupMemberships::GroupId)
+                        .uuid()
+                        .not_null(),
+                )
+                .primary_key(
+                    Index::create()
+                        .name("pk-ip_record_group_memberships")
+                        .col(IpRecordGroupMemberships::IpRecordId)
+                        .col(IpRecordGroupMemberships::GroupId),
+                )
+                .foreign_key(
+                    ForeignKey::create()
+                        .name("fk-irgm-ip_record_id")
+                        .from(
+                            IpRecordGroupMembershipsRebuild::Table,
+                            IpRecordGroupMemberships::IpRecordId,
+                        )
+                        .to(IpRecords::Table, IpRecords::Id)
+                        .on_delete(ForeignKeyAction::Cascade)
+                        .on_update(ForeignKeyAction::Cascade),
+                )
+                .foreign_key(
+                    ForeignKey::create()
+                        .name("fk-irgm-group_id")
+                        .from(
+                            IpRecordGroupMembershipsRebuild::Table,
+                            IpRecordGroupMemberships::GroupId,
+                        )
+                        .to(IpGroups::Table, IpGroups::Id)
+                        .on_delete(ForeignKeyAction::Cascade)
+                        .on_update(ForeignKeyAction::Cascade),
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .exec_stmt(
+            Query::insert()
+                .into_table(IpRecordGroupMembershipsRebuild::Table)
+                .columns([
+                    IpRecordGroupMemberships::IpRecordId,
+                    IpRecordGroupMemberships::GroupId,
+                ])
+                .select_from(
+                    Query::select()
+                        .columns([
+                            IpRecordGroupMemberships::IpRecordId,
+                            IpRecordGroupMemberships::GroupId,
+                        ])
+                        .from(IpRecordGroupMemberships::Table)
+                        .to_owned(),
+                )
+                .map_err(|e| DbErr::Custom(e.to_string()))?
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .drop_table(
+            Table::drop()
+                .table(IpRecordGroupMemberships::Table)
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .rename_table(
+            Table::rename()
+                .table(
+                    IpRecordGroupMembershipsRebuild::Table,
+                    IpRecordGroupMemberships::Table,
+                )
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name(LOOKUP_INDEX)
+                .table(IpRecordGroupMemberships::Table)
+                .col(IpRecordGroupMemberships::GroupId)
+                .col(IpRecordGroupMemberships::IpRecordId)
+                .to_owned(),
+        )
+        .await
 }

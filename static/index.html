@@ -187,34 +187,18 @@
             <div class="admin-grid">
                 <!-- IP Groups -->
                 <section class="card admin-section" id="groups-section">
-                    <h2>IP Groups</h2>
+                    <div class="list-header">
+                        <h2>IP Groups</h2>
+                        <button type="button" id="btn-open-create-group" class="btn btn-primary hidden">+ Create Group</button>
+                    </div>
                     <p class="subtitle">Organize IP records.</p>
-                    <form id="form-create-group" class="admin-form">
-                        <div class="form-row">
-                            <div class="form-group form-group-grow">
-                                <label for="create-group-name">Group Name <span>*</span></label>
-                                <input type="text" id="create-group-name" required class="input-field">
-                            </div>
-                            <div class="form-group">
-                                <label for="group-type-select">Type</label>
-                                <select id="group-type-select" class="input-field select-field">
-                                    <option value="banlist" selected>Banlist</option>
-                                    <option value="whitelist">Whitelist</option>
-                                </select>
-                            </div>
-                            <div class="form-group form-group-action">
-                                <label class="label-spacer">&nbsp;</label>
-                                <button type="submit" class="btn btn-primary">Create</button>
-                            </div>
-                        </div>
-                    </form>
                     <div class="batch-actions hidden">
                         <button type="button" id="delete-selected-groups" class="btn btn-batch-delete" disabled>Delete Selected</button>
                     </div>
 
                     <div class="table-container mt-4">
                         <table class="data-table">
-                            <thead><tr><th><input type="checkbox" id="select-all-groups" title="Select all"></th><th>ID</th><th>Name</th><th>Type</th><th>Actions</th></tr></thead>
+                            <thead><tr><th><input type="checkbox" id="select-all-groups" title="Select all"></th><th>ID</th><th>Name</th><th>Type</th><th>Ban Policy</th><th>Actions</th></tr></thead>
                             <tbody id="groups-table-body"></tbody>
                         </table>
                     </div>
@@ -472,12 +456,13 @@
                 <section class="card admin-section" id="apikey-section">
                     <div class="list-header">
                         <h2>API Keys</h2>
-                        <button type="button" id="btn-open-create-key" class="btn btn-primary">+ New Key</button>
+                        <div class="list-toolbar">
+                            <button type="button" id="btn-open-create-key" class="btn btn-primary">+ New Key</button>
+                            <button type="button" id="btn-open-manage-rights" class="btn btn-primary hidden">+ Assign Group Rights</button>
+                        </div>
                     </div>
                     <p class="subtitle">Create and manage API keys (Global Scopes).</p>
 
-                    <!-- `batch-actions-keys` adds the vertical separation from the Create API Key
-                         form above; without it the two controls sat flush against each other. -->
                     <div class="batch-actions batch-actions-keys hidden">
                         <button type="button" id="delete-selected-keys" class="btn btn-batch-delete" disabled>Delete Selected</button>
                     </div>
@@ -501,47 +486,6 @@
                         </table>
                     </div>
 
-                    <!-- Manage Rights for Existing Keys -->
-                    <div class="mt-4 pt-4" style="border-top: 1px solid var(--border);">
-                        <h4>Manage Group Rights</h4>
-                        <p class="subtitle text-sm">Assign isolated rights to an existing key.</p>
-                        <form id="form-manage-rights" class="admin-form">
-                            <div class="form-grid">
-                                <div class="form-group">
-                                    <label for="manage-rights-key">Target Key <span>*</span></label>
-                                    <select id="manage-rights-key" class="input-field select-field" required>
-                                        <option value="">-- Select API Key --</option>
-                                    </select>
-                                </div>
-                                <div class="form-group">
-                                    <label for="manage-rights-group-search">Group <span>*</span></label>
-                                    <div class="combobox" id="manage-rights-group-combobox">
-                                        <input type="text" id="manage-rights-group-search" class="input-field combobox-input" placeholder="-- Select Group --" autocomplete="off" required>
-                                        <input type="hidden" id="manage-rights-group">
-                                        <div class="combobox-menu hidden"></div>
-                                    </div>
-                                </div>
-                            </div>
-                            <div class="permissions-grid mt-2 mb-4">
-                                <label class="checkbox-container">
-                                    <input type="checkbox" id="manage-rights-read">
-                                    <span>Read</span>
-                                </label>
-                                <label class="checkbox-container">
-                                    <input type="checkbox" id="manage-rights-write">
-                                    <span>Write</span>
-                                </label>
-                                <label class="checkbox-container">
-                                    <input type="checkbox" id="manage-rights-delete">
-                                    <span>Delete</span>
-                                </label>
-                            </div>
-                            <div class="form-actions">
-                                <button type="submit" class="btn btn-secondary">Assign Group Rights</button>
-                            </div>
-                        </form>
-                    </div>
-
                 </section>
             </div>
         </main>
@@ -554,165 +498,11 @@
 
                 <!-- Webhook Configs -->
                 <section class="card admin-section" id="webhooks-section">
-                    <h2>Webhook Configs</h2>
+                    <div class="list-header">
+                        <h2>Webhook Configs</h2>
+                        <button type="button" id="btn-open-create-webhook" class="btn btn-primary hidden">+ Create Webhook</button>
+                    </div>
                     <p class="subtitle">Configure advanced templated webhook events, custom headers, and payload templates.</p>
-                    <form id="form-create-webhook" class="admin-form">
-                        <!-- Row 1 — universal fields: every mode needs all three. -->
-                        <div class="compact-grid">
-                            <div class="form-group">
-                                <label for="webhook-name">Webhook Name <span>*</span></label>
-                                <input type="text" id="webhook-name" placeholder="My Alert Hook" required class="input-field">
-                            </div>
-                            <div class="form-group">
-                                <label for="webhook-url">Target URL <span>*</span></label>
-                                <input type="url" id="webhook-url" placeholder="https://example.com" required class="input-field">
-                                <small class="field-hint">
-                                    Supports the same <code>$variable</code> substitution as the
-                                    payload template —
-                                    <button type="button" class="btn-link" id="webhook-vars-help-btn">see all template variables</button>.
-                                </small>
-                            </div>
-                            <div class="form-group">
-                                <label for="webhook-group-search">Target Group <span>*</span></label>
-                                <div class="combobox" id="webhook-group-combobox">
-                                    <input type="text" id="webhook-group-search" class="input-field combobox-input" placeholder="-- Select Group --" autocomplete="off" required>
-                                    <input type="hidden" id="webhook-group-id">
-                                    <div class="combobox-menu hidden"></div>
-                                </div>
-                            </div>
-                        </div>
-
-                        <!-- Row 2 — Auth Mode drives everything below it. The description is a
-                             single line that swaps with the selection (see syncWebhookAuthFields),
-                             instead of a permanent paragraph listing all four modes at once. -->
-                        <div class="compact-grid auth-mode-row">
-                            <div class="form-group">
-                                <label for="webhook-auth-mode">Auth Mode <span>*</span></label>
-                                <select id="webhook-auth-mode" class="input-field select-field">
-                                    <option value="CANONICAL_V1" selected>CANONICAL_V1 (Simply IP Vault / hook executor)</option>
-                                    <option value="HMAC_ONLY">HMAC_ONLY (signature only, no key)</option>
-                                    <option value="API_KEY_ONLY">API_KEY_ONLY (key header, no signature)</option>
-                                    <option value="NONE">NONE (no auth headers)</option>
-                                </select>
-                            </div>
-                            <p class="auth-mode-hint field-hint" id="webhook-auth-mode-hint" aria-live="polite"></p>
-                        </div>
-
-                        <!-- Row 3 — mode-dependent credentials, shown/hidden by JS. -->
-                        <div class="compact-grid">
-                            <div class="form-group" id="webhook-secret-group">
-                                <label for="webhook-secret">HMAC Secret <span>*</span></label>
-                                <input type="password" id="webhook-secret" placeholder="Shared Secret" required class="input-field">
-                            </div>
-                            <div class="form-group" id="webhook-api-key-group">
-                                <label for="webhook-api-key">API Key</label>
-                                <div class="input-pair">
-                                    <input type="text" id="webhook-api-key-header" class="input-field font-mono header-name-input"
-                                           value="X-API-Key" placeholder="X-API-Key" autocomplete="off"
-                                           aria-label="Header name for the API key">
-                                    <input type="password" id="webhook-api-key" placeholder="Credential value" class="input-field" autocomplete="off">
-                                </div>
-                                <small class="field-hint">
-                                    Credential for the <em>receiving</em> system. Stored as given, never shown again.
-                                    Rename the header if the receiver expects something other than
-                                    <code>X-API-Key</code>.
-                                </small>
-                            </div>
-                        </div>
-
-                        <!-- Signature transport — applies to whichever mode signs. Kept adjacent to
-                             the template because all three answer the same question: what exactly
-                             does the receiver see, and under what name. -->
-                        <div class="compact-grid">
-                            <div class="form-group" id="webhook-sig-header-group">
-                                <label for="webhook-sig-header">Signature Header</label>
-                                <input type="text" id="webhook-sig-header" class="input-field font-mono"
-                                       placeholder="X-Signature-256" autocomplete="off" spellcheck="false">
-                                <small class="field-hint">
-                                    Where the signature is sent. Blank uses <code>X-Signature-256</code>,
-                                    which is what another Simply IP Vault instance and the hook executor
-                                    expect. GitHub-style receivers want <code>X-Hub-Signature-256</code>.
-                                </small>
-                            </div>
-                            <div class="form-group" id="webhook-sig-prefix-group">
-                                <label for="webhook-sig-prefix">Signature Prefix</label>
-                                <input type="text" id="webhook-sig-prefix" class="input-field font-mono"
-                                       value="sha256=" placeholder="sha256=" autocomplete="off" spellcheck="false">
-                                <small class="field-hint">
-                                    Prepended to the hex digest. Clear it to send a bare digest for
-                                    receivers that reject a prefix. The algorithm is always SHA-256.
-                                </small>
-                            </div>
-                        </div>
-
-                        <div class="form-group" id="webhook-hmac-template-group">
-                            <label for="webhook-hmac-template">HMAC Signature Template <span>*</span></label>
-                            <input type="text" id="webhook-hmac-template" class="input-field font-mono"
-                                   value="{method}\n{path}\n{timestamp}\n{body}" spellcheck="false" autocomplete="off">
-                            <small class="field-hint">
-                                The exact string that gets signed. <code>\n</code> is a real newline;
-                                <code>{method}</code>, <code>{path}</code>, <code>{timestamp}</code>, <code>{body}</code>
-                                are substituted (<code>{path}</code> comes from the target URL). Behind a path-rewriting
-                                proxy, hardcode the path the receiver sees. <code>{body}</code> is mandatory.
-                            </small>
-                        </div>
-
-                        <!-- Row 4 — payload shaping, side by side: both are code-ish textareas and
-                             read better adjacent than stacked full-width. -->
-                        <div class="compact-grid">
-                            <div class="form-group">
-                                <label id="webhook-headers-label">Custom Headers</label>
-                                <!-- Rows are built by JS (renderHeaderRows). Always present, in every
-                                     auth mode, so a receiver that wants its signature or credential
-                                     under a non-standard name can be accommodated without the form
-                                     needing a field for each possibility. -->
-                                <div id="webhook-headers-list" class="kv-editor" role="group"
-                                     aria-labelledby="webhook-headers-label"></div>
-                                <button type="button" id="webhook-headers-add" class="btn btn-secondary btn-sm mt-2">+ Add Header</button>
-                                <small class="field-hint">
-                                    Sent verbatim on every dispatch. Rows with an empty name are ignored.
-                                </small>
-                            </div>
-                            <div class="form-group">
-                                <label for="webhook-template">Payload Template <span>*</span></label>
-                                <textarea id="webhook-template" required class="input-field font-mono" rows="3">{"target_address": "$target_address", "cause": "$cause", "group_name": "$group_name"}</textarea>
-                            </div>
-                        </div>
-
-                        <div class="form-group">
-                            <label>Trigger On Events <span>*</span></label>
-                            <div class="permissions-grid mt-2">
-                                <label class="checkbox-container">
-                                    <input type="checkbox" id="webhook-event-add" checked>
-                                    <span class="checkmark"></span> IP Added
-                                </label>
-                                <label class="checkbox-container">
-                                    <input type="checkbox" id="webhook-event-update" checked>
-                                    <span class="checkmark"></span> IP Updated
-                                </label>
-                                <label class="checkbox-container">
-                                    <input type="checkbox" id="webhook-event-delete" checked>
-                                    <span class="checkmark"></span> IP Deleted
-                                </label>
-                            </div>
-                        </div>
-
-                        <div class="form-group">
-                            <label class="checkbox-container">
-                                <input type="checkbox" id="webhook-send-normalized-ipv6">
-                                <span class="checkmark"></span> Send normalized IPv6 (/48)
-                            </label>
-                            <small class="field-hint">
-                                When enabled, <code>$target_address</code> and <code>$ip</code> emit the <code>/48</code>
-                                subnet for bare IPv6 bans (e.g. for firewall hooks like <code>launch.block.ip</code>).
-                                Leave unchecked to send the full host IPv6 (e.g. for AbuseIPDB reporting).
-                            </small>
-                        </div>
-
-                        <div class="form-actions mt-4">
-                            <button type="submit" class="btn btn-primary">Create Webhook</button>
-                        </div>
-                    </form>
                     <div class="table-container mt-4">
                         <table class="data-table">
                             <thead><tr><th>ID</th><th>Name</th><th>URL</th><th>Auth Mode</th><th>Actions</th></tr></thead>
@@ -908,7 +698,7 @@
                     <input type="text" id="audit-ip-filter" class="input-field font-mono" placeholder="Filter by client IP...">
                     <input type="text" id="audit-key-filter" class="input-field" placeholder="Filter by API key (name or prefix)...">
                     <input type="datetime-local" id="audit-since-filter" class="input-field" title="Since (inclusive)">
-                    <input type="datetime-local" id="audit-until-filter" class="input-field" title="Until (exclusive)">
+                    <input type="datetime-local" id="audit-until-filter" class="input-field" title="Until (inclusive)">
                     <button type="button" id="audit-search-btn" class="btn btn-icon" title="Search">🔍</button>
                     <button type="button" id="audit-clear-btn" class="btn btn-secondary btn-sm">Clear</button>
                 </div>
@@ -940,6 +730,318 @@
                 </div>
             </section>
         </main>
+    </div>
+
+    <div id="create-group-modal" class="modal-overlay resource-modal hidden" role="dialog" aria-modal="true"
+         aria-labelledby="create-group-modal-title">
+        <div class="modal-card modal-card-form card">
+            <div class="modal-header">
+                <h3 id="create-group-modal-title">Create Group</h3>
+                <button type="button" class="btn-modal-close" data-close-modal aria-label="Close">&times;</button>
+            </div>
+            <form id="form-create-group" class="admin-form">
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label for="create-group-name">Group Name <span>*</span></label>
+                        <input type="text" id="create-group-name" required class="input-field">
+                    </div>
+                    <div class="form-group">
+                        <label for="create-group-type">Type</label>
+                        <select id="create-group-type" class="input-field select-field">
+                            <option value="banlist">Banlist</option>
+                            <option value="whitelist">Whitelist</option>
+                        </select>
+                    </div>
+                </div>
+                <fieldset class="group-ban-policy">
+                    <legend>Ban Policy</legend>
+                    <label class="group-policy-option">
+                        <input type="checkbox" id="create-group-allow-private">
+                        Allow Private IPs (RFC1918 / CGNAT / ULA)
+                    </label>
+                    <div class="group-whitelist-options" role="group" aria-labelledby="create-group-exclusions-label">
+                        <strong id="create-group-exclusions-label">Exclude Whitelists from Banning</strong>
+                        <div id="create-group-excluded-whitelists"></div>
+                    </div>
+                </fieldset>
+                <div class="form-actions">
+                    <button type="button" class="btn btn-secondary" data-close-modal>Cancel</button>
+                    <button type="submit" class="btn btn-primary">Create Group</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <div id="edit-group-modal" class="modal-overlay resource-modal hidden" role="dialog" aria-modal="true"
+         aria-labelledby="edit-group-modal-title">
+        <div class="modal-card modal-card-form card">
+            <div class="modal-header">
+                <h3 id="edit-group-modal-title">Edit Group</h3>
+                <button type="button" class="btn-modal-close" data-close-modal aria-label="Close">&times;</button>
+            </div>
+            <form id="form-edit-group" class="admin-form">
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label for="edit-group-name">Group Name <span>*</span></label>
+                        <input type="text" id="edit-group-name" required class="input-field">
+                    </div>
+                    <div class="form-group">
+                        <label for="edit-group-type">Type</label>
+                        <select id="edit-group-type" class="input-field select-field" disabled>
+                            <option value="banlist">Banlist</option>
+                            <option value="whitelist">Whitelist</option>
+                        </select>
+                    </div>
+                </div>
+                <fieldset class="group-ban-policy">
+                    <legend>Ban Policy</legend>
+                    <label class="group-policy-option">
+                        <input type="checkbox" id="edit-group-allow-private">
+                        Allow Private IPs (RFC1918 / CGNAT / ULA)
+                    </label>
+                    <div class="group-whitelist-options" role="group" aria-labelledby="edit-group-exclusions-label">
+                        <strong id="edit-group-exclusions-label">Exclude Whitelists from Banning</strong>
+                        <div id="edit-group-excluded-whitelists"></div>
+                    </div>
+                </fieldset>
+                <div class="form-actions">
+                    <button type="button" class="btn btn-secondary" data-close-modal>Cancel</button>
+                    <button type="submit" class="btn btn-primary">Save Changes</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <div id="group-owner-modal" class="modal-overlay resource-modal hidden" role="dialog" aria-modal="true"
+         aria-labelledby="group-owner-modal-title">
+        <div class="modal-card modal-card-form card">
+            <div class="modal-header">
+                <h3 id="group-owner-modal-title">Assign Group Owner</h3>
+                <button type="button" class="btn-modal-close" data-close-modal aria-label="Close">&times;</button>
+            </div>
+            <form id="form-group-owner" class="admin-form">
+                <div class="form-group">
+                    <label for="group-owner-key">Owner</label>
+                    <select id="group-owner-key" class="input-field select-field"></select>
+                </div>
+                <div class="form-actions">
+                    <button type="button" class="btn btn-secondary" data-close-modal>Cancel</button>
+                    <button type="submit" class="btn btn-primary">Save Owner</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <div id="create-webhook-modal" class="modal-overlay resource-modal hidden" role="dialog" aria-modal="true"
+         aria-labelledby="create-webhook-modal-title">
+        <div class="modal-card modal-card-form card">
+            <div class="modal-header">
+                <h3 id="create-webhook-modal-title">Create Webhook</h3>
+                <button type="button" class="btn-modal-close" data-close-modal aria-label="Close">&times;</button>
+            </div>
+            <form id="form-create-webhook" class="admin-form">
+                <!-- Row 1 — universal fields: every mode needs all three. -->
+                <div class="compact-grid">
+                    <div class="form-group">
+                        <label for="webhook-name">Webhook Name <span>*</span></label>
+                        <input type="text" id="webhook-name" placeholder="My Alert Hook" required class="input-field">
+                    </div>
+                    <div class="form-group">
+                        <label for="webhook-url">Target URL <span>*</span></label>
+                        <input type="url" id="webhook-url" placeholder="https://example.com" required class="input-field">
+                        <small class="field-hint">
+                            Supports the same <code>$variable</code> substitution as the
+                            payload template —
+                            <button type="button" class="btn-link" id="webhook-vars-help-btn">see all template variables</button>.
+                        </small>
+                    </div>
+                    <div class="form-group">
+                        <label for="webhook-group-search">Target Group <span>*</span></label>
+                        <div class="combobox" id="webhook-group-combobox">
+                            <input type="text" id="webhook-group-search" class="input-field combobox-input" placeholder="-- Select Group --" autocomplete="off" required>
+                            <input type="hidden" id="webhook-group-id">
+                            <div class="combobox-menu hidden"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Row 2 — Auth Mode drives everything below it. The description is a
+                     single line that swaps with the selection (see syncWebhookAuthFields),
+                     instead of a permanent paragraph listing all four modes at once. -->
+                <div class="compact-grid auth-mode-row">
+                    <div class="form-group">
+                        <label for="webhook-auth-mode">Auth Mode <span>*</span></label>
+                        <select id="webhook-auth-mode" class="input-field select-field">
+                            <option value="CANONICAL_V1" selected>CANONICAL_V1 (Simply IP Vault / hook executor)</option>
+                            <option value="HMAC_ONLY">HMAC_ONLY (signature only, no key)</option>
+                            <option value="API_KEY_ONLY">API_KEY_ONLY (key header, no signature)</option>
+                            <option value="NONE">NONE (no auth headers)</option>
+                        </select>
+                    </div>
+                    <p class="auth-mode-hint field-hint" id="webhook-auth-mode-hint" aria-live="polite"></p>
+                </div>
+
+                <!-- Row 3 — mode-dependent credentials, shown/hidden by JS. -->
+                <div class="compact-grid">
+                    <div class="form-group" id="webhook-secret-group">
+                        <label for="webhook-secret">HMAC Secret <span>*</span></label>
+                        <input type="password" id="webhook-secret" placeholder="Shared Secret" required class="input-field">
+                    </div>
+                    <div class="form-group" id="webhook-api-key-group">
+                        <label for="webhook-api-key">API Key</label>
+                        <div class="input-pair">
+                            <input type="text" id="webhook-api-key-header" class="input-field font-mono header-name-input"
+                                   value="X-API-Key" placeholder="X-API-Key" autocomplete="off"
+                                   aria-label="Header name for the API key">
+                            <input type="password" id="webhook-api-key" placeholder="Credential value" class="input-field" autocomplete="off">
+                        </div>
+                        <small class="field-hint">
+                            Credential for the <em>receiving</em> system. Stored as given, never shown again.
+                            Rename the header if the receiver expects something other than
+                            <code>X-API-Key</code>.
+                        </small>
+                    </div>
+                </div>
+
+                <!-- Signature transport — applies to whichever mode signs. Kept adjacent to
+                     the template because all three answer the same question: what exactly
+                     does the receiver see, and under what name. -->
+                <div class="compact-grid">
+                    <div class="form-group" id="webhook-sig-header-group">
+                        <label for="webhook-sig-header">Signature Header</label>
+                        <input type="text" id="webhook-sig-header" class="input-field font-mono"
+                               placeholder="X-Signature-256" autocomplete="off" spellcheck="false">
+                        <small class="field-hint">
+                            Where the signature is sent. Blank uses <code>X-Signature-256</code>,
+                            which is what another Simply IP Vault instance and the hook executor
+                            expect. GitHub-style receivers want <code>X-Hub-Signature-256</code>.
+                        </small>
+                    </div>
+                    <div class="form-group" id="webhook-sig-prefix-group">
+                        <label for="webhook-sig-prefix">Signature Prefix</label>
+                        <input type="text" id="webhook-sig-prefix" class="input-field font-mono"
+                               value="sha256=" placeholder="sha256=" autocomplete="off" spellcheck="false">
+                        <small class="field-hint">
+                            Prepended to the hex digest. Clear it to send a bare digest for
+                            receivers that reject a prefix. The algorithm is always SHA-256.
+                        </small>
+                    </div>
+                </div>
+
+                <div class="form-group" id="webhook-hmac-template-group">
+                    <label for="webhook-hmac-template">HMAC Signature Template <span>*</span></label>
+                    <input type="text" id="webhook-hmac-template" class="input-field font-mono"
+                           value="{method}\n{path}\n{timestamp}\n{body}" spellcheck="false" autocomplete="off">
+                    <small class="field-hint">
+                        The exact string that gets signed. <code>\n</code> is a real newline;
+                        <code>{method}</code>, <code>{path}</code>, <code>{timestamp}</code>, <code>{body}</code>
+                        are substituted (<code>{path}</code> comes from the target URL). Behind a path-rewriting
+                        proxy, hardcode the path the receiver sees. <code>{body}</code> is mandatory.
+                    </small>
+                </div>
+
+                <!-- Row 4 — payload shaping, side by side: both are code-ish textareas and
+                     read better adjacent than stacked full-width. -->
+                <div class="compact-grid">
+                    <div class="form-group">
+                        <label id="webhook-headers-label">Custom Headers</label>
+                        <!-- Rows are built by JS (renderHeaderRows). Always present, in every
+                             auth mode, so a receiver that wants its signature or credential
+                             under a non-standard name can be accommodated without the form
+                             needing a field for each possibility. -->
+                        <div id="webhook-headers-list" class="kv-editor" role="group"
+                             aria-labelledby="webhook-headers-label"></div>
+                        <button type="button" id="webhook-headers-add" class="btn btn-secondary btn-sm mt-2">+ Add Header</button>
+                        <small class="field-hint">
+                            Sent verbatim on every dispatch. Rows with an empty name are ignored.
+                        </small>
+                    </div>
+                    <div class="form-group">
+                        <label for="webhook-template">Payload Template <span>*</span></label>
+                        <textarea id="webhook-template" required class="input-field font-mono" rows="3">{"target_address": "$target_address", "cause": "$cause", "group_name": "$group_name"}</textarea>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>Trigger On Events <span>*</span></label>
+                    <div class="permissions-grid mt-2">
+                        <label class="checkbox-container">
+                            <input type="checkbox" id="webhook-event-add" checked>
+                            <span class="checkmark"></span> IP Added
+                        </label>
+                        <label class="checkbox-container">
+                            <input type="checkbox" id="webhook-event-update" checked>
+                            <span class="checkmark"></span> IP Updated
+                        </label>
+                        <label class="checkbox-container">
+                            <input type="checkbox" id="webhook-event-delete" checked>
+                            <span class="checkmark"></span> IP Deleted
+                        </label>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label class="checkbox-container">
+                        <input type="checkbox" id="webhook-send-normalized-ipv6">
+                        <span class="checkmark"></span> Send normalized IPv6 (/48)
+                    </label>
+                    <small class="field-hint">
+                        When enabled, <code>$target_address</code> and <code>$ip</code> emit the <code>/48</code>
+                        subnet for bare IPv6 bans (e.g. for firewall hooks like <code>launch.block.ip</code>).
+                        Leave unchecked to send the full host IPv6 (e.g. for AbuseIPDB reporting).
+                    </small>
+                </div>
+
+                <div class="form-actions mt-4">
+                    <button type="submit" class="btn btn-primary">Create Webhook</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <div id="manage-rights-modal" class="modal-overlay resource-modal hidden" role="dialog" aria-modal="true"
+         aria-labelledby="manage-rights-modal-title">
+        <div class="modal-card modal-card-form card">
+            <div class="modal-header">
+                <h3 id="manage-rights-modal-title">Assign Group Rights</h3>
+                <button type="button" class="btn-modal-close" data-close-modal aria-label="Close">&times;</button>
+            </div>
+            <form id="form-manage-rights" class="admin-form">
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label for="manage-rights-key">Target Key <span>*</span></label>
+                        <select id="manage-rights-key" class="input-field select-field" required>
+                            <option value="">-- Select API Key --</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="manage-rights-group-search">Group <span>*</span></label>
+                        <div class="combobox" id="manage-rights-group-combobox">
+                            <input type="text" id="manage-rights-group-search" class="input-field combobox-input" placeholder="-- Select Group --" autocomplete="off" required>
+                            <input type="hidden" id="manage-rights-group">
+                            <div class="combobox-menu hidden"></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="permissions-grid mt-2 mb-4">
+                    <label class="checkbox-container">
+                        <input type="checkbox" id="manage-rights-read">
+                        <span>Read</span>
+                    </label>
+                    <label class="checkbox-container">
+                        <input type="checkbox" id="manage-rights-write">
+                        <span>Write</span>
+                    </label>
+                    <label class="checkbox-container">
+                        <input type="checkbox" id="manage-rights-delete">
+                        <span>Delete</span>
+                    </label>
+                </div>
+                <div class="form-actions">
+                    <button type="submit" class="btn btn-secondary">Assign Group Rights</button>
+                </div>
+            </form>
+        </div>
     </div>
 
     <!-- Manage Access Modal (the former left-hand panel on the IP Records tab) -->
@@ -1026,7 +1128,7 @@
 
                 <div class="form-actions mt-4">
                     <button type="submit" class="btn btn-primary" id="apikey-submit-btn">Create Key</button>
-                    <button type="button" id="btn-cancel-create-key" class="btn btn-secondary">Cancel</button>
+                    <button type="button" id="btn-cancel-create-key" class="btn btn-cancel">Cancel</button>
                 </div>
             </form>
         </div>
@@ -1076,7 +1178,7 @@
                 </p>
                 <div class="form-actions mt-4">
                     <button type="submit" class="btn btn-primary">Save Changes</button>
-                    <button type="button" id="edit-key-cancel" class="btn btn-secondary">Cancel</button>
+                    <button type="button" id="edit-key-cancel" class="btn btn-cancel">Cancel</button>
                 </div>
             </form>
         </div>
@@ -1306,14 +1408,14 @@
             <h3 id="key-secret-modal-title">API Key Created</h3>
             <p class="subtitle">Copy both values now — the signing secret cannot be retrieved or displayed again.</p>
             <div id="apikey-created" class="key-reveal">
-                <div style="display:flex;justify-content:space-between;align-items:center;">
+                <div class="key-reveal-header">
                     <span class="key-reveal-label">API Key:</span>
-                    <button type="button" class="btn btn-secondary btn-sm" id="btn-copy-vault-apikey" style="padding:0.2rem 0.5rem;font-size:0.75rem;">Copy</button>
+                    <button type="button" class="btn btn-secondary btn-sm copy-compact-btn" id="btn-copy-vault-apikey">Copy</button>
                 </div>
                 <code id="apikey-plaintext" class="key-reveal-value"></code>
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-top:0.5rem;">
+                <div class="key-reveal-header mt-2">
                     <span class="key-reveal-label">Signing Secret:</span>
-                    <button type="button" class="btn btn-secondary btn-sm" id="btn-copy-vault-signing-secret" style="padding:0.2rem 0.5rem;font-size:0.75rem;">Copy</button>
+                    <button type="button" class="btn btn-secondary btn-sm copy-compact-btn" id="btn-copy-vault-signing-secret">Copy</button>
                 </div>
                 <code id="apikey-signing-secret" class="key-reveal-value"></code>
             </div>
@@ -1324,14 +1426,23 @@
     </div>
 
     <!-- Secret Reveal Modal (used after key rotation) -->
-    <div id="secret-reveal-modal" class="modal-overlay hidden">
+    <div id="secret-reveal-modal" class="modal-overlay hidden" role="dialog" aria-modal="true"
+         aria-labelledby="secret-reveal-modal-title">
         <div class="modal-card card">
-            <h3>New Secret Generated</h3>
+            <h3 id="secret-reveal-modal-title">New Secret Generated</h3>
             <p class="subtitle">Copy both values now — they will not be shown again.</p>
-            <p class="key-reveal-label">API Key:</p>
-            <code id="secret-reveal-value" class="key-reveal-value"></code>
-            <p class="key-reveal-label">Signing Secret:</p>
-            <code id="secret-reveal-signing-secret" class="key-reveal-value"></code>
+            <div class="key-reveal">
+                <div class="key-reveal-header">
+                    <span class="key-reveal-label">API Key:</span>
+                    <button type="button" class="btn btn-secondary btn-sm copy-compact-btn" id="secret-reveal-copy-key">Copy</button>
+                </div>
+                <code id="secret-reveal-value" class="key-reveal-value"></code>
+                <div class="key-reveal-header mt-2">
+                    <span class="key-reveal-label">Signing Secret:</span>
+                    <button type="button" class="btn btn-secondary btn-sm copy-compact-btn" id="secret-reveal-copy-secret">Copy</button>
+                </div>
+                <code id="secret-reveal-signing-secret" class="key-reveal-value"></code>
+            </div>
             <div class="form-actions mt-4">
                 <button type="button" id="secret-reveal-close" class="btn btn-primary">Done</button>
             </div>
@@ -1339,18 +1450,23 @@
     </div>
 
     <!-- Signing-Secret Reveal Modal (used after POST /api/keys/{id}/rotate-secret) -->
-    <div id="signing-secret-modal" class="modal-overlay hidden">
+    <div id="signing-secret-modal" class="modal-overlay hidden" role="dialog" aria-modal="true"
+         aria-labelledby="signing-secret-modal-title">
         <div class="modal-card card">
-            <h3>New Signing Secret</h3>
+            <h3 id="signing-secret-modal-title">New Signing Secret</h3>
             <p class="subtitle">
                 The API key, its name, and all permissions are unchanged — only the HMAC signing
                 secret was replaced. The previous secret stopped working immediately, so update every
                 client using this key. This value is shown once and cannot be retrieved again.
             </p>
-            <p class="key-reveal-label">Key: <span id="signing-secret-key-name"></span></p>
-            <code id="signing-secret-value" class="key-reveal-value"></code>
-            <div class="modal-actions mt-4">
-                <button type="button" id="signing-secret-copy" class="btn btn-cancel">Copy</button>
+            <div class="key-reveal">
+                <div class="key-reveal-header">
+                    <span class="key-reveal-label">Signing Secret: <span id="signing-secret-key-name"></span></span>
+                    <button type="button" id="signing-secret-copy" class="btn btn-secondary btn-sm copy-compact-btn">Copy</button>
+                </div>
+                <code id="signing-secret-value" class="key-reveal-value"></code>
+            </div>
+            <div class="form-actions mt-4">
                 <button type="button" id="signing-secret-close" class="btn btn-primary">Done</button>
             </div>
         </div>

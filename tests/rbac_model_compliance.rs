@@ -52,7 +52,11 @@ async fn setup() -> (DatabaseConnection, axum::Router) {
     // The receiver is leaked deliberately: dropping it closes the channel, and a handler that
     // dispatches a webhook event would then see a send error rather than the success path under test.
     std::mem::forget(rx);
-    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+    let app = create_app(AppState::with_trusted_proxies(
+        db.clone(),
+        webhook_tx,
+        Vec::new(),
+    ));
     (db, app)
 }
 
@@ -112,16 +116,14 @@ fn sign_with(
 ) -> Request<Body> {
     let method = builder
         .method_ref()
-        .map(|m| m.as_str().to_owned())
-        .unwrap_or_else(|| "GET".to_owned());
-    let target = builder
-        .uri_ref()
-        .map(|u| {
+        .map_or_else(|| "GET".to_owned(), |m| m.as_str().to_owned());
+    let target = builder.uri_ref().map_or_else(
+        || "/".to_owned(),
+        |u| {
             u.path_and_query()
-                .map(|pq| pq.as_str().to_owned())
-                .unwrap_or_else(|| u.path().to_owned())
-        })
-        .unwrap_or_else(|| "/".to_owned());
+                .map_or_else(|| u.path().to_owned(), |pq| pq.as_str().to_owned())
+        },
+    );
     let timestamp = (chrono::Utc::now().timestamp() + offset).to_string();
 
     let mut builder = builder.header("X-Timestamp", &timestamp);
@@ -145,7 +147,7 @@ fn sign_with(
 /// This helper exists so the adversarial shape is written once and cannot drift into a cooperative
 /// one. Two properties are load-bearing and neither is obvious:
 ///
-/// - **No `ActiveModel`.** SeaORM builds column lists from the entity, and `master_marker` is not on
+/// - **No `ActiveModel`.** `SeaORM` builds column lists from the entity, and `master_marker` is not on
 ///   the entity, so an `ActiveModel` insert is adversarial only by accident of our own type
 ///   definitions. Raw SQL is adversarial by construction, and stays adversarial if someone
 ///   reintroduces the field.
@@ -176,14 +178,36 @@ async fn adversarial_master_insert(
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
+const KEYS_SCOPE: simply_ip_vault::api::AdminScopes = simply_ip_vault::api::AdminScopes {
+    can_manage_keys: true,
+    can_manage_webhooks: false,
+    can_create_groups: false,
+};
+
+const NO_ADMIN_SCOPES: simply_ip_vault::api::AdminScopes = simply_ip_vault::api::AdminScopes {
+    can_manage_keys: false,
+    can_manage_webhooks: false,
+    can_create_groups: false,
+};
+
+const ALL_ADMIN_SCOPES: simply_ip_vault::api::AdminScopes = simply_ip_vault::api::AdminScopes {
+    can_manage_keys: true,
+    can_manage_webhooks: true,
+    can_create_groups: true,
+};
+
+const KEYS_AND_WEBHOOKS_SCOPE: simply_ip_vault::api::AdminScopes =
+    simply_ip_vault::api::AdminScopes {
+        can_manage_keys: true,
+        can_manage_webhooks: true,
+        can_create_groups: false,
+    };
+
 async fn key(
     db: &DatabaseConnection,
     name: &str,
     is_master: bool,
-    can_manage_keys: bool,
-    can_manage_webhooks: bool,
-    can_create_groups: bool,
+    scopes: simply_ip_vault::api::AdminScopes,
 ) -> (Uuid, String) {
     let id = Uuid::new_v4();
     let plaintext = simply_ip_vault::api::generate_random_key();
@@ -194,9 +218,9 @@ async fn key(
         name: Set(name.to_owned()),
         bound_ips: Set(None),
         is_master: Set(is_master),
-        can_manage_keys: Set(can_manage_keys),
-        can_manage_webhooks: Set(can_manage_webhooks),
-        can_create_groups: Set(can_create_groups),
+        can_manage_keys: Set(scopes.can_manage_keys),
+        can_manage_webhooks: Set(scopes.can_manage_webhooks),
+        can_create_groups: Set(scopes.can_create_groups),
         parent_key_id: Set(None),
         prefix: Set("compl001".to_owned()),
         created_at: Set(chrono::Utc::now().naive_utc()),
@@ -213,6 +237,7 @@ async fn group(db: &DatabaseConnection, name: &str, owner: Option<Uuid>) -> Uuid
     simply_ip_vault::entities::ip_group::ActiveModel {
         id: Set(id),
         name: Set(name.to_owned()),
+        allow_private_ips: Set(false),
         group_type: Set("banlist".to_owned()),
         description: Set(None),
         owner_key_id: Set(owner),
@@ -224,22 +249,41 @@ async fn group(db: &DatabaseConnection, name: &str, owner: Option<Uuid>) -> Uuid
     id
 }
 
+const GROUP_READ: simply_ip_vault::api::GroupCapabilities =
+    simply_ip_vault::api::GroupCapabilities {
+        can_read: true,
+        can_write: false,
+        can_delete: false,
+    };
+
+const GROUP_READ_WRITE_DELETE: simply_ip_vault::api::GroupCapabilities =
+    simply_ip_vault::api::GroupCapabilities {
+        can_read: true,
+        can_write: true,
+        can_delete: true,
+    };
+
+const GROUP_READ_WRITE: simply_ip_vault::api::GroupCapabilities =
+    simply_ip_vault::api::GroupCapabilities {
+        can_read: true,
+        can_write: true,
+        can_delete: false,
+    };
+
 async fn grant(
     db: &DatabaseConnection,
     key_id: Uuid,
     group_id: Uuid,
-    read: bool,
-    write: bool,
-    del: bool,
+    capabilities: simply_ip_vault::api::GroupCapabilities,
     manage: bool,
 ) {
     simply_ip_vault::entities::api_key_group_permission::ActiveModel {
         id: Set(Uuid::new_v4()),
         api_key_id: Set(key_id),
         group_id: Set(group_id),
-        can_read: Set(read),
-        can_write: Set(write),
-        can_delete: Set(del),
+        can_read: Set(capabilities.can_read),
+        can_write: Set(capabilities.can_write),
+        can_delete: Set(capabilities.can_delete),
         can_manage: Set(manage),
         created_at: Set(chrono::Utc::now().naive_utc()),
     }
@@ -264,17 +308,23 @@ async fn set_parent(db: &DatabaseConnection, child: Uuid, parent: Option<Uuid>) 
 async fn send(app: &axum::Router, req: Request<Body>) -> (StatusCode, String) {
     let res = app.clone().oneshot(req).await.unwrap();
     let status = res.status();
-    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
     (status, String::from_utf8(bytes.to_vec()).unwrap())
 }
 
 /// A `POST /api/keys/{target}/permissions` body.
-fn perm_body(group_name: &str, read: bool, write: bool, del: bool, manage: bool) -> String {
+fn perm_body(
+    group_name: &str,
+    capabilities: simply_ip_vault::api::GroupCapabilities,
+    manage: bool,
+) -> String {
     json!({
         "group_name": group_name,
-        "can_read": read,
-        "can_write": write,
-        "can_delete": del,
+        "can_read": capabilities.can_read,
+        "can_write": capabilities.can_write,
+        "can_delete": capabilities.can_delete,
         "can_manage": manage,
     })
     .to_string()
@@ -292,32 +342,54 @@ fn perm_body(group_name: &str, read: bool, write: bool, del: bool, manage: bool)
 #[tokio::test]
 async fn r1_non_amplification_a_caller_cannot_grant_a_verb_it_does_not_hold() {
     let (db, app) = setup().await;
-    let (caller_id, caller) = key(&db, "Reader-manager", false, true, false, false).await;
-    let (target_id, _t) = key(&db, "Target", false, false, false, false).await;
+    let (caller_id, caller) = key(&db, "Reader-manager", false, KEYS_SCOPE).await;
+    let (target_id, _t) = key(&db, "Target", false, NO_ADMIN_SCOPES).await;
 
     let g = group(&db, "r1-group", None).await;
     // Read only, plus the administrative flag: admitted by R2, bounded by R1.
-    grant(&db, caller_id, g, true, false, false, true).await;
+    grant(&db, caller_id, g, GROUP_READ, true).await;
 
     let attempt = |read, write, del, manage, offset| {
         let (app, caller) = (app.clone(), caller.clone());
         async move {
             let req = signed(
-                peer(Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/keys/{target_id}/permissions"))
-                    .header("X-API-Key", &caller)
-                    .header("Content-Type", "application/json")),
+                peer(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/keys/{target_id}/permissions"))
+                        .header("X-API-Key", &caller)
+                        .header("Content-Type", "application/json"),
+                ),
                 offset,
-                perm_body("r1-group", read, write, del, manage),
+                perm_body(
+                    "r1-group",
+                    simply_ip_vault::api::GroupCapabilities {
+                        can_read: read,
+                        can_write: write,
+                        can_delete: del,
+                    },
+                    manage,
+                ),
             );
             send(&app, req).await.0
         }
     };
 
-    assert_eq!(attempt(true, false, false, false, 1).await, StatusCode::OK, "the verb it holds");
-    assert_eq!(attempt(true, true, false, false, 2).await, StatusCode::FORBIDDEN, "can_write");
-    assert_eq!(attempt(true, false, true, false, 3).await, StatusCode::FORBIDDEN, "can_delete");
+    assert_eq!(
+        attempt(true, false, false, false, 1).await,
+        StatusCode::OK,
+        "the verb it holds"
+    );
+    assert_eq!(
+        attempt(true, true, false, false, 2).await,
+        StatusCode::FORBIDDEN,
+        "can_write"
+    );
+    assert_eq!(
+        attempt(true, false, true, false, 3).await,
+        StatusCode::FORBIDDEN,
+        "can_delete"
+    );
 
     let landed = simply_ip_vault::entities::api_key_group_permission::Entity::find()
         .filter(simply_ip_vault::entities::api_key_group_permission::Column::ApiKeyId.eq(target_id))
@@ -342,28 +414,30 @@ async fn r2_conjunction_neither_half_alone_confers_management() {
     let (db, app) = setup().await;
     let g = group(&db, "r2-group", None).await;
 
-    let (global_id, global) = key(&db, "Global half", false, true, false, false).await;
-    grant(&db, global_id, g, true, true, true, false).await;
+    let (global_id, global) = key(&db, "Global half", false, KEYS_SCOPE).await;
+    grant(&db, global_id, g, GROUP_READ_WRITE_DELETE, false).await;
 
-    let (scoped_id, scoped) = key(&db, "Scoped half", false, false, false, false).await;
-    grant(&db, scoped_id, g, true, true, true, true).await;
+    let (scoped_id, scoped) = key(&db, "Scoped half", false, NO_ADMIN_SCOPES).await;
+    grant(&db, scoped_id, g, GROUP_READ_WRITE_DELETE, true).await;
 
-    let (both_id, both) = key(&db, "Both halves", false, true, false, false).await;
-    grant(&db, both_id, g, true, true, true, true).await;
+    let (both_id, both) = key(&db, "Both halves", false, KEYS_SCOPE).await;
+    grant(&db, both_id, g, GROUP_READ_WRITE_DELETE, true).await;
 
-    let (victim_id, _v) = key(&db, "Victim", false, false, false, false).await;
+    let (victim_id, _v) = key(&db, "Victim", false, NO_ADMIN_SCOPES).await;
 
     let grant_as = |caller: String, offset| {
         let app = app.clone();
         async move {
             let req = signed(
-                peer(Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/keys/{victim_id}/permissions"))
-                    .header("X-API-Key", &caller)
-                    .header("Content-Type", "application/json")),
+                peer(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/keys/{victim_id}/permissions"))
+                        .header("X-API-Key", &caller)
+                        .header("Content-Type", "application/json"),
+                ),
                 offset,
-                perm_body("r2-group", true, true, false, false),
+                perm_body("r2-group", GROUP_READ_WRITE, false),
             );
             send(&app, req).await.0
         }
@@ -372,10 +446,12 @@ async fn r2_conjunction_neither_half_alone_confers_management() {
         let app = app.clone();
         async move {
             let req = signed(
-                peer(Request::builder()
-                    .method("DELETE")
-                    .uri(format!("/api/keys/{victim_id}/permissions/r2-group"))
-                    .header("X-API-Key", &caller)),
+                peer(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(format!("/api/keys/{victim_id}/permissions/r2-group"))
+                        .header("X-API-Key", &caller),
+                ),
                 offset,
                 "",
             );
@@ -383,13 +459,37 @@ async fn r2_conjunction_neither_half_alone_confers_management() {
         }
     };
 
-    assert_eq!(grant_as(global.clone(), 1).await, StatusCode::FORBIDDEN, "can_manage_keys alone");
-    assert_eq!(grant_as(scoped.clone(), 2).await, StatusCode::FORBIDDEN, "can_manage alone");
-    assert_eq!(grant_as(both.clone(), 3).await, StatusCode::OK, "both halves");
+    assert_eq!(
+        grant_as(global.clone(), 1).await,
+        StatusCode::FORBIDDEN,
+        "can_manage_keys alone"
+    );
+    assert_eq!(
+        grant_as(scoped.clone(), 2).await,
+        StatusCode::FORBIDDEN,
+        "can_manage alone"
+    );
+    assert_eq!(
+        grant_as(both.clone(), 3).await,
+        StatusCode::OK,
+        "both halves"
+    );
 
-    assert_eq!(revoke_as(global, 4).await, StatusCode::FORBIDDEN, "can_manage_keys alone");
-    assert_eq!(revoke_as(scoped, 5).await, StatusCode::FORBIDDEN, "can_manage alone");
-    assert_eq!(revoke_as(both, 6).await, StatusCode::NO_CONTENT, "both halves");
+    assert_eq!(
+        revoke_as(global, 4).await,
+        StatusCode::FORBIDDEN,
+        "can_manage_keys alone"
+    );
+    assert_eq!(
+        revoke_as(scoped, 5).await,
+        StatusCode::FORBIDDEN,
+        "can_manage alone"
+    );
+    assert_eq!(
+        revoke_as(both, 6).await,
+        StatusCode::NO_CONTENT,
+        "both halves"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -407,12 +507,12 @@ async fn r2_conjunction_neither_half_alone_confers_management() {
 #[tokio::test]
 async fn r3_lineage_confers_no_authority() {
     let (db, app) = setup().await;
-    let (master_id, _m) = key(&db, "Master", true, true, true, true).await;
-    let (parent_id, _p) = key(&db, "Ordinary parent", false, true, false, false).await;
+    let (master_id, _m) = key(&db, "Master", true, ALL_ADMIN_SCOPES).await;
+    let (parent_id, _p) = key(&db, "Ordinary parent", false, KEYS_SCOPE).await;
 
-    let (royal_id, royal) = key(&db, "Master's child", false, true, false, false).await;
-    let (commoner_id, commoner) = key(&db, "Parent's child", false, true, false, false).await;
-    let (orphan_id, orphan) = key(&db, "No parent", false, true, false, false).await;
+    let (royal_id, royal) = key(&db, "Master's child", false, KEYS_SCOPE).await;
+    let (commoner_id, commoner) = key(&db, "Parent's child", false, KEYS_SCOPE).await;
+    let (orphan_id, orphan) = key(&db, "No parent", false, KEYS_SCOPE).await;
     set_parent(&db, royal_id, Some(master_id)).await;
     set_parent(&db, commoner_id, Some(parent_id)).await;
     set_parent(&db, orphan_id, None).await;
@@ -423,49 +523,59 @@ async fn r3_lineage_confers_no_authority() {
     let home = group(&db, "r3-home", None).await;
     let target = group(&db, "r3-target", None).await;
     for id in [royal_id, commoner_id, orphan_id] {
-        grant(&db, id, home, true, true, true, true).await;
-        grant(&db, id, target, true, true, true, false).await;
+        grant(&db, id, home, GROUP_READ_WRITE_DELETE, true).await;
+        grant(&db, id, target, GROUP_READ_WRITE_DELETE, false).await;
     }
-    let (victim_id, _v) = key(&db, "Victim", false, false, false, false).await;
-    grant(&db, victim_id, target, true, false, false, false).await;
+    let (victim_id, _v) = key(&db, "Victim", false, NO_ADMIN_SCOPES).await;
+    grant(&db, victim_id, target, GROUP_READ, false).await;
 
     let probe = |caller: String, offset: i64| {
         let app = app.clone();
         async move {
             let mut answers = Vec::new();
             let req = signed(
-                peer(Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/keys/{victim_id}/permissions"))
-                    .header("X-API-Key", &caller)
-                    .header("Content-Type", "application/json")),
+                peer(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/keys/{victim_id}/permissions"))
+                        .header("X-API-Key", &caller)
+                        .header("Content-Type", "application/json"),
+                ),
                 offset,
-                perm_body("r3-target", true, true, false, false),
+                perm_body("r3-target", GROUP_READ_WRITE, false),
             );
             answers.push(send(&app, req).await.0);
 
             let req = signed(
-                peer(Request::builder()
-                    .method("DELETE")
-                    .uri(format!("/api/keys/{victim_id}/permissions/r3-target"))
-                    .header("X-API-Key", &caller)),
+                peer(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(format!("/api/keys/{victim_id}/permissions/r3-target"))
+                        .header("X-API-Key", &caller),
+                ),
                 offset + 1,
                 "",
             );
             answers.push(send(&app, req).await.0);
 
             let req = signed(
-                peer(Request::builder().uri("/api/audit-logs").header("X-API-Key", &caller)),
+                peer(
+                    Request::builder()
+                        .uri("/api/audit-logs")
+                        .header("X-API-Key", &caller),
+                ),
                 offset + 2,
                 "",
             );
             answers.push(send(&app, req).await.0);
 
             let req = signed(
-                peer(Request::builder()
-                    .method("DELETE")
-                    .uri(format!("/api/groups/{target}"))
-                    .header("X-API-Key", &caller)),
+                peer(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(format!("/api/groups/{target}"))
+                        .header("X-API-Key", &caller),
+                ),
                 offset + 3,
                 "",
             );
@@ -499,24 +609,30 @@ async fn r3_lineage_confers_no_authority() {
 #[tokio::test]
 async fn r4_only_master_grants_global_scopes() {
     let (db, app) = setup().await;
-    let (_master_id, master) = key(&db, "Master", true, true, true, true).await;
-    let (parent_id, parent) = key(&db, "Parent", false, true, true, true).await;
-    let (victim_id, _v) = key(&db, "Victim", false, false, false, false).await;
+    let (_master_id, master) = key(&db, "Master", true, ALL_ADMIN_SCOPES).await;
+    let (parent_id, parent) = key(&db, "Parent", false, ALL_ADMIN_SCOPES).await;
+    let (victim_id, _v) = key(&db, "Victim", false, NO_ADMIN_SCOPES).await;
     set_parent(&db, victim_id, Some(parent_id)).await;
 
-    for (n, scope) in ["can_manage_keys", "can_create_groups", "can_manage_webhooks"]
-        .into_iter()
-        .enumerate()
+    for (n, scope) in [
+        "can_manage_keys",
+        "can_create_groups",
+        "can_manage_webhooks",
+    ]
+    .into_iter()
+    .enumerate()
     {
-        let n = n as i64 * 10;
+        let n = i64::try_from(n).unwrap() * 10;
 
         // Create path.
         let req = signed(
-            peer(Request::builder()
-                .method("POST")
-                .uri("/api/keys")
-                .header("X-API-Key", &parent)
-                .header("Content-Type", "application/json")),
+            peer(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/keys")
+                    .header("X-API-Key", &parent)
+                    .header("Content-Type", "application/json"),
+            ),
             n + 1,
             json!({ "name": format!("minted-{scope}"), scope: true }).to_string(),
         );
@@ -528,11 +644,13 @@ async fn r4_only_master_grants_global_scopes() {
 
         // Update path.
         let req = signed(
-            peer(Request::builder()
-                .method("PUT")
-                .uri(format!("/api/keys/{victim_id}"))
-                .header("X-API-Key", &parent)
-                .header("Content-Type", "application/json")),
+            peer(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/keys/{victim_id}"))
+                    .header("X-API-Key", &parent)
+                    .header("Content-Type", "application/json"),
+            ),
             n + 2,
             json!({ scope: true }).to_string(),
         );
@@ -544,15 +662,21 @@ async fn r4_only_master_grants_global_scopes() {
 
         // The master may.
         let req = signed(
-            peer(Request::builder()
-                .method("PUT")
-                .uri(format!("/api/keys/{victim_id}"))
-                .header("X-API-Key", &master)
-                .header("Content-Type", "application/json")),
+            peer(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/keys/{victim_id}"))
+                    .header("X-API-Key", &master)
+                    .header("Content-Type", "application/json"),
+            ),
             n + 3,
             json!({ scope: true }).to_string(),
         );
-        assert_eq!(send(&app, req).await.0, StatusCode::OK, "the master grants '{scope}'");
+        assert_eq!(
+            send(&app, req).await.0,
+            StatusCode::OK,
+            "the master grants '{scope}'"
+        );
     }
 }
 
@@ -572,54 +696,74 @@ async fn r5_manage_propagates_sideways_without_creating_parents() {
     let (db, app) = setup().await;
     let g = group(&db, "r5-group", None).await;
 
-    let (alice_id, alice) = key(&db, "Parent A", false, true, false, false).await;
-    grant(&db, alice_id, g, true, true, true, true).await;
-    let (bob_id, bob) = key(&db, "Parent B", false, true, false, false).await;
-    grant(&db, bob_id, g, true, true, false, false).await;
-    let (daughter_id, daughter) = key(&db, "Daughter", false, false, false, false).await;
+    let (alice_id, alice) = key(&db, "Parent A", false, KEYS_SCOPE).await;
+    grant(&db, alice_id, g, GROUP_READ_WRITE_DELETE, true).await;
+    let (bob_id, bob) = key(&db, "Parent B", false, KEYS_SCOPE).await;
+    grant(&db, bob_id, g, GROUP_READ_WRITE, false).await;
+    let (daughter_id, daughter) = key(&db, "Daughter", false, NO_ADMIN_SCOPES).await;
 
     // Sideways: Alice confers `can_manage` on Bob, who is already a parent.
     let req = signed(
-        peer(Request::builder()
-            .method("POST")
-            .uri(format!("/api/keys/{bob_id}/permissions"))
-            .header("X-API-Key", &alice)
-            .header("Content-Type", "application/json")),
+        peer(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/keys/{bob_id}/permissions"))
+                .header("X-API-Key", &alice)
+                .header("Content-Type", "application/json"),
+        ),
         1,
-        perm_body("r5-group", true, true, false, true),
+        perm_body("r5-group", GROUP_READ_WRITE, true),
     );
-    assert_eq!(send(&app, req).await.0, StatusCode::OK, "manage may propagate sideways");
+    assert_eq!(
+        send(&app, req).await.0,
+        StatusCode::OK,
+        "manage may propagate sideways"
+    );
 
     // ...and Bob can now actually use it.
-    let (victim_id, _v) = key(&db, "Victim", false, false, false, false).await;
+    let (victim_id, _v) = key(&db, "Victim", false, NO_ADMIN_SCOPES).await;
     let req = signed(
-        peer(Request::builder()
-            .method("POST")
-            .uri(format!("/api/keys/{victim_id}/permissions"))
-            .header("X-API-Key", &bob)
-            .header("Content-Type", "application/json")),
+        peer(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/keys/{victim_id}/permissions"))
+                .header("X-API-Key", &bob)
+                .header("Content-Type", "application/json"),
+        ),
         2,
-        perm_body("r5-group", true, false, false, false),
+        perm_body("r5-group", GROUP_READ, false),
     );
-    assert_eq!(send(&app, req).await.0, StatusCode::OK, "the conferred flag is real");
+    assert_eq!(
+        send(&app, req).await.0,
+        StatusCode::OK,
+        "the conferred flag is real"
+    );
 
     // Downward: the same grant to a key with no `can_manage_keys` confers nothing usable.
     let req = signed(
-        peer(Request::builder()
-            .method("POST")
-            .uri(format!("/api/keys/{daughter_id}/permissions"))
-            .header("X-API-Key", &alice)
-            .header("Content-Type", "application/json")),
+        peer(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/keys/{daughter_id}/permissions"))
+                .header("X-API-Key", &alice)
+                .header("Content-Type", "application/json"),
+        ),
         3,
-        perm_body("r5-group", true, true, false, true),
+        perm_body("r5-group", GROUP_READ_WRITE, true),
     );
-    assert_eq!(send(&app, req).await.0, StatusCode::OK, "the row is written");
+    assert_eq!(
+        send(&app, req).await.0,
+        StatusCode::OK,
+        "the row is written"
+    );
 
     let req = signed(
-        peer(Request::builder()
-            .method("DELETE")
-            .uri(format!("/api/keys/{victim_id}/permissions/r5-group"))
-            .header("X-API-Key", &daughter)),
+        peer(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/keys/{victim_id}/permissions/r5-group"))
+                .header("X-API-Key", &daughter),
+        ),
         4,
         "",
     );
@@ -648,17 +792,19 @@ async fn r6_revocation_needs_no_verb_and_permits_self_revocation() {
     let (db, app) = setup().await;
     let g = group(&db, "r6-group", None).await;
 
-    let (mgr_id, mgr) = key(&db, "Read-only manager", false, true, false, false).await;
-    grant(&db, mgr_id, g, true, false, false, true).await;
-    let (worker_id, _w) = key(&db, "Worker", false, false, false, false).await;
-    grant(&db, worker_id, g, true, true, true, false).await;
+    let (mgr_id, mgr) = key(&db, "Read-only manager", false, KEYS_SCOPE).await;
+    grant(&db, mgr_id, g, GROUP_READ, true).await;
+    let (worker_id, _w) = key(&db, "Worker", false, NO_ADMIN_SCOPES).await;
+    grant(&db, worker_id, g, GROUP_READ_WRITE_DELETE, false).await;
 
     // 1. Removes verbs it does not hold, through the dedicated route.
     let req = signed(
-        peer(Request::builder()
-            .method("DELETE")
-            .uri(format!("/api/keys/{worker_id}/permissions/r6-group"))
-            .header("X-API-Key", &mgr)),
+        peer(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/keys/{worker_id}/permissions/r6-group"))
+                .header("X-API-Key", &mgr),
+        ),
         1,
         "",
     );
@@ -669,17 +815,19 @@ async fn r6_revocation_needs_no_verb_and_permits_self_revocation() {
     );
 
     // 2. Endpoint parity, in the shape that distinguishes it.
-    grant(&db, worker_id, g, true, true, true, false).await;
+    grant(&db, worker_id, g, GROUP_READ_WRITE_DELETE, false).await;
     let req = signed(
-        peer(Request::builder()
-            .method("POST")
-            .uri(format!("/api/keys/{worker_id}/permissions"))
-            .header("X-API-Key", &mgr)
-            .header("Content-Type", "application/json")),
+        peer(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/keys/{worker_id}/permissions"))
+                .header("X-API-Key", &mgr)
+                .header("Content-Type", "application/json"),
+        ),
         2,
         // Drops `can_delete`, keeps `can_write` — which the manager does not hold. It adds no verb,
         // so it is a revocation; on the grant path the surviving `can_write` would trip R1's ceiling.
-        perm_body("r6-group", true, true, false, false),
+        perm_body("r6-group", GROUP_READ_WRITE, false),
     );
     assert_eq!(
         send(&app, req).await.0,
@@ -692,18 +840,27 @@ async fn r6_revocation_needs_no_verb_and_permits_self_revocation() {
         .await
         .unwrap()
         .unwrap();
-    assert!(row.can_read && row.can_write && !row.can_delete, "only the dropped verb changed");
+    assert!(
+        row.can_read && row.can_write && !row.can_delete,
+        "only the dropped verb changed"
+    );
 
     // 3. Self-revocation.
     let req = signed(
-        peer(Request::builder()
-            .method("DELETE")
-            .uri(format!("/api/keys/{mgr_id}/permissions/r6-group"))
-            .header("X-API-Key", &mgr)),
+        peer(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/keys/{mgr_id}/permissions/r6-group"))
+                .header("X-API-Key", &mgr),
+        ),
         3,
         "",
     );
-    assert_eq!(send(&app, req).await.0, StatusCode::NO_CONTENT, "a manager may revoke itself");
+    assert_eq!(
+        send(&app, req).await.0,
+        StatusCode::NO_CONTENT,
+        "a manager may revoke itself"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -719,38 +876,48 @@ async fn r6_revocation_needs_no_verb_and_permits_self_revocation() {
 async fn r7_granting_requires_r1_and_r2_simultaneously() {
     let (db, app) = setup().await;
     let g = group(&db, "r7-group", None).await;
-    let (victim_id, _v) = key(&db, "Victim", false, false, false, false).await;
+    let (victim_id, _v) = key(&db, "Victim", false, NO_ADMIN_SCOPES).await;
 
     // Passes R1 (holds every verb it tries to confer), fails R2 (no `can_manage` row).
-    let (r1_only_id, r1_only) = key(&db, "R1 only", false, true, false, false).await;
-    grant(&db, r1_only_id, g, true, true, true, false).await;
+    let (r1_only_id, r1_only) = key(&db, "R1 only", false, KEYS_SCOPE).await;
+    grant(&db, r1_only_id, g, GROUP_READ_WRITE_DELETE, false).await;
 
     // Passes R2 (both halves), fails R1 (does not hold `can_write`).
-    let (r2_only_id, r2_only) = key(&db, "R2 only", false, true, false, false).await;
-    grant(&db, r2_only_id, g, true, false, false, true).await;
+    let (r2_only_id, r2_only) = key(&db, "R2 only", false, KEYS_SCOPE).await;
+    grant(&db, r2_only_id, g, GROUP_READ, true).await;
 
     // Passes both.
-    let (both_id, both) = key(&db, "Both", false, true, false, false).await;
-    grant(&db, both_id, g, true, true, true, true).await;
+    let (both_id, both) = key(&db, "Both", false, KEYS_SCOPE).await;
+    grant(&db, both_id, g, GROUP_READ_WRITE_DELETE, true).await;
 
     let attempt = |caller: String, offset| {
         let app = app.clone();
         async move {
             let req = signed(
-                peer(Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/keys/{victim_id}/permissions"))
-                    .header("X-API-Key", &caller)
-                    .header("Content-Type", "application/json")),
+                peer(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/keys/{victim_id}/permissions"))
+                        .header("X-API-Key", &caller)
+                        .header("Content-Type", "application/json"),
+                ),
                 offset,
-                perm_body("r7-group", true, true, false, false),
+                perm_body("r7-group", GROUP_READ_WRITE, false),
             );
             send(&app, req).await.0
         }
     };
 
-    assert_eq!(attempt(r1_only, 1).await, StatusCode::FORBIDDEN, "R1 without R2 is not enough");
-    assert_eq!(attempt(r2_only, 2).await, StatusCode::FORBIDDEN, "R2 without R1 is not enough");
+    assert_eq!(
+        attempt(r1_only, 1).await,
+        StatusCode::FORBIDDEN,
+        "R1 without R2 is not enough"
+    );
+    assert_eq!(
+        attempt(r2_only, 2).await,
+        StatusCode::FORBIDDEN,
+        "R2 without R1 is not enough"
+    );
     assert_eq!(attempt(both, 3).await, StatusCode::OK, "both together");
 }
 
@@ -769,21 +936,23 @@ async fn r7_granting_requires_r1_and_r2_simultaneously() {
 #[tokio::test]
 async fn s3_lifecycle_authority_belongs_to_master_and_owner_only() {
     let (db, app) = setup().await;
-    let (_master_id, master) = key(&db, "Master", true, true, true, true).await;
-    let (owner_id, owner) = key(&db, "Owner", false, false, false, false).await;
-    let (privileged_id, privileged) = key(&db, "Privileged non-owner", false, true, false, false).await;
+    let (_master_id, master) = key(&db, "Master", true, ALL_ADMIN_SCOPES).await;
+    let (owner_id, owner) = key(&db, "Owner", false, NO_ADMIN_SCOPES).await;
+    let (privileged_id, privileged) = key(&db, "Privileged non-owner", false, KEYS_SCOPE).await;
 
     let g = group(&db, "s3-group", Some(owner_id)).await;
-    grant(&db, privileged_id, g, true, true, true, true).await;
+    grant(&db, privileged_id, g, GROUP_READ_WRITE_DELETE, true).await;
 
     let delete_as = |caller: String, offset| {
         let app = app.clone();
         async move {
             let req = signed(
-                peer(Request::builder()
-                    .method("DELETE")
-                    .uri(format!("/api/groups/{g}"))
-                    .header("X-API-Key", &caller)),
+                peer(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(format!("/api/groups/{g}"))
+                        .header("X-API-Key", &caller),
+                ),
                 offset,
                 "",
             );
@@ -806,24 +975,34 @@ async fn s3_lifecycle_authority_belongs_to_master_and_owner_only() {
     );
 
     // Master reassigns, and the authority moves with the ownership.
-    let (new_owner_id, _n) = key(&db, "New owner", false, false, false, false).await;
+    let (new_owner_id, _n) = key(&db, "New owner", false, NO_ADMIN_SCOPES).await;
     let req = signed(
-        peer(Request::builder()
-            .method("PUT")
-            .uri(format!("/api/groups/{g}/owner"))
-            .header("X-API-Key", &master)
-            .header("Content-Type", "application/json")),
+        peer(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/groups/{g}/owner"))
+                .header("X-API-Key", &master)
+                .header("Content-Type", "application/json"),
+        ),
         2,
         json!({ "owner_key_id": new_owner_id.to_string() }).to_string(),
     );
-    assert_eq!(send(&app, req).await.0, StatusCode::OK, "a master may reassign ownership");
+    assert_eq!(
+        send(&app, req).await.0,
+        StatusCode::OK,
+        "a master may reassign ownership"
+    );
 
     assert_eq!(
         delete_as(owner, 3).await,
         StatusCode::FORBIDDEN,
         "the previous owner lost lifecycle authority with the reassignment"
     );
-    assert_eq!(delete_as(master, 4).await, StatusCode::NO_CONTENT, "and a master may always delete");
+    assert_eq!(
+        delete_as(master, 4).await,
+        StatusCode::NO_CONTENT,
+        "and a master may always delete"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -836,33 +1015,50 @@ async fn s3_lifecycle_authority_belongs_to_master_and_owner_only() {
 #[tokio::test]
 async fn s4_visibility_scopes_bound_what_a_key_listing_returns() {
     let (db, app) = setup().await;
-    let (caller_id, caller) = key(&db, "Caller", false, true, false, false).await;
-    let (daughter_id, _d) = key(&db, "Daughter", false, false, false, false).await;
+    let (caller_id, caller) = key(&db, "Caller", false, KEYS_SCOPE).await;
+    let (daughter_id, _d) = key(&db, "Daughter", false, NO_ADMIN_SCOPES).await;
     set_parent(&db, daughter_id, Some(caller_id)).await;
 
     let shared = group(&db, "s4-shared", None).await;
-    grant(&db, caller_id, shared, true, true, true, true).await;
+    grant(&db, caller_id, shared, GROUP_READ_WRITE_DELETE, true).await;
 
-    let (peer_id, _p) = key(&db, "Other tenant", false, true, true, true).await;
+    let (peer_id, _p) = key(&db, "Other tenant", false, ALL_ADMIN_SCOPES).await;
     let private = group(&db, "s4-private", None).await;
-    grant(&db, peer_id, shared, true, false, false, false).await;
-    grant(&db, peer_id, private, true, true, true, true).await;
+    grant(&db, peer_id, shared, GROUP_READ, false).await;
+    grant(&db, peer_id, private, GROUP_READ_WRITE_DELETE, true).await;
 
-    let (stranger_id, _s) = key(&db, "Stranger", false, true, true, true).await;
+    let (stranger_id, _s) = key(&db, "Stranger", false, ALL_ADMIN_SCOPES).await;
 
-    let req = signed(peer(Request::builder().uri("/api/keys").header("X-API-Key", &caller)), 1, "");
+    let req = signed(
+        peer(
+            Request::builder()
+                .uri("/api/keys")
+                .header("X-API-Key", &caller),
+        ),
+        1,
+        "",
+    );
     let (status, body) = send(&app, req).await;
     assert_eq!(status, StatusCode::OK);
     let listing: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
     let find = |id: Uuid| listing.iter().find(|k| k["id"] == id.to_string());
 
-    assert!(find(stranger_id).is_none(), "an unrelated key must not appear");
+    assert!(
+        find(stranger_id).is_none(),
+        "an unrelated key must not appear"
+    );
     assert_eq!(find(caller_id).unwrap()["view"], "full");
     assert_eq!(find(daughter_id).unwrap()["view"], "full");
 
     let shared_entry = find(peer_id).expect("a key sharing a managed group is listed");
     assert_eq!(shared_entry["view"], "minimal");
-    for withheld in ["bound_ips", "is_master", "can_manage_keys", "can_manage_webhooks", "prefix"] {
+    for withheld in [
+        "bound_ips",
+        "is_master",
+        "can_manage_keys",
+        "can_manage_webhooks",
+        "prefix",
+    ] {
         assert!(
             shared_entry.get(withheld).is_none(),
             "§4: '{withheld}' must not leak through a shared resource"
@@ -887,16 +1083,21 @@ async fn s4_visibility_scopes_bound_what_a_key_listing_returns() {
 #[tokio::test]
 async fn s4_oracle_discipline_out_of_scope_is_indistinguishable_from_nonexistent() {
     let (db, app) = setup().await;
-    let (master_id, _m) = key(&db, "Master", true, true, true, true).await;
-    let (_caller_id, caller) = key(&db, "Caller", false, true, true, false).await;
-    let (stranger_id, _s) = key(&db, "Stranger", false, false, false, false).await;
+    let (master_id, _m) = key(&db, "Master", true, ALL_ADMIN_SCOPES).await;
+    let (_caller_id, caller) = key(&db, "Caller", false, KEYS_AND_WEBHOOKS_SCOPE).await;
+    let (stranger_id, _s) = key(&db, "Stranger", false, NO_ADMIN_SCOPES).await;
     let absent = Uuid::new_v4();
 
     let probe = |method: &'static str, path: String, offset: i64| {
         let (app, caller) = (app.clone(), caller.clone());
         async move {
             let req = signed(
-                peer(Request::builder().method(method).uri(path).header("X-API-Key", &caller)),
+                peer(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("X-API-Key", &caller),
+                ),
                 offset,
                 "",
             );
@@ -904,17 +1105,28 @@ async fn s4_oracle_discipline_out_of_scope_is_indistinguishable_from_nonexistent
         }
     };
 
-    for (n, (method, suffix)) in
-        [("DELETE", ""), ("POST", "/rotate"), ("POST", "/rotate-secret")].into_iter().enumerate()
+    for (n, (method, suffix)) in [
+        ("DELETE", ""),
+        ("POST", "/rotate"),
+        ("POST", "/rotate-secret"),
+    ]
+    .into_iter()
+    .enumerate()
     {
-        let n = n as i64 * 10;
+        let n = i64::try_from(n).unwrap() * 10;
         let missing = probe(method, format!("/api/keys/{absent}{suffix}"), n + 1).await;
         let invisible = probe(method, format!("/api/keys/{stranger_id}{suffix}"), n + 2).await;
         let master_probe = probe(method, format!("/api/keys/{master_id}{suffix}"), n + 3).await;
 
         assert_eq!(missing.0, StatusCode::NOT_FOUND);
-        assert_eq!(invisible, missing, "{method}{suffix}: invisible must match nonexistent");
-        assert_eq!(master_probe, missing, "{method}{suffix}: the master must not be enumerable");
+        assert_eq!(
+            invisible, missing,
+            "{method}{suffix}: invisible must match nonexistent"
+        );
+        assert_eq!(
+            master_probe, missing,
+            "{method}{suffix}: the master must not be enumerable"
+        );
     }
 }
 
@@ -927,7 +1139,7 @@ async fn s4_oracle_discipline_out_of_scope_is_indistinguishable_from_nonexistent
 #[tokio::test]
 async fn s4_authenticate_then_authorize_ordering_survives_oracle_discipline() {
     let (db, app) = setup().await;
-    let (bound_id, bound) = key(&db, "Bound", false, false, false, false).await;
+    let (bound_id, bound) = key(&db, "Bound", false, NO_ADMIN_SCOPES).await;
     let mut active: simply_ip_vault::entities::api_key::ActiveModel =
         simply_ip_vault::entities::prelude::ApiKey::find_by_id(bound_id)
             .one(&db)
@@ -940,7 +1152,11 @@ async fn s4_authenticate_then_authorize_ordering_survives_oracle_discipline() {
 
     // Unproven caller, real key: 401.
     let req = signed_as(
-        peer(Request::builder().uri("/api/auth/me").header("X-API-Key", &bound)),
+        peer(
+            Request::builder()
+                .uri("/api/auth/me")
+                .header("X-API-Key", &bound),
+        ),
         "wrong-secret",
         1,
         "",
@@ -949,7 +1165,11 @@ async fn s4_authenticate_then_authorize_ordering_survives_oracle_discipline() {
 
     // Unproven caller, key that does not exist: the same 401, indistinguishable.
     let req = signed_as(
-        peer(Request::builder().uri("/api/auth/me").header("X-API-Key", "0".repeat(64))),
+        peer(
+            Request::builder()
+                .uri("/api/auth/me")
+                .header("X-API-Key", "0".repeat(64)),
+        ),
         "wrong-secret",
         2,
         "",
@@ -957,7 +1177,15 @@ async fn s4_authenticate_then_authorize_ordering_survives_oracle_discipline() {
     assert_eq!(send(&app, req).await.0, StatusCode::UNAUTHORIZED);
 
     // Proven caller, wrong network: 403, **not** 404.
-    let req = signed(peer(Request::builder().uri("/api/auth/me").header("X-API-Key", &bound)), 3, "");
+    let req = signed(
+        peer(
+            Request::builder()
+                .uri("/api/auth/me")
+                .header("X-API-Key", &bound),
+        ),
+        3,
+        "",
+    );
     assert_eq!(
         send(&app, req).await.0,
         StatusCode::FORBIDDEN,
@@ -974,7 +1202,7 @@ async fn s4_authenticate_then_authorize_ordering_survives_oracle_discipline() {
 #[tokio::test]
 async fn s5_master_is_unique_unsettable_immutable_and_undeletable() {
     let (db, app) = setup().await;
-    let (master_id, master) = key(&db, "Master", true, true, true, true).await;
+    let (master_id, master) = key(&db, "Master", true, ALL_ADMIN_SCOPES).await;
 
     // Uniqueness is a schema invariant, and §5 requires it be proven by an **adversarial write**:
     // a direct insert setting `is_master` with the marker absent. Raw SQL rather than an
@@ -983,18 +1211,24 @@ async fn s5_master_is_unique_unsettable_immutable_and_undeletable() {
     // from our own entity definitions. The statement below is what an operator at a `psql` prompt, a
     // restored backup, or a future migration would issue, and it is the exact statement that was
     // **accepted** against the previous application-maintained marker.
-    assert!(adversarial_master_insert(&db, "Usurper", "usurper1").await.is_err(),
+    assert!(
+        adversarial_master_insert(&db, "Usurper", "usurper1")
+            .await
+            .is_err(),
         "an insert setting is_master with master_marker absent must be refused by the engine; \
-         accepting it is how this codebase came to hold two masters while every test passed");
+         accepting it is how this codebase came to hold two masters while every test passed"
+    );
 
     // `is_master` is unsettable and unclearable, from every caller including the master.
     for value in [true, false] {
         let req = signed(
-            peer(Request::builder()
-                .method("POST")
-                .uri("/api/keys")
-                .header("X-API-Key", &master)
-                .header("Content-Type", "application/json")),
+            peer(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/keys")
+                    .header("X-API-Key", &master)
+                    .header("Content-Type", "application/json"),
+            ),
             if value { 1 } else { 2 },
             json!({ "name": format!("carries-{value}"), "is_master": value }).to_string(),
         );
@@ -1007,32 +1241,56 @@ async fn s5_master_is_unique_unsettable_immutable_and_undeletable() {
 
     // `bound_ips` is the one editable field.
     let req = signed(
-        peer(Request::builder()
-            .method("PUT")
-            .uri(format!("/api/keys/{master_id}"))
-            .header("X-API-Key", &master)
-            .header("Content-Type", "application/json")),
-        3,
-        json!({ "bound_ips": "10.0.0.0/8" }).to_string(),
-    );
-    assert_eq!(send(&app, req).await.0, StatusCode::OK, "the master may edit its own bound_ips");
-
-    for (n, body) in [json!({ "name": "Renamed" }), json!({ "can_manage_keys": false })]
-        .into_iter()
-        .enumerate()
-    {
-        let req = signed(
-            peer(Request::builder()
+        peer(
+            Request::builder()
                 .method("PUT")
                 .uri(format!("/api/keys/{master_id}"))
                 .header("X-API-Key", &master)
-                .header("Content-Type", "application/json")),
-            10 + n as i64,
+                .header("Content-Type", "application/json"),
+        ),
+        3,
+        json!({ "bound_ips": "10.0.0.0/8" }).to_string(),
+    );
+    assert_eq!(
+        send(&app, req).await.0,
+        StatusCode::OK,
+        "the master may edit its own bound_ips"
+    );
+
+    for (n, body) in [
+        json!({ "name": "Renamed" }),
+        json!({ "can_manage_keys": false }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let req = signed(
+            peer(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/keys/{master_id}"))
+                    .header("X-API-Key", &master)
+                    .header("Content-Type", "application/json"),
+            ),
+            10 + i64::try_from(n).unwrap(),
             body.to_string(),
         );
-        assert_eq!(send(&app, req).await.0, StatusCode::FORBIDDEN, "and nothing else");
+        assert_eq!(
+            send(&app, req).await.0,
+            StatusCode::FORBIDDEN,
+            "and nothing else"
+        );
     }
 
+    assert_master_cannot_be_rotated_or_deleted(&app, &db, master_id, &master).await;
+}
+
+async fn assert_master_cannot_be_rotated_or_deleted(
+    app: &axum::Router,
+    db: &DatabaseConnection,
+    master_id: Uuid,
+    master: &str,
+) {
     // Rotation and deletion are outside the API surface entirely.
     for (n, path) in [
         format!("/api/keys/{master_id}/rotate"),
@@ -1042,25 +1300,36 @@ async fn s5_master_is_unique_unsettable_immutable_and_undeletable() {
     .enumerate()
     {
         let req = signed(
-            peer(Request::builder().method("POST").uri(path).header("X-API-Key", &master)),
-            20 + n as i64,
+            peer(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("X-API-Key", master),
+            ),
+            20 + i64::try_from(n).unwrap(),
             "",
         );
-        assert_eq!(send(&app, req).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(send(app, req).await.0, StatusCode::FORBIDDEN);
     }
 
     let req = signed(
-        peer(Request::builder()
-            .method("DELETE")
-            .uri(format!("/api/keys/{master_id}"))
-            .header("X-API-Key", &master)),
+        peer(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/keys/{master_id}"))
+                .header("X-API-Key", master),
+        ),
         30,
         "",
     );
-    assert_eq!(send(&app, req).await.0, StatusCode::FORBIDDEN, "the master cannot be deleted");
+    assert_eq!(
+        send(app, req).await.0,
+        StatusCode::FORBIDDEN,
+        "the master cannot be deleted"
+    );
     assert!(
         simply_ip_vault::entities::prelude::ApiKey::find_by_id(master_id)
-            .one(&db)
+            .one(db)
             .await
             .unwrap()
             .is_some()
@@ -1083,12 +1352,16 @@ async fn s5_the_derived_marker_is_unwritable_by_any_client() {
     use sea_orm::ConnectionTrait;
 
     let (db, _app) = setup().await;
-    let (master_id, _master) = key(&db, "Master", true, true, true, true).await;
+    let (master_id, _master) = key(&db, "Master", true, ALL_ADMIN_SCOPES).await;
 
     let attempt = |sql: String| {
         let db = db.clone();
         async move {
-            db.execute_raw(sea_orm::Statement::from_string(db.get_database_backend(), sql)).await
+            db.execute_raw(sea_orm::Statement::from_string(
+                db.get_database_backend(),
+                sql,
+            ))
+            .await
         }
     };
 
@@ -1148,17 +1421,19 @@ async fn s5_the_derived_marker_is_unwritable_by_any_client() {
 #[tokio::test]
 async fn s5_is_master_is_refused_by_the_payload_type_not_by_a_handler() {
     let (db, app) = setup().await;
-    let (_master_id, master) = key(&db, "Master", true, true, true, true).await;
+    let (_master_id, master) = key(&db, "Master", true, ALL_ADMIN_SCOPES).await;
 
     let mut nonce = 0i64;
     let mut post = |uri: &str, method: &str, body: String| {
         nonce += 1;
         signed(
-            peer(Request::builder()
-                .method(method)
-                .uri(uri.to_owned())
-                .header("X-API-Key", &master)
-                .header("Content-Type", "application/json")),
+            peer(
+                Request::builder()
+                    .method(method)
+                    .uri(uri.to_owned())
+                    .header("X-API-Key", &master)
+                    .header("Content-Type", "application/json"),
+            ),
             nonce,
             body,
         )
@@ -1166,8 +1441,14 @@ async fn s5_is_master_is_refused_by_the_payload_type_not_by_a_handler() {
 
     for (label, body) in [
         ("is_master true", json!({ "name": "n", "is_master": true })),
-        ("is_master false", json!({ "name": "n", "is_master": false })),
-        ("an unrelated unknown field", json!({ "name": "n", "can_do_anything": true })),
+        (
+            "is_master false",
+            json!({ "name": "n", "is_master": false }),
+        ),
+        (
+            "an unrelated unknown field",
+            json!({ "name": "n", "can_do_anything": true }),
+        ),
     ] {
         let (status, text) = send(&app, post("/api/keys", "POST", body.to_string())).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{label} must be refused");
@@ -1180,7 +1461,7 @@ async fn s5_is_master_is_refused_by_the_payload_type_not_by_a_handler() {
 
     // The update payload is the other half of "no key-creation or key-update payload may carry it",
     // and it is a separate struct with its own attribute.
-    let (_daughter_id, _daughter) = key(&db, "Daughter", false, false, false, false).await;
+    let (_daughter_id, _daughter) = key(&db, "Daughter", false, NO_ADMIN_SCOPES).await;
     let target = simply_ip_vault::entities::prelude::ApiKey::find()
         .filter(simply_ip_vault::entities::api_key::Column::Name.eq("Daughter"))
         .one(&db)
@@ -1197,7 +1478,10 @@ async fn s5_is_master_is_refused_by_the_payload_type_not_by_a_handler() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(text.contains("unknown field"), "the update payload must refuse it in the type too: {text}");
+    assert!(
+        text.contains("unknown field"),
+        "the update payload must refuse it in the type too: {text}"
+    );
 }
 
 /// **§5.** ADVERSARIAL(§5) — the Master's immutability holds **per row**, not because there happens to
@@ -1217,7 +1501,7 @@ async fn s5_master_immutability_does_not_rest_on_the_uniqueness_constraint() {
     use sea_orm::ConnectionTrait;
 
     let (db, app) = setup().await;
-    let (master_id, master) = key(&db, "Master", true, true, true, true).await;
+    let (master_id, master) = key(&db, "Master", true, ALL_ADMIN_SCOPES).await;
 
     // One authenticated request *before* any tampering, which pins the master exactly as a real boot
     // would (`main.rs` pins before binding the listener). The ordering is not incidental to this
@@ -1226,11 +1510,19 @@ async fn s5_master_immutability_does_not_rest_on_the_uniqueness_constraint() {
     // production cannot reach, and would silently pass for the wrong reason once the demotion in
     // `middleware.rs` started firing.
     let req = signed(
-        peer(Request::builder().uri("/api/auth/me").header("X-API-Key", &master)),
+        peer(
+            Request::builder()
+                .uri("/api/auth/me")
+                .header("X-API-Key", &master),
+        ),
         0,
         "",
     );
-    assert_eq!(send(&app, req).await.0, StatusCode::OK, "the master is master before tampering");
+    assert_eq!(
+        send(&app, req).await.0,
+        StatusCode::OK,
+        "the master is master before tampering"
+    );
 
     // Take the constraint away, then build the forbidden state underneath the application.
     db.execute_raw(sea_orm::Statement::from_string(
@@ -1256,16 +1548,26 @@ async fn s5_master_immutability_does_not_rest_on_the_uniqueness_constraint() {
         for (method, path, body) in [
             ("DELETE", format!("/api/keys/{target}"), String::new()),
             ("POST", format!("/api/keys/{target}/rotate"), String::new()),
-            ("POST", format!("/api/keys/{target}/rotate-secret"), String::new()),
-            ("PUT", format!("/api/keys/{target}"), json!({ "name": "Renamed" }).to_string()),
+            (
+                "POST",
+                format!("/api/keys/{target}/rotate-secret"),
+                String::new(),
+            ),
+            (
+                "PUT",
+                format!("/api/keys/{target}"),
+                json!({ "name": "Renamed" }).to_string(),
+            ),
         ] {
             nonce += 1;
             let req = signed(
-                peer(Request::builder()
-                    .method(method)
-                    .uri(path.clone())
-                    .header("X-API-Key", &master)
-                    .header("Content-Type", "application/json")),
+                peer(
+                    Request::builder()
+                        .method(method)
+                        .uri(path.clone())
+                        .header("X-API-Key", &master)
+                        .header("Content-Type", "application/json"),
+                ),
                 nonce,
                 body,
             );
@@ -1284,7 +1586,11 @@ async fn s5_master_immutability_does_not_rest_on_the_uniqueness_constraint() {
         .all(&db)
         .await
         .unwrap();
-    assert_eq!(masters.len(), 2, "the test's own premise must still hold at the end");
+    assert_eq!(
+        masters.len(),
+        2,
+        "the test's own premise must still hold at the end"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1299,34 +1605,48 @@ async fn s5_master_immutability_does_not_rest_on_the_uniqueness_constraint() {
 #[tokio::test]
 async fn s6_cascade_requires_a_complete_pre_flight_resolution_map() {
     let (db, app) = setup().await;
-    let (_master_id, master) = key(&db, "Master", true, true, true, true).await;
-    let (root_id, _r) = key(&db, "Root", false, true, false, false).await;
-    let (child_id, _c) = key(&db, "Child", false, false, false, false).await;
-    let (grandchild_id, _g) = key(&db, "Grandchild", false, false, false, false).await;
+    let (_master_id, master) = key(&db, "Master", true, ALL_ADMIN_SCOPES).await;
+    let (root_id, _r) = key(&db, "Root", false, KEYS_SCOPE).await;
+    let (child_id, _c) = key(&db, "Child", false, NO_ADMIN_SCOPES).await;
+    let (grandchild_id, _g) = key(&db, "Grandchild", false, NO_ADMIN_SCOPES).await;
     set_parent(&db, child_id, Some(root_id)).await;
     set_parent(&db, grandchild_id, Some(child_id)).await;
 
     let owned = group(&db, "s6-owned", Some(grandchild_id)).await;
-    let (survivor_id, _s) = key(&db, "Survivor", false, false, false, false).await;
+    let (survivor_id, _s) = key(&db, "Survivor", false, NO_ADMIN_SCOPES).await;
 
     // 1. Unresolved inventory refuses, and the payload carries §6's four fields.
     let req = signed(
-        peer(Request::builder()
-            .method("DELETE")
-            .uri(format!("/api/keys/{root_id}"))
-            .header("X-API-Key", &master)),
+        peer(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/keys/{root_id}"))
+                .header("X-API-Key", &master),
+        ),
         1,
         "",
     );
     let (status, body) = send(&app, req).await;
-    assert_eq!(status, StatusCode::CONFLICT, "an unresolved inventory refuses");
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "an unresolved inventory refuses"
+    );
     let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
     let entities = payload["owned_entities"].as_array().unwrap();
-    assert_eq!(entities.len(), 1, "the inventory walks the whole subtree: {body}");
+    assert_eq!(
+        entities.len(),
+        1,
+        "the inventory walks the whole subtree: {body}"
+    );
     for field in ["entity_type", "id", "name", "owner_key_id"] {
         assert!(entities[0].get(field).is_some(), "§6 requires '{field}'");
     }
-    assert_eq!(entities[0]["owner_key_id"], grandchild_id.to_string(), "two levels down");
+    assert_eq!(
+        entities[0]["owner_key_id"],
+        grandchild_id.to_string(),
+        "two levels down"
+    );
 
     // 2. Nothing happened.
     for id in [root_id, child_id, grandchild_id] {
@@ -1341,11 +1661,13 @@ async fn s6_cascade_requires_a_complete_pre_flight_resolution_map() {
 
     // 3. A complete map executes; `reassign` moves rather than destroys; the subtree cascades.
     let req = signed(
-        peer(Request::builder()
-            .method("DELETE")
-            .uri(format!("/api/keys/{root_id}"))
-            .header("X-API-Key", &master)
-            .header("Content-Type", "application/json")),
+        peer(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/keys/{root_id}"))
+                .header("X-API-Key", &master)
+                .header("Content-Type", "application/json"),
+        ),
         2,
         json!({
             "resolutions": [{
@@ -1359,7 +1681,11 @@ async fn s6_cascade_requires_a_complete_pre_flight_resolution_map() {
     );
     assert_eq!(send(&app, req).await.0, StatusCode::NO_CONTENT);
 
-    for (id, label) in [(root_id, "root"), (child_id, "child"), (grandchild_id, "grandchild")] {
+    for (id, label) in [
+        (root_id, "root"),
+        (child_id, "child"),
+        (grandchild_id, "grandchild"),
+    ] {
         assert!(
             simply_ip_vault::entities::prelude::ApiKey::find_by_id(id)
                 .one(&db)
@@ -1374,7 +1700,11 @@ async fn s6_cascade_requires_a_complete_pre_flight_resolution_map() {
         .await
         .unwrap()
         .expect("data is never destroyed implicitly");
-    assert_eq!(surviving.owner_key_id, Some(survivor_id), "reassign moved it");
+    assert_eq!(
+        surviving.owner_key_id,
+        Some(survivor_id),
+        "reassign moved it"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1408,7 +1738,9 @@ async fn s7_the_schema_carries_the_required_constraints_and_indexes() {
         .map(|r| {
             (
                 r.try_get::<String>("", "name").unwrap_or_default(),
-                r.try_get::<Option<String>>("", "sql").unwrap_or_default().unwrap_or_default(),
+                r.try_get::<Option<String>>("", "sql")
+                    .unwrap_or_default()
+                    .unwrap_or_default(),
             )
         })
         .collect();
@@ -1421,7 +1753,10 @@ async fn s7_the_schema_carries_the_required_constraints_and_indexes() {
         "idx-akgp-group_id",
         "idx-akgp-api_key_id-group_id",
     ] {
-        assert!(named(required), "§7 requires an index named '{required}': {indexes:?}");
+        assert!(
+            named(required),
+            "§7 requires an index named '{required}': {indexes:?}"
+        );
     }
 
     // The key-hash lookup column and the master-uniqueness constraint are both backed by *unique*
@@ -1462,9 +1797,11 @@ async fn s7_the_schema_carries_the_required_constraints_and_indexes() {
     // And the constraint actually bites, against an **adversarial** writer — an index that exists but
     // is not unique would satisfy every name check above, and a marker the writer supplies would
     // satisfy even a behavioural check while leaving the bypass wide open.
-    let (_id, _plain) = key(&db, "First master", true, true, true, true).await;
+    let (_id, _plain) = key(&db, "First master", true, ALL_ADMIN_SCOPES).await;
     assert!(
-        adversarial_master_insert(&db, "Second master", "second01").await.is_err(),
+        adversarial_master_insert(&db, "Second master", "second01")
+            .await
+            .is_err(),
         "the uniqueness constraint must refuse a second master written directly at the table"
     );
 }
@@ -1495,7 +1832,7 @@ async fn s7_referential_integrity_holds_where_ddl_cannot_express_it() {
     use sea_orm::ConnectionTrait;
 
     let (db, app) = setup().await;
-    let (_master_id, master) = key(&db, "Master", true, true, true, true).await;
+    let (_master_id, master) = key(&db, "Master", true, ALL_ADMIN_SCOPES).await;
 
     // 1. The premise: these columns really are unconstrained at the schema level.
     for table in ["api_keys", "ip_groups", "webhook_configs"] {
@@ -1523,11 +1860,13 @@ async fn s7_referential_integrity_holds_where_ddl_cannot_express_it() {
     let orphan_group = group(&db, "s7-group", None).await;
     let ghost = Uuid::new_v4();
     let req = signed(
-        peer(Request::builder()
-            .method("PUT")
-            .uri(format!("/api/groups/{orphan_group}/owner"))
-            .header("X-API-Key", &master)
-            .header("Content-Type", "application/json")),
+        peer(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/groups/{orphan_group}/owner"))
+                .header("X-API-Key", &master)
+                .header("Content-Type", "application/json"),
+        ),
         1,
         json!({ "owner_key_id": ghost.to_string() }).to_string(),
     );
@@ -1541,17 +1880,19 @@ async fn s7_referential_integrity_holds_where_ddl_cannot_express_it() {
 
     // 3. No orphans after a real cascade. The subtree is built with lineage, given an owned resource,
     // and deleted with a complete resolution map — the path that rewrites the most references at once.
-    let (root_id, _r) = key(&db, "s7-root", false, true, false, false).await;
-    let (child_id, _c) = key(&db, "s7-child", false, false, false, false).await;
+    let (root_id, _r) = key(&db, "s7-root", false, KEYS_SCOPE).await;
+    let (child_id, _c) = key(&db, "s7-child", false, NO_ADMIN_SCOPES).await;
     set_parent(&db, child_id, Some(root_id)).await;
     let owned = group(&db, "s7-owned", Some(child_id)).await;
 
     let req = signed(
-        peer(Request::builder()
-            .method("DELETE")
-            .uri(format!("/api/keys/{root_id}"))
-            .header("X-API-Key", &master)
-            .header("Content-Type", "application/json")),
+        peer(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/keys/{root_id}"))
+                .header("X-API-Key", &master)
+                .header("Content-Type", "application/json"),
+        ),
         2,
         json!({
             "resolutions": [{

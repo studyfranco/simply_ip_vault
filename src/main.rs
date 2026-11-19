@@ -1,12 +1,16 @@
+//! Vault service startup and shutdown.
+
 #[cfg(all(target_os = "linux", not(target_env = "msvc")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
+};
+use simply_ip_vault::{api, create_app, entities, setup_state};
 use std::net::SocketAddr;
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use tokio::net::TcpListener;
 use uuid::Uuid;
-use simply_ip_vault::{create_app, setup_state, api, entities};
 
 /// Waits for a Ctrl+C or (on Unix) SIGTERM signal so `axum::serve` can shut down gracefully.
 ///
@@ -37,8 +41,8 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+        () = ctrl_c => {},
+        () = terminate => {},
     }
     tracing::info!("Received shutdown signal.");
 }
@@ -70,7 +74,9 @@ async fn bootstrap_master_key(
         return Ok(());
     }
 
-    let plaintext_key = match simply_ip_vault::config::get_secret_or_env(simply_ip_vault::config::INITIAL_MASTER_KEY_ENV) {
+    let plaintext_key = match simply_ip_vault::config::get_secret_or_env(
+        simply_ip_vault::config::INITIAL_MASTER_KEY_ENV,
+    ) {
         Some(fixed_key) if !fixed_key.is_empty() => {
             // Strict, and fatal. Until this check existed the variable accepted any non-empty
             // string, with the warning below as the only objection — a safeguard that reads like
@@ -96,17 +102,18 @@ async fn bootstrap_master_key(
     };
     // The signing secret follows the same rule as the key itself: deterministic when explicitly
     // provided for test/CI bootstrap, random otherwise.
-    let signing_secret = match simply_ip_vault::config::get_secret_or_env("INITIAL_MASTER_SIGNING_SECRET") {
-        Some(fixed_secret) if !fixed_secret.is_empty() => {
-            tracing::warn!(
-                "INITIAL_MASTER_SIGNING_SECRET is set: using the provided value as the master \
+    let signing_secret =
+        match simply_ip_vault::config::get_secret_or_env("INITIAL_MASTER_SIGNING_SECRET") {
+            Some(fixed_secret) if !fixed_secret.is_empty() => {
+                tracing::warn!(
+                    "INITIAL_MASTER_SIGNING_SECRET is set: using the provided value as the master \
                  key's HMAC signing secret instead of generating a random one. Intended for \
                  deterministic test/CI bootstrap only — do not set this in a real deployment."
-            );
-            fixed_secret
-        }
-        _ => simply_ip_vault::crypto::generate_signing_secret(),
-    };
+                );
+                fixed_secret
+            }
+            _ => simply_ip_vault::crypto::generate_signing_secret(),
+        };
 
     let key_hash = api::hash_key(&plaintext_key);
     let stored_signing_secret = cipher.seal(&signing_secret)?;
@@ -147,21 +154,29 @@ async fn bootstrap_master_key(
 
     model.insert(db).await?;
 
+    print_bootstrap_credentials(&plaintext_key, &signing_secret, &bound_ip);
+
+    Ok(())
+}
+
+fn print_bootstrap_credentials(plaintext_key: &str, signing_secret: &str, bound_ip: &str) {
+    use std::{fmt::Write as _, io::Write as _};
+
     // The box is drawn against an explicit inner width rather than hardcoded runs of ═, so the
     // borders stay aligned around a 64-hex-char credential (the previous fixed layout did not).
     const W: usize = 82;
     let border = "═".repeat(W);
-    let body: String = [
+    let mut body = String::new();
+    for row in [
         format!("X-API-Key      : {plaintext_key}"),
         format!("Signing secret : {signing_secret}"),
         format!("Bound IPs      : {bound_ip}"),
         String::new(),
         "Both values are needed to sign requests (X-Timestamp + X-Signature-256).".to_owned(),
         "They will NOT be shown again — store them securely!".to_owned(),
-    ]
-    .iter()
-    .map(|row| format!("║ {row:<W$} ║\n"))
-    .collect();
+    ] {
+        let _ = writeln!(body, "║ {row:<W$} ║");
+    }
 
     tracing::info!(
         "\n╔{border}╗\n║ {:<W$} ║\n╠{border}╣\n{body}╚{border}╝",
@@ -172,11 +187,8 @@ async fn bootstrap_master_key(
     // right after this point (as scripts/test_e2e.sh used to, before it switched to
     // INITIAL_MASTER_KEY) could otherwise see a truncated or missing banner for a short window.
     // Flushing explicitly makes the banner's appearance in the log deterministic.
-    use std::io::Write;
     std::io::stdout().flush().ok();
     std::io::stderr().flush().ok();
-
-    Ok(())
 }
 
 /// Startup canary for `VAULT_ENCRYPTION_KEY`: proves the configured key is the one
@@ -197,7 +209,7 @@ async fn verify_encryption_key(
     cipher: &simply_ip_vault::crypto::SecretCipher,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use entities::{api_key, prelude::ApiKey};
-    use simply_ip_vault::crypto::{check_key_canary, KeyCanary};
+    use simply_ip_vault::crypto::{KeyCanary, check_key_canary};
 
     let sample = ApiKey::find()
         .filter(api_key::Column::SigningSecret.is_not_null())
@@ -237,20 +249,13 @@ async fn verify_encryption_key(
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dotenvy::dotenv().ok();
-
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
-    let db_url = simply_ip_vault::config::get_secret_or_env("DATABASE_URL")
-        .unwrap_or_else(|| "sqlite://simply_ip_vault.db?mode=rwc".to_owned());
-
+fn load_security_config() -> Result<
+    (
+        simply_ip_vault::crypto::SecretCipher,
+        simply_ip_vault::config::TrustedProxies,
+    ),
+    Box<dyn std::error::Error>,
+> {
     // Built once, here, and carried in `AppState` from now on — never re-read per request.
     //
     // A malformed key stops startup rather than silently degrading to writing signing secrets in
@@ -296,6 +301,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             trusted_proxies.matchers()
         );
     }
+
+    Ok((cipher, trusted_proxies))
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dotenvy::dotenv().ok();
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let db_url = simply_ip_vault::config::get_secret_or_env("DATABASE_URL")
+        .unwrap_or_else(|| "sqlite://simply_ip_vault.db?mode=rwc".to_owned());
+
+    let (cipher, trusted_proxies) = load_security_config()?;
 
     // Two-phase: migrations run to completion, on their own single-connection pool, and that pool
     // is closed — all before the application pool below is ever opened. See `src/db.rs`'s module
@@ -380,6 +404,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     });
 
+    // Separate retention sweep for audit logs (`AUDIT_LOG_RETENTION_DAYS`, default 365).
+    let (audit_retention_tx, audit_retention_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let audit_retention_db = db.clone();
+    let audit_retention_handle = tokio::spawn(async move {
+        simply_ip_vault::retention::run_audit_log_retention_worker(
+            audit_retention_db,
+            audit_retention_rx,
+        )
+        .await;
+    });
+
     let app = create_app(state);
 
     let addr = simply_ip_vault::config::resolve_bind_addr();
@@ -399,10 +434,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(tx);
     drop(retention_tx);
     drop(exec_retention_tx);
+    drop(audit_retention_tx);
     drop(maint_tx);
     let _ = worker_handle.await;
     let _ = retention_handle.await;
     let _ = exec_retention_handle.await;
+    let _ = audit_retention_handle.await;
     let _ = maint_handle.await;
 
     tracing::info!("Graceful shutdown complete.");
@@ -418,8 +455,12 @@ mod tests {
     /// `sqlite::memory:` — none of the pragmas `db::connect` applies matter here, only that
     /// migrations have run and a row exists to check the canary against.
     async fn seeded_db() -> DatabaseConnection {
-        let db = Database::connect("sqlite::memory:").await.expect("in-memory sqlite opens");
-        simply_ip_vault::db::run_migrations(&db).await.expect("every migration applies");
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite opens");
+        simply_ip_vault::db::run_migrations(&db)
+            .await
+            .expect("every migration applies");
         db
     }
 
@@ -478,7 +519,10 @@ mod tests {
         insert_key_with_secret(&db, &cipher, "the-real-secret").await;
 
         let result = verify_encryption_key(&db, &cipher).await;
-        assert!(result.is_ok(), "the correct key must not be refused: {result:?}");
+        assert!(
+            result.is_ok(),
+            "the correct key must not be refused: {result:?}"
+        );
     }
 
     /// A fresh database has nothing sealed to check against yet. The canary must not treat that as
@@ -489,7 +533,10 @@ mod tests {
         let cipher = SecretCipher::from_hex_key(KEY_A).expect("valid key");
 
         let result = verify_encryption_key(&db, &cipher).await;
-        assert!(result.is_ok(), "an empty database must not fail the canary: {result:?}");
+        assert!(
+            result.is_ok(),
+            "an empty database must not fail the canary: {result:?}"
+        );
     }
 
     /// Switching to `Plaintext` (unsetting `VAULT_ENCRYPTION_KEY`) against a database holding a
@@ -518,7 +565,9 @@ mod tests {
         insert_key_with_secret(&db, &written_with, "the-real-secret").await;
 
         let configured_with = SecretCipher::from_hex_key(KEY_B).expect("valid key");
-        let err = verify_encryption_key(&db, &configured_with).await.unwrap_err();
+        let err = verify_encryption_key(&db, &configured_with)
+            .await
+            .unwrap_err();
 
         assert!(
             err.downcast_ref::<CryptoError>().is_some(),

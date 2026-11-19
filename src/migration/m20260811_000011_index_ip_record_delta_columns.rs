@@ -66,7 +66,12 @@ impl MigrationTrait for Migration {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
-            .drop_index(Index::drop().name(UPDATED_AT_INDEX).table(IpRecords::Table).to_owned())
+            .drop_index(
+                Index::drop()
+                    .name(UPDATED_AT_INDEX)
+                    .table(IpRecords::Table)
+                    .to_owned(),
+            )
             .await
     }
 }

@@ -24,7 +24,7 @@ pub struct Model {
     /// `"API_KEY_ONLY"`, `"NONE"`. See [`AuthMode`], which is the parsed form; this column stores
     /// its string representation.
     ///
-    /// Stored as a plain `String` rather than a SeaORM enum column to stay SQL-agnostic per
+    /// Stored as a plain `String` rather than a `SeaORM` enum column to stay SQL-agnostic per
     /// `AGENT.MD` (a native `ENUM` type is PostgreSQL/MySQL-specific and has no SQLite equivalent).
     /// Values are validated at the API boundary, and [`AuthMode::from_stored`] fails safe on
     /// anything unrecognized.
@@ -67,7 +67,7 @@ pub struct Model {
     pub is_active: bool,
     /// When `true`, `$target_address` and `$ip` emit the `/48`-normalized IPv6 subnet for
     /// non-whitelist bare host IPv6 bans (e.g. for firewall hooks like `launch.block.ip`).
-    /// When `false` (default), they emit the exact full address (e.g. for AbuseIPDB reporting).
+    /// When `false` (default), they emit the exact full address (e.g. for `AbuseIPDB` reporting).
     pub send_normalized_ipv6: bool,
     /// Comma-separated subset of `IP_ADD`/`IP_UPDATE`/`IP_DELETE` this webhook should fire for.
     /// `None` means all events (the historical, pre-filtering behavior).
@@ -171,6 +171,7 @@ impl AuthMode {
     ];
 
     /// Parses a caller-supplied value, accepting any casing. `None` if unrecognized.
+    #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_uppercase().as_str() {
             Self::CANONICAL_V1 => Some(Self::CanonicalV1),
@@ -188,6 +189,7 @@ impl AuthMode {
     /// silently dropping the event or panicking inside the worker. The fallback is `HMAC_ONLY`, not
     /// the column default `CANONICAL_V1` — an unreadable mode must resolve to *more* signing, never
     /// less, and never to [`Self::None`].
+    #[must_use]
     pub fn from_stored(value: &str) -> Self {
         Self::parse(value).unwrap_or_else(|| {
             tracing::warn!(
@@ -200,6 +202,7 @@ impl AuthMode {
     }
 
     /// The canonical string representation, for storage and API responses.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::CanonicalV1 => Self::CANONICAL_V1,
@@ -210,6 +213,7 @@ impl AuthMode {
     }
 
     /// Whether this mode computes an HMAC, and therefore requires a non-empty `secret_token`.
+    #[must_use]
     pub fn requires_secret(self) -> bool {
         matches!(self, Self::CanonicalV1 | Self::HmacOnly)
     }
@@ -223,6 +227,7 @@ impl AuthMode {
     /// signature-only authentication has said it does not want a bearer credential, and shipping one
     /// anyway would put a reusable secret on the wire for a peer that never asked for it and may not
     /// protect it.
+    #[must_use]
     pub fn sends_api_key(self) -> bool {
         matches!(self, Self::CanonicalV1 | Self::ApiKeyOnly)
     }

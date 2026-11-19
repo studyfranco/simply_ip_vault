@@ -23,7 +23,7 @@ use sea_orm_migration::prelude::*;
 
 /// Identifiers this migration touches. `Table` is re-declared locally rather than imported from the
 /// initial-schema migration so that module can stay private; `DeriveIden` maps the variants to the
-/// same snake_case names, so they address the same table.
+/// same `snake_case` names, so they address the same table.
 #[derive(DeriveIden)]
 enum ApiKeyGroupPermissions {
     /// The `api_key_group_permissions` table.

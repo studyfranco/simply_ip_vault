@@ -11,9 +11,9 @@
 //! [`StrictJson`] is what turns that refusal into the same `400` the handler used to produce.
 
 use axum::{
+    Json,
     body::Bytes,
     extract::{FromRequest, Request, rejection::JsonRejection},
-    Json,
 };
 use serde::de::DeserializeOwned;
 
@@ -61,12 +61,13 @@ where
             Ok(Json(value)) => Ok(Self(value)),
             // `body_text` is the human-readable form axum would have rendered itself, so the caller
             // gets serde's field-level detail rather than a generic "invalid body".
-            Err(rejection @ (JsonRejection::JsonDataError(_) | JsonRejection::JsonSyntaxError(_))) => {
-                Err(AppError::InvalidInput(JsonRejection::body_text(&rejection)))
-            }
-            Err(other) => {
-                Err(AppError::BodyRejected(other.status(), JsonRejection::body_text(&other)))
-            }
+            Err(
+                rejection @ (JsonRejection::JsonDataError(_) | JsonRejection::JsonSyntaxError(_)),
+            ) => Err(AppError::InvalidInput(JsonRejection::body_text(&rejection))),
+            Err(other) => Err(AppError::BodyRejected(
+                other.status(),
+                JsonRejection::body_text(&other),
+            )),
         }
     }
 }
@@ -110,9 +111,9 @@ where
     type Rejection = AppError;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let bytes = Bytes::from_request(req, state)
-            .await
-            .map_err(|rejection| AppError::BodyRejected(rejection.status(), rejection.body_text()))?;
+        let bytes = Bytes::from_request(req, state).await.map_err(|rejection| {
+            AppError::BodyRejected(rejection.status(), rejection.body_text())
+        })?;
 
         if bytes.is_empty() {
             return Ok(Self(T::default()));

@@ -338,7 +338,7 @@ Parameters may arrive via **query string, JSON body, or both**. Query values win
 DELETE /api/ips
 Content-Type: application/json
 
-{"target_address": "192.0.2.10", "group_name": "fail2ban"}
+{"target_address": "8.8.4.4", "group_name": "fail2ban"}
 ```
 
 | Name | Type | Req. | Description |
@@ -359,6 +359,7 @@ extend the retention window.
 | `400` | `target_address` missing, or invalid JSON |
 | `403` | No `can_delete` on the group; the membership is `is_locked`; or `hard=true` from a non-master |
 | `404` | No such group, address, or membership in that group |
+| `409` | The ban overlaps active protected whitelist CIDRs. The error names the matching groups |
 
 Enqueues an `IP_DELETE` webhook event after the transaction commits, for this group only.
 
@@ -373,7 +374,7 @@ Enqueues an `IP_DELETE` webhook event after the transaction commits, for this gr
 POST /api/ips/restore
 Content-Type: application/json
 
-{"target_address": "192.0.2.10", "group_name": "fail2ban"}
+{"target_address": "8.8.4.4", "group_name": "fail2ban"}
 ```
 
 Clears `is_deleted`, `deleted_at` and `deleted_by` on that membership, so it is indistinguishable
@@ -382,9 +383,10 @@ from one never deleted.
 | Status | Body / meaning |
 | :--- | :--- |
 | `200` | `{"target_address":"...","group_name":"...","is_deleted":false,"restored":true}` |
-| `400` | The membership is not deleted; nothing to restore |
+| `400` | The membership is already active, or the ban violates the group address policy |
 | `403` | Caller is not master |
 | `404` | No such group, address, or membership in that group |
+| `409` | The ban overlaps active protected whitelist CIDRs. The error names the matching groups |
 
 > Master-only even though a delegated key may have caused the deletion: the point of the trash is
 > that recovering from a compromised key does not depend on that same key's authority.
@@ -429,18 +431,23 @@ existing address updates `last_seen_at` rather than failing, and **resurrects** 
 | Status | Meaning |
 | :--- | :--- |
 | `200` | Registered |
-| `400` | Invalid IP/CIDR; both or neither group identifier; **banning loopback/private/link-local**; group-type mismatch (`/white` into a banlist or vice versa) |
+| `400` | Invalid IP/CIDR; both or neither group identifier; banlist address policy violation; group-type mismatch (`/white` into a banlist or vice versa) |
 | `403` | No `can_write`; no access to the group; group absent and no `can_create_groups`; record `is_locked` |
 | `404` | `group_id` supplied but no such group |
+| `409` | The ban overlaps active protected whitelist CIDRs |
 
 Enqueues an `IP_ADD` webhook event when the group **membership** is new, `IP_UPDATE` otherwise — keyed
 on the membership, not the record row, so an address already banned in Group A that is added to
 Group B is an `IP_ADD` from Group B's perspective.
 
-> **Banlist address validation.** Loopback, unspecified, RFC 1918 / link-local IPv4, and
-> link-local / unique-local IPv6 are refused for banlist targets — a rule covering `127.0.0.1` or
-> `10.0.0.0/8` propagates to every downstream firewall and can cut a fleet off from itself.
-> Whitelists are exempt by construction.
+Banlists can opt into RFC1918, CGNAT, and IPv6 ULA ranges with `allow_private_ips`. Loopback,
+unspecified, broadcast, link-local, multicast, documentation, benchmarking, IETF protocol,
+reserved IPv4, IPv6 discard, and well-known NAT64 ranges remain blocked, including mapped IPv6
+forms of blocked IPv4 ranges. These checks cover the entire requested CIDR.
+
+A ban returns `409 Conflict` with the matching whitelist group names if the requested or stored
+CIDR overlaps an active membership in a configured exclusion. This includes bans stored as IPv6
+`/48`s. Soft-deleted whitelist memberships do not block bans.
 
 ### `POST /api/records/batch`
 
@@ -475,13 +482,17 @@ Each `records[]` entry (`BatchRecordInput`):
 
 ```json
 { "created": 0, "updated": 0, "restored": 0,
-  "locked_skipped": 0, "soft_deleted": 0, "linked": 0 }
+  "locked_skipped": 0, "soft_deleted": 0, "linked": 0, "skipped_excluded": 0 }
 ```
 
 | Status | Meaning |
 | :--- | :--- |
 | `400` | Batch over 10 000; invalid IP/CIDR; duplicate address after canonicalization; banlist address rule violated |
 | `403` | No `can_write`; `full_replace` without `can_delete`; group absent and no `can_create_groups` |
+
+A banlist batch skips entries that overlap configured active whitelist ranges and continues with the
+remaining entries. `skipped_excluded` is always returned, including when zero, and is recorded in the
+`batch_records_updated` audit details. For `full_replace`, skipped entries count as omissions.
 
 **Webhook dispatch.** One event per record outcome — `IP_ADD` when the membership is new,
 `IP_UPDATE` otherwise, and `IP_DELETE` for each record the `full_replace` sweep soft-deletes. Events
@@ -738,7 +749,7 @@ name**.
 
 ## 8. IP groups
 
-All four group routes carry an `/ip_groups` alias registered inside the same authenticated nest, for
+All group routes carry an `/ip_groups` alias registered inside the same authenticated nest, for
 companion agents that spell it that way. The alias is byte-identical in behavior — same handler, same
 auth.
 
@@ -753,11 +764,13 @@ auth.
 | Any other key | only groups where it holds `can_read` **or** `can_write` **or** `can_delete` **or** `can_manage` |
 | A key with no permission rows | `200` with `[]` — **never `403`** |
 
-**Response `200`** — array of `ip_group::Model`:
+**Response `200`** — array of `GroupSummary`:
 
 ```json
 [{ "id": "uuid", "name": "fail2ban", "group_type": "banlist",
-   "description": null, "owner_key_id": "uuid" | null, "created_at": "..." }]
+   "description": null, "owner_key_id": null, "created_at": "...",
+   "allow_private_ips": false, "excluded_whitelist_ids": ["uuid"],
+   "excluded_whitelist_names": ["trusted-network"] }]
 ```
 
 > The `can_manage` arm is load-bearing: the least-privilege rule only forces `can_read` for
@@ -777,11 +790,14 @@ auth.
 | :--- | :--- | :--- | :--- | :--- |
 | `name` | string | **yes** | — | Unique across the installation |
 | `group_type` | string | no | `banlist` | `whitelist`, or **anything else → `banlist`**. Never rejected over this field |
+| `allow_private_ips` | bool | no | `false` | Permit bans of RFC1918, CGNAT, and IPv6 ULA ranges |
+| `excluded_whitelist_ids` | UUID array | no | `[]` | Protect active memberships of these whitelist groups |
 
-**Response `200`:** `{"id":"uuid","name":"fail2ban","group_type":"banlist"}`
+**Response `200`** returns a `GroupSummary`, with exclusion IDs and names in matching order.
 
 | Status | Meaning |
 | :--- | :--- |
+| `400` | A whitelist requested private-IP bans or exclusions, or an exclusion ID does not identify a whitelist |
 | `403` | Neither master nor `can_create_groups` |
 | `409` | A group with that name already exists |
 
@@ -791,6 +807,28 @@ that creates a group can use it but cannot delegate access until a Master grants
 `owner_key_id` is set to the creator (`null` when a master creates it, since `null` already means
 master-only).
 
+### `PUT /api/groups/{id}` · alias `PUT /api/ip_groups/{id}`
+
+**Handler** `api::update_ip_group`. Master or the group's `owner_key_id` may update the group.
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `name` | string | New unique name |
+| `allow_private_ips` | bool | Enable or disable private-range bans |
+| `excluded_whitelist_ids` | UUID array | Atomically replace exclusions. An empty array clears them |
+
+All fields are optional. Omitted fields retain their current values. Exclusion IDs are deduplicated
+and must identify existing whitelist groups. A group cannot reference itself. Whitelist groups can
+use only `false` and an empty exclusion list. Successful updates write a `GROUP_UPDATE` audit entry.
+
+| Status | Meaning |
+| :--- | :--- |
+| `200` | Updated `GroupSummary` |
+| `400` | Invalid policy, UUID, or request fields |
+| `403` | Caller is neither master nor group owner |
+| `404` | Group does not exist |
+| `409` | A group with that name already exists |
+
 ### `DELETE /api/groups/{id}` · alias `DELETE /api/ip_groups/{id}`
 
 **Handler:** `api::delete_ip_group` · **Auth:** **§3 lifecycle** — Master **or** the group's
@@ -798,7 +836,7 @@ master-only).
 
 | Status | Meaning |
 | :--- | :--- |
-| `204` | Deleted (cascades to memberships, permission rows, and webhooks on this group) |
+| `204` | Deleted (cascades to memberships, permission rows, webhooks, and exclusions referencing this group) |
 | `403` | Neither master nor owner |
 | `404` | No such group |
 
@@ -1133,7 +1171,7 @@ survive it — an audit row that cannot say who acted is not an audit row.
 **Known action values** (non-exhaustive — any mutating action may log its own type):
 `IP_ADD`, `IP_UPDATE`, `IP_DELETE`, `IP_SOFT_DELETE`, `IP_HARD_DELETE`, `IP_RESTORE`, `IP_PURGE`,
 `batch_records_updated`, `KEY_CREATE`, `KEY_UPDATE`, `KEY_DELETE`, `KEY_ROTATE`, `KEY_SECRET_ROTATE`,
-`KEY_PERM_UPDATE`, `KEY_PERM_REVOKE`, `GROUP_CREATE`, `GROUP_DELETE`, `GROUP_OWNER_REASSIGN`,
+`KEY_PERM_UPDATE`, `KEY_PERM_REVOKE`, `GROUP_CREATE`, `GROUP_UPDATE`, `GROUP_DELETE`, `GROUP_OWNER_REASSIGN`,
 `WEBHOOK_CREATE`, `WEBHOOK_UPDATE`, `WEBHOOK_DELETE`, `WEBHOOK_TEST`, `WEBHOOK_CLONE`,
 `WEBHOOK_OWNER_REASSIGN`, `WEBHOOK_EXECUTION_DELETE`.
 
@@ -1179,6 +1217,7 @@ fallback, specifically so a file dropped into `static/` could never shadow a pro
 | 19 | DELETE | `/api/keys/{id}/permissions/{group_identifier}` | — | R2 conjunction |
 | 20 | GET | `/api/groups` | `/api/ip_groups` | **any key**, read-scoped |
 | 21 | POST | `/api/groups` | `/api/ip_groups` | Master or `can_create_groups` |
+| 22a | PUT | `/api/groups/{id}` | `/api/ip_groups/{id}` | Master or owner (§3) |
 | 22 | DELETE | `/api/groups/{id}` | `/api/ip_groups/{id}` | Master or owner (§3) |
 | 23 | PUT | `/api/groups/{id}/owner` | `/api/ip_groups/{id}/owner` | Master |
 | 24 | POST | `/api/webhooks` | — | `can_manage_webhooks` + `can_read` on group |

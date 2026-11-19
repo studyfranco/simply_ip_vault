@@ -147,7 +147,7 @@ impl ReplayGuard {
     /// nothing and keeps a future caller from switching the guard off, or turning the map into an
     /// unbounded allocation, by passing a nonsensical window.
     fn new(window_seconds: i64) -> Self {
-        let window = Duration::from_secs(window_seconds.clamp(1, 3600) as u64);
+        let window = Duration::from_secs(window_seconds.clamp(1, 3600).unsigned_abs());
         let prune_interval = window / PRUNE_INTERVAL_DIVISOR;
         let capacity_backoff = window / CAPACITY_BACKOFF_DIVISOR;
         let now = Instant::now();
@@ -189,7 +189,10 @@ impl ReplayGuard {
             return false;
         };
 
-        let id = SignatureId { key_id, digest: digest.to_vec() };
+        let id = SignatureId {
+            key_id,
+            digest: digest.to_vec(),
+        };
         match seen.get(&id) {
             // An entry that has outlived the window is stale bookkeeping the sweep has not reached
             // yet, not a replay — its timestamp could no longer pass the freshness check anyway.
@@ -221,7 +224,7 @@ impl ReplayGuard {
     /// out of release builds rather than left as public surface no caller uses.
     #[cfg(test)]
     fn tracked(&self) -> usize {
-        self.seen.lock().map(|seen| seen.len()).unwrap_or(0)
+        self.seen.lock().map_or(0, |seen| seen.len())
     }
 
     /// Drops expired entries when a sweep is due, or when the map has reached its ceiling.
@@ -232,8 +235,10 @@ impl ReplayGuard {
     /// The two locks are taken strictly one after the other, never nested, so this cannot deadlock
     /// against [`ReplayGuard::check_and_record`].
     fn prune_if_due(&self, now: Instant) {
-        let over_capacity =
-            self.seen.lock().is_ok_and(|seen| seen.len() >= MAX_TRACKED_SIGNATURES);
+        let over_capacity = self
+            .seen
+            .lock()
+            .is_ok_and(|seen| seen.len() >= MAX_TRACKED_SIGNATURES);
 
         {
             let Ok(mut schedule) = self.schedule.lock() else {
@@ -284,14 +289,29 @@ mod tests {
         let guard = ReplayGuard::default();
         let key = Uuid::new_v4();
 
-        assert!(guard.check_and_record(key, &digest(1)), "the first use is the legitimate request");
-        assert!(!guard.check_and_record(key, &digest(1)), "the same signature is a replay");
-        assert!(!guard.check_and_record(key, &digest(1)), "...and stays one on every later attempt");
+        assert!(
+            guard.check_and_record(key, &digest(1)),
+            "the first use is the legitimate request"
+        );
+        assert!(
+            !guard.check_and_record(key, &digest(1)),
+            "the same signature is a replay"
+        );
+        assert!(
+            !guard.check_and_record(key, &digest(1)),
+            "...and stays one on every later attempt"
+        );
 
         // Unrecord allows retrying the request after a transient failure
         guard.unrecord(key, &digest(1));
-        assert!(guard.check_and_record(key, &digest(1)), "unrecorded signature can be used again");
-        assert!(!guard.check_and_record(key, &digest(1)), "and is protected against replays once again");
+        assert!(
+            guard.check_and_record(key, &digest(1)),
+            "unrecorded signature can be used again"
+        );
+        assert!(
+            !guard.check_and_record(key, &digest(1)),
+            "and is protected against replays once again"
+        );
     }
 
     #[tokio::test]
@@ -300,7 +320,10 @@ mod tests {
         let (key, other_key) = (Uuid::new_v4(), Uuid::new_v4());
 
         assert!(guard.check_and_record(key, &digest(1)));
-        assert!(guard.check_and_record(key, &digest(2)), "a different signature is not a replay");
+        assert!(
+            guard.check_and_record(key, &digest(2)),
+            "a different signature is not a replay"
+        );
         // The same digest under a different key must not read as reuse — otherwise one tenant's
         // traffic could deny another's.
         assert!(guard.check_and_record(other_key, &digest(1)));
@@ -336,7 +359,10 @@ mod tests {
         let key = Uuid::new_v4();
 
         assert!(guard.check_and_record(key, &digest(1)));
-        assert!(!guard.check_and_record(key, &digest(1)), "still inside the window");
+        assert!(
+            !guard.check_and_record(key, &digest(1)),
+            "still inside the window"
+        );
 
         tokio::time::advance(Duration::from_secs(301)).await;
 
@@ -361,7 +387,11 @@ mod tests {
         tokio::time::advance(Duration::from_secs(301)).await;
         assert!(guard.check_and_record(key, &digest(200)));
 
-        assert_eq!(guard.tracked(), 1, "the sweep released the expired entries rather than stacking");
+        assert_eq!(
+            guard.tracked(),
+            1,
+            "the sweep released the expired entries rather than stacking"
+        );
     }
 
     /// Amortization: inside one interval the map is not rescanned, so expired entries linger in
@@ -410,7 +440,10 @@ mod tests {
             let expires_at = Instant::now() + Duration::from_secs(300);
             for n in 0..MAX_TRACKED_SIGNATURES {
                 seen.insert(
-                    SignatureId { key_id: key, digest: n.to_le_bytes().to_vec() },
+                    SignatureId {
+                        key_id: key,
+                        digest: n.to_le_bytes().to_vec(),
+                    },
                     expires_at,
                 );
             }
@@ -429,7 +462,10 @@ mod tests {
             !guard.check_and_record(key, 0usize.to_le_bytes().as_ref()),
             "capacity pressure must never make an already-used signature replayable"
         );
-        assert!(!guard.check_and_record(key, &digest(0xFF)), "the new entry is enforced too");
+        assert!(
+            !guard.check_and_record(key, &digest(0xFF)),
+            "the new entry is enforced too"
+        );
     }
 
     /// The other half of the capacity contract: once entries genuinely expire, the sweep reclaims
@@ -444,7 +480,10 @@ mod tests {
             let expires_at = Instant::now() + Duration::from_secs(300);
             for n in 0..MAX_TRACKED_SIGNATURES {
                 seen.insert(
-                    SignatureId { key_id: key, digest: n.to_le_bytes().to_vec() },
+                    SignatureId {
+                        key_id: key,
+                        digest: n.to_le_bytes().to_vec(),
+                    },
                     expires_at,
                 );
             }
@@ -453,6 +492,10 @@ mod tests {
         tokio::time::advance(Duration::from_secs(301)).await;
         assert!(guard.check_and_record(key, &digest(1)));
 
-        assert_eq!(guard.tracked(), 1, "the sweep reclaimed the whole saturated map");
+        assert_eq!(
+            guard.tracked(),
+            1,
+            "the sweep reclaimed the whole saturated map"
+        );
     }
 }

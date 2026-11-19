@@ -117,5 +117,8 @@ pub async fn readiness_check(State(state): State<AppState>) -> impl IntoResponse
         );
     }
 
-    (StatusCode::OK, Json(json!({ "status": "ready", "database": "up" })))
+    (
+        StatusCode::OK,
+        Json(json!({ "status": "ready", "database": "up" })),
+    )
 }

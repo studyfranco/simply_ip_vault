@@ -64,13 +64,26 @@ impl MigrationTrait for Migration {
                 Table::create()
                     .table(WebhookExecutions::Table)
                     .if_not_exists()
-                    .col(ColumnDef::new(WebhookExecutions::Id).uuid().not_null().primary_key())
-                    .col(ColumnDef::new(WebhookExecutions::WebhookId).uuid().not_null())
+                    .col(
+                        ColumnDef::new(WebhookExecutions::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(WebhookExecutions::WebhookId)
+                            .uuid()
+                            .not_null(),
+                    )
                     // `IP_ADD`/`IP_UPDATE`/`IP_DELETE` (the same vocabulary `webhook_configs.events`
                     // and `audit_logs.action` already use) plus `TEST` for a live "Test Webhook"
                     // dispatch (`api::webhooks::test_webhook`) — never filtered against a fixed
                     // enum, matching every other free-text action/event column in this schema.
-                    .col(ColumnDef::new(WebhookExecutions::EventType).string().not_null())
+                    .col(
+                        ColumnDef::new(WebhookExecutions::EventType)
+                            .string()
+                            .not_null(),
+                    )
                     // NULL means the attempt never received an HTTP response at all — a network
                     // error, a timeout, a DNS failure — as distinct from a response that carried a
                     // status this service doesn't treat as success. `is_success` is the column to
@@ -78,14 +91,26 @@ impl MigrationTrait for Migration {
                     // itself informative (see `dispatch::DispatchOutcome`, whose `status: Option<u16>`
                     // this column mirrors exactly).
                     .col(ColumnDef::new(WebhookExecutions::StatusCode).integer())
-                    .col(ColumnDef::new(WebhookExecutions::IsSuccess).boolean().not_null())
+                    .col(
+                        ColumnDef::new(WebhookExecutions::IsSuccess)
+                            .boolean()
+                            .not_null(),
+                    )
                     // Wall-clock time of the one HTTP attempt this row records, not a cumulative
                     // total across retries — each retry attempt is its own row (see `dispatch.rs`'s
                     // module header), so summing this column across a delivery's rows is how a
                     // caller gets the cumulative figure if they want it.
-                    .col(ColumnDef::new(WebhookExecutions::DurationMs).integer().not_null())
+                    .col(
+                        ColumnDef::new(WebhookExecutions::DurationMs)
+                            .integer()
+                            .not_null(),
+                    )
                     .col(ColumnDef::new(WebhookExecutions::ErrorMessage).text())
-                    .col(ColumnDef::new(WebhookExecutions::CreatedAt).date_time().not_null())
+                    .col(
+                        ColumnDef::new(WebhookExecutions::CreatedAt)
+                            .date_time()
+                            .not_null(),
+                    )
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk-webhook_executions-webhook_id")
@@ -137,6 +162,8 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager.drop_table(Table::drop().table(WebhookExecutions::Table).to_owned()).await
+        manager
+            .drop_table(Table::drop().table(WebhookExecutions::Table).to_owned())
+            .await
     }
 }

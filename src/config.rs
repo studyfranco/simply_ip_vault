@@ -26,11 +26,14 @@ const DEFAULT_BIND_PORT: u16 = 3000;
 /// confine the service to a loopback or management interface short of a firewall — and no way to
 /// run a second instance on one host, which the test suite needs in order to assert startup
 /// behaviour at all.
+#[must_use]
 pub fn resolve_bind_addr() -> SocketAddr {
     // `BIND_HOST` wins over `HOST` because `HOST` is a widely-used variable that some environments
     // set to something entirely unrelated (a hostname, a build target triple); an operator who sets
     // the explicit name should not have it silently overridden by ambient configuration.
-    let host = std::env::var("BIND_HOST").or_else(|_| std::env::var("HOST")).ok();
+    let host = std::env::var("BIND_HOST")
+        .or_else(|_| std::env::var("HOST"))
+        .ok();
     let port = std::env::var("PORT").ok();
     parse_bind_addr(host.as_deref(), port.as_deref())
 }
@@ -49,29 +52,29 @@ pub fn resolve_bind_addr() -> SocketAddr {
 /// what a socket-activated deployment or a test harness wants.
 pub fn parse_bind_addr(host: Option<&str>, port: Option<&str>) -> SocketAddr {
     let ip = match host.map(str::trim).filter(|h| !h.is_empty()) {
-        Some(raw) => match raw.parse::<IpAddr>() {
-            Ok(ip) => ip,
-            Err(_) => {
+        Some(raw) => {
+            if let Ok(ip) = raw.parse::<IpAddr>() {
+                ip
+            } else {
                 tracing::warn!(
                     "Invalid bind host {raw:?} (expected a literal IP address such as 0.0.0.0, \
-                     127.0.0.1, or ::) — falling back to {DEFAULT_BIND_HOST}"
+                 127.0.0.1, or ::) — falling back to {DEFAULT_BIND_HOST}"
                 );
                 DEFAULT_BIND_HOST
             }
-        },
+        }
         None => DEFAULT_BIND_HOST,
     };
 
     let port = match port.map(str::trim).filter(|p| !p.is_empty()) {
-        Some(raw) => match raw.parse::<u16>() {
-            Ok(port) => port,
-            Err(_) => {
-                tracing::warn!(
-                    "Invalid PORT {raw:?} — falling back to {DEFAULT_BIND_PORT}"
-                );
+        Some(raw) => {
+            if let Ok(port) = raw.parse::<u16>() {
+                port
+            } else {
+                tracing::warn!("Invalid PORT {raw:?} — falling back to {DEFAULT_BIND_PORT}");
                 DEFAULT_BIND_PORT
             }
-        },
+        }
         None => DEFAULT_BIND_PORT,
     };
 
@@ -102,23 +105,33 @@ pub const TRUSTED_PROXIES_ENV: &str = "TRUSTED_PROXIES";
 // choice, and refusing to boot over it would trade a real outage for a tuning mistake. Contrast
 // `TRUSTED_PROXIES` and `VAULT_ENCRYPTION_KEY`, which abort startup — those *are* boundaries.
 
-/// Reads a numeric environment variable, falling back to `default` with a warning if unusable.
-pub(crate) fn numeric_env<T>(name: &str, default: T) -> T
+/// Parses a numeric value read from env var `name`, falling back to `default` if unset or invalid.
+fn parse_numeric_env<T>(name: &str, raw: Option<&str>, default: T) -> T
 where
     T: std::str::FromStr + std::fmt::Display + Copy,
 {
-    match std::env::var(name) {
-        Err(_) => default,
-        Ok(raw) => match raw.trim().parse::<T>() {
-            Ok(value) => value,
-            Err(_) => {
+    match raw {
+        None => default,
+        Some(raw) => {
+            if let Ok(value) = raw.trim().parse::<T>() {
+                value
+            } else {
                 tracing::warn!(
                     "{name}={raw:?} is not a valid number; using the default of {default}"
                 );
                 default
             }
-        },
+        }
     }
+}
+
+/// Reads a numeric environment variable, falling back to `default` with a warning if unusable.
+pub(crate) fn numeric_env<T>(name: &str, default: T) -> T
+where
+    T: std::str::FromStr + std::fmt::Display + Copy,
+{
+    let raw = std::env::var(name).ok();
+    parse_numeric_env(name, raw.as_deref(), default)
 }
 
 /// Parallel webhook dispatch workers. Env `WEBHOOK_WORKERS`, default 4.
@@ -168,7 +181,9 @@ pub fn webhook_workers() -> usize {
 /// while draining an order of magnitude faster.
 pub fn webhook_dispatch_interval() -> std::time::Duration {
     static VALUE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    std::time::Duration::from_millis(*VALUE.get_or_init(|| numeric_env::<u64>(WEBHOOK_INTERVAL_ENV, 50)))
+    std::time::Duration::from_millis(
+        *VALUE.get_or_init(|| numeric_env::<u64>(WEBHOOK_INTERVAL_ENV, 50)),
+    )
 }
 
 /// Capacity of the webhook channel. **Clamped to at least 1** — `mpsc::channel(0)` panics.
@@ -265,6 +280,7 @@ pub fn parse_bool_env(raw: Option<&str>, default: bool, name: &str) -> bool {
 }
 
 /// Reads [`NORMALIZE_IPV6_TO_48_ENV`] from the environment, defaulting to `true`.
+#[must_use]
 pub fn normalize_ipv6_to_48_from_env() -> bool {
     let raw = std::env::var(NORMALIZE_IPV6_TO_48_ENV).ok();
     parse_bool_env(raw.as_deref(), true, NORMALIZE_IPV6_TO_48_ENV)
@@ -345,16 +361,19 @@ pub fn database_max_connections() -> u32 {
 pub fn database_min_connections() -> u32 {
     static VALUE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *VALUE.get_or_init(|| {
-        clamp_pool_min(numeric_env::<u32>(DATABASE_MIN_CONNECTIONS_ENV, 10), database_max_connections())
+        clamp_pool_min(
+            numeric_env::<u32>(DATABASE_MIN_CONNECTIONS_ENV, 10),
+            database_max_connections(),
+        )
     })
 }
 
 /// How long an idle pooled connection may sit before being closed.
 pub fn database_idle_timeout() -> std::time::Duration {
     static VALUE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    std::time::Duration::from_secs(*VALUE.get_or_init(|| {
-        numeric_env::<u64>(DATABASE_IDLE_TIMEOUT_ENV, 600)
-    }))
+    std::time::Duration::from_secs(
+        *VALUE.get_or_init(|| numeric_env::<u64>(DATABASE_IDLE_TIMEOUT_ENV, 600)),
+    )
 }
 
 /// How long a request waits for the pool to hand back a connection before failing. **Clamped to at
@@ -380,11 +399,11 @@ pub fn sqlite_busy_timeout() -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
-/// Environment variable overriding the SQLx slow-statement warning threshold, in milliseconds.
+/// Environment variable overriding the `SQLx` slow-statement warning threshold, in milliseconds.
 pub const DATABASE_SLOW_THRESHOLD_MS_ENV: &str = "DATABASE_SLOW_THRESHOLD_MS";
-/// Default SQLx slow-statement alert threshold: 5,000 ms (5 seconds).
+/// Default `SQLx` slow-statement alert threshold: 5,000 ms (5 seconds).
 ///
-/// Raised from SQLx's 1,000 ms default so that 10,001-row bulk sync pages and multi-million-row
+/// Raised from `SQLx`'s 1,000 ms default so that 10,001-row bulk sync pages and multi-million-row
 /// analytical index scans finishing in 1–4 seconds on spinning or network-attached storage do not
 /// flood warning logs while genuinely slow queries remain surfaced.
 pub const DEFAULT_DATABASE_SLOW_THRESHOLD_MS: u64 = 5_000;
@@ -430,7 +449,8 @@ fn clamp_sqlite_file_max(requested: u32) -> u32 {
 /// than one connection at all, safely or not: it is a single unshareable buffer, not a slower disk.
 pub fn sqlite_file_max_connections() -> u32 {
     static VALUE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *VALUE.get_or_init(|| clamp_sqlite_file_max(numeric_env::<u32>(DATABASE_MAX_CONNECTIONS_ENV, 10)))
+    *VALUE
+        .get_or_init(|| clamp_sqlite_file_max(numeric_env::<u32>(DATABASE_MAX_CONNECTIONS_ENV, 10)))
 }
 
 /// The file-backed SQLite tier's warm-connection floor: `DATABASE_MIN_CONNECTIONS`, default 2,
@@ -438,7 +458,10 @@ pub fn sqlite_file_max_connections() -> u32 {
 pub fn sqlite_file_min_connections() -> u32 {
     static VALUE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *VALUE.get_or_init(|| {
-        clamp_pool_min(numeric_env::<u32>(DATABASE_MIN_CONNECTIONS_ENV, 2), sqlite_file_max_connections())
+        clamp_pool_min(
+            numeric_env::<u32>(DATABASE_MIN_CONNECTIONS_ENV, 2),
+            sqlite_file_max_connections(),
+        )
     })
 }
 
@@ -447,12 +470,12 @@ pub fn sqlite_file_min_connections() -> u32 {
 pub fn get_secret_or_env(var_name: &str) -> Option<String> {
     if let Ok(file_path) = std::env::var(format!("{var_name}_FILE")) {
         let trimmed = file_path.trim();
-        if !trimmed.is_empty() {
-            if let Ok(content) = std::fs::read_to_string(trimmed) {
-                let trimmed_content = content.trim().to_owned();
-                if !trimmed_content.is_empty() {
-                    return Some(trimmed_content);
-                }
+        if !trimmed.is_empty()
+            && let Ok(content) = std::fs::read_to_string(trimmed)
+        {
+            let trimmed_content = content.trim().to_owned();
+            if !trimmed_content.is_empty() {
+                return Some(trimmed_content);
             }
         }
     }
@@ -518,6 +541,10 @@ pub struct InvalidInitialMasterKey {
 /// > **Deliberate divergence.** `simply_hook_executor` accepts any non-empty
 /// > `INITIAL_MASTER_KEY`. This service is stricter on purpose, and the asymmetry is recorded in
 /// > `AGENT_NOTES.MD` rather than being converged away.
+///
+/// # Errors
+///
+/// Returns an error if the configured value is invalid or unavailable.
 pub fn validate_initial_master_key(raw: &str) -> Result<(), InvalidInitialMasterKey> {
     let is_hex = raw.chars().all(|c| c.is_ascii_hexdigit());
     if raw.len() == MASTER_KEY_HEX_LEN && is_hex {
@@ -525,7 +552,11 @@ pub fn validate_initial_master_key(raw: &str) -> Result<(), InvalidInitialMaster
     }
     Err(InvalidInitialMasterKey {
         got: raw.chars().count(),
-        detail: if is_hex { "" } else { ", and it contains non-hexadecimal characters" },
+        detail: if is_hex {
+            ""
+        } else {
+            ", and it contains non-hexadecimal characters"
+        },
     })
 }
 
@@ -544,7 +575,7 @@ const POSITIVE_TTL: Duration = Duration::from_secs(30);
 /// without it, every request arriving while a configured hostname is unresolvable triggers its own
 /// DNS lookup. A hot path behind a dead name then turns this service into a resolution amplifier —
 /// one inbound request becomes one outbound query, at whatever rate the caller chooses — which is a
-/// DoS both against the resolver and against this process's own latency. With it, the cost is
+/// `DoS` both against the resolver and against this process's own latency. With it, the cost is
 /// bounded to one query per name per interval no matter how much traffic arrives.
 const NEGATIVE_TTL: Duration = Duration::from_secs(5);
 
@@ -691,6 +722,7 @@ impl std::fmt::Debug for ResolutionCache {
 
 impl TrustedProxies {
     /// Builds from an already-parsed matcher list.
+    #[must_use]
     pub fn new(matchers: Vec<ProxyMatcher>) -> Self {
         let networks: Vec<IpNet> = matchers
             .iter()
@@ -726,12 +758,21 @@ impl TrustedProxies {
     ///
     /// An **unset** variable is not an error. That is the zero-configuration case, and it means
     /// "trust nothing", which is the safe posture rather than an ambiguous one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configured value is invalid or unavailable.
     pub fn from_env() -> Result<Self, InvalidTrustedProxies> {
-        let Ok(raw) = std::env::var(TRUSTED_PROXIES_ENV) else {
+        let raw = std::env::var(TRUSTED_PROXIES_ENV).ok();
+        Self::from_raw(raw.as_deref())
+    }
+
+    fn from_raw(raw: Option<&str>) -> Result<Self, InvalidTrustedProxies> {
+        let Some(raw) = raw else {
             return Ok(Self::default());
         };
 
-        match parse_trusted_proxies(&raw) {
+        match parse_trusted_proxies(raw) {
             Ok(matchers) => Ok(Self::new(matchers)),
             Err(entries) => {
                 for invalid in &entries {
@@ -751,6 +792,7 @@ impl TrustedProxies {
     /// Overrides both DNS reuse windows. Test-facing: a suite cannot wait 30 seconds to observe
     /// that a re-resolution happened, nor 5 to observe that one was suppressed.
     #[cfg(test)]
+    #[must_use]
     pub fn with_ttls(mut self, positive: Duration, negative: Duration) -> Self {
         self.positive_ttl = positive;
         self.negative_ttl = negative;
@@ -758,11 +800,13 @@ impl TrustedProxies {
     }
 
     /// Whether anything at all is trusted. An empty configuration ignores forwarding headers.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.matchers.is_empty()
     }
 
     /// The configured matchers, for startup logging.
+    #[must_use]
     pub fn matchers(&self) -> &[ProxyMatcher] {
         &self.matchers
     }
@@ -788,15 +832,12 @@ impl TrustedProxies {
         {
             let cache = self.cache.read().await;
             if cache.built
-                && self
-                    .hostnames
-                    .iter()
-                    .all(|name| {
-                        cache
-                            .hosts
-                            .get(name)
-                            .is_some_and(|s| s.is_fresh(self.positive_ttl, self.negative_ttl))
-                    })
+                && self.hostnames.iter().all(|name| {
+                    cache
+                        .hosts
+                        .get(name)
+                        .is_some_and(|s| s.is_fresh(self.positive_ttl, self.negative_ttl))
+                })
             {
                 return Arc::clone(&cache.snapshot);
             }
@@ -826,7 +867,11 @@ impl TrustedProxies {
             let resolved = !addresses.is_empty();
             cache.hosts.insert(
                 name.clone(),
-                HostnameState { addresses, attempted_at: Instant::now(), resolved },
+                HostnameState {
+                    addresses,
+                    attempted_at: Instant::now(),
+                    resolved,
+                },
             );
         }
 
@@ -880,7 +925,11 @@ impl TrustedProxies {
                         "All {} {} hostname entr{} resolved at startup.",
                         proxies.hostnames.len(),
                         TRUSTED_PROXIES_ENV,
-                        if proxies.hostnames.len() == 1 { "y" } else { "ies" }
+                        if proxies.hostnames.len() == 1 {
+                            "y"
+                        } else {
+                            "ies"
+                        }
                     );
                 }
                 return;
@@ -932,8 +981,9 @@ async fn resolve_hostname(hostname: &str) -> Vec<IpNet> {
     // Port 0: `lookup_host` wants a socket address, but only the address half is used.
     match tokio::net::lookup_host((hostname, 0u16)).await {
         Ok(addrs) => {
-            let networks: Vec<IpNet> =
-                addrs.map(|addr| IpNet::from(normalize_ip(addr.ip()))).collect();
+            let networks: Vec<IpNet> = addrs
+                .map(|addr| IpNet::from(normalize_ip(addr.ip())))
+                .collect();
             if networks.is_empty() {
                 tracing::warn!(
                     "TRUSTED_PROXIES hostname {hostname:?} resolved to no addresses; it is not \
@@ -942,7 +992,11 @@ async fn resolve_hostname(hostname: &str) -> Vec<IpNet> {
             } else {
                 tracing::debug!(
                     "TRUSTED_PROXIES hostname {hostname:?} resolved to {}",
-                    networks.iter().map(|n| n.addr().to_string()).collect::<Vec<_>>().join(", ")
+                    networks
+                        .iter()
+                        .map(|n| n.addr().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
             }
             networks
@@ -970,6 +1024,10 @@ async fn resolve_hostname(hostname: &str) -> Vec<IpNet> {
 ///
 /// The check is purely syntactic and does no I/O: a well-formed hostname is accepted here whether or
 /// not it currently resolves, which is what keeps a DNS outage from becoming a refusal to boot.
+///
+/// # Errors
+///
+/// Returns an error if the configured value is invalid or unavailable.
 pub fn parse_trusted_proxies(raw: &str) -> Result<Vec<ProxyMatcher>, Vec<InvalidProxyEntry>> {
     let mut matchers = Vec::new();
     let mut invalid = Vec::new();
@@ -983,13 +1041,20 @@ pub fn parse_trusted_proxies(raw: &str) -> Result<Vec<ProxyMatcher>, Vec<Invalid
             match hostname_rejection(entry) {
                 None => matchers.push(ProxyMatcher::Hostname(entry.to_owned())),
                 Some(reason) => {
-                    invalid.push(InvalidProxyEntry { entry: entry.to_owned(), reason });
+                    invalid.push(InvalidProxyEntry {
+                        entry: entry.to_owned(),
+                        reason,
+                    });
                 }
             }
         }
     }
 
-    if invalid.is_empty() { Ok(matchers) } else { Err(invalid) }
+    if invalid.is_empty() {
+        Ok(matchers)
+    } else {
+        Err(invalid)
+    }
 }
 
 /// Why `entry` cannot be a DNS name, or `None` when it is shaped like one.
@@ -1038,7 +1103,10 @@ fn hostname_rejection(entry: &str) -> Option<&'static str> {
     if entry.chars().all(|c| c.is_ascii_digit() || c == '.') {
         return Some("made only of digits and dots, so this is a malformed IPv4 literal");
     }
-    if !entry.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_') {
+    if !entry
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_')
+    {
         return Some("contains characters that cannot appear in a DNS name");
     }
     None
@@ -1050,6 +1118,7 @@ fn hostname_rejection(entry: &str) -> Option<&'static str> {
 /// such a peer would fail to match an IPv4 CIDR in either `bound_ips` or `TRUSTED_PROXIES` — the
 /// first causing a spurious `403`, the second silently downgrading a trusted proxy to an untrusted
 /// one.
+#[must_use]
 pub fn normalize_ip(ip: IpAddr) -> IpAddr {
     ip.to_canonical()
 }
@@ -1099,21 +1168,22 @@ pub fn resolve_client_ip(
         return peer;
     }
 
-    if let Some(forwarded) = headers.get("X-Forwarded-For").and_then(|h| h.to_str().ok()) {
-        let client = forwarded
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .filter_map(|s| s.parse::<IpAddr>().ok())
-            .map(normalize_ip)
-            .rev()
-            .find(|ip| !is_trusted(*ip, trusted));
-
-        if let Some(client) = client {
-            return client;
-        }
-        // A header listing only trusted proxies (or nothing parseable) says nothing about the
-        // client; fall through rather than inventing one.
+    let forwarded_chain: Vec<IpAddr> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|h| h.to_str().ok())
+        .flat_map(|val| val.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<IpAddr>().ok())
+        .map(normalize_ip)
+        .collect();
+    if let Some(client) = forwarded_chain
+        .into_iter()
+        .rev()
+        .find(|ip| !is_trusted(*ip, trusted))
+    {
+        return client;
     }
 
     if let Some(real_ip) = headers
@@ -1126,71 +1196,6 @@ pub fn resolve_client_ip(
     }
 
     peer
-}
-
-#[cfg(test)]
-mod master_key_tests {
-    use super::*;
-
-    /// What the service generates for itself must satisfy the rule it imposes on operators.
-    ///
-    /// The important assertion in this file. If `generate_random_key` and `MASTER_KEY_HEX_LEN` ever
-    /// drift apart, a deployment that let the service pick its own key would still boot while an
-    /// operator supplying an identically-shaped one would be refused — a rule the service does not
-    /// follow itself, and the kind of inconsistency that gets "fixed" by deleting the check.
-    #[test]
-    fn a_self_generated_key_passes_the_operator_rule() {
-        for _ in 0..64 {
-            let generated = crate::api::generate_random_key();
-            assert_eq!(generated.len(), MASTER_KEY_HEX_LEN);
-            assert!(validate_initial_master_key(&generated).is_ok());
-        }
-    }
-
-    #[test]
-    fn exactly_64_hex_characters_are_accepted_in_either_case() {
-        assert!(validate_initial_master_key(&"a".repeat(64)).is_ok());
-        assert!(validate_initial_master_key(&"F".repeat(64)).is_ok());
-        assert!(validate_initial_master_key(&"0123456789abcdefABCDEF".repeat(3)[..64]).is_ok());
-    }
-
-    /// Both failure directions, and the boundary on each side — 63 and 65 are the off-by-ones a
-    /// length check gets wrong.
-    #[test]
-    fn wrong_length_or_non_hex_is_refused() {
-        for bad in [
-            "".to_owned(),
-            "a".repeat(63),
-            "a".repeat(65),
-            "changeme".to_owned(),
-            "e2e_master_secret_key_for_testing_123456789".to_owned(),
-            // 64 characters, but `g` is not a hex digit — the case a bare length check would pass.
-            format!("{}g", "a".repeat(63)),
-        ] {
-            assert!(
-                validate_initial_master_key(&bad).is_err(),
-                "{bad:?} must be refused"
-            );
-        }
-    }
-
-    /// The refusal has to tell an operator what to do; a bare "invalid" would send them guessing.
-    #[test]
-    fn the_refusal_names_the_requirement_and_the_remedy() {
-        let text = validate_initial_master_key("changeme").unwrap_err().to_string();
-        assert!(text.contains("64 hexadecimal characters"), "{text}");
-        assert!(text.contains("openssl rand -hex 32"), "{text}");
-        assert!(text.contains("Refusing to start"), "{text}");
-        assert!(text.contains("Got 8 character(s)"), "the actual length is reported: {text}");
-        assert!(
-            text.contains("non-hexadecimal"),
-            "a non-hex value says so, rather than only complaining about length: {text}"
-        );
-
-        // A right-length, wrong-alphabet key must not be told it is the wrong length.
-        let hex_only = validate_initial_master_key(&"a".repeat(63)).unwrap_err().to_string();
-        assert!(!hex_only.contains("non-hexadecimal"), "{hex_only}");
-    }
 }
 
 #[cfg(test)]
@@ -1241,8 +1246,14 @@ mod tests {
     fn bare_addresses_and_cidrs_both_parse() {
         let networks = only_networks("10.0.0.0/8, 192.168.1.5 ,, ::1");
         assert_eq!(networks.len(), 3, "empty entries are skipped, not counted");
-        assert!(networks[1].contains(&ip("192.168.1.5")), "a bare address becomes a /32");
-        assert!(!networks[1].contains(&ip("192.168.1.6")), "...and covers only itself");
+        assert!(
+            networks[1].contains(&ip("192.168.1.5")),
+            "a bare address becomes a /32"
+        );
+        assert!(
+            !networks[1].contains(&ip("192.168.1.6")),
+            "...and covers only itself"
+        );
     }
 
     #[test]
@@ -1260,7 +1271,11 @@ mod tests {
         // A near-miss CIDR must NOT be quietly demoted to a hostname: the `/` makes it impossible
         // as a DNS name, so it surfaces as a configuration error instead of a silent non-match.
         let refused = rejections("10.0.0.0/99, 10.0.0.0/8");
-        assert_eq!(refused.len(), 1, "the well-formed entry alongside it is not an error");
+        assert_eq!(
+            refused.len(),
+            1,
+            "the well-formed entry alongside it is not an error"
+        );
         assert_eq!(refused[0].entry, "10.0.0.0/99");
 
         // Nor may a mistyped IPv4 literal become a hostname — the same reasoning, and the case the
@@ -1276,7 +1291,14 @@ mod tests {
         let refused = rejections("-leading, trailing-, .dotted, has space, trailing.dot., _under");
         assert_eq!(
             refused.iter().map(|r| r.entry.as_str()).collect::<Vec<_>>(),
-            ["-leading", "trailing-", ".dotted", "has space", "trailing.dot.", "_under"],
+            [
+                "-leading",
+                "trailing-",
+                ".dotted",
+                "has space",
+                "trailing.dot.",
+                "_under"
+            ],
             "every bad entry is collected, so one restart surfaces all of the typos"
         );
     }
@@ -1310,11 +1332,31 @@ mod tests {
     /// gets its own test rather than being asserted only through `parse_trusted_proxies`.
     #[test]
     fn hostname_syntax_matches_the_peer_services_rule() {
-        for name in ["traefik", "proxy.internal", "a", "x1-y2.example.com", "under_score.local"] {
-            assert!(hostname_rejection(name).is_none(), "{name:?} must be accepted");
+        for name in [
+            "traefik",
+            "proxy.internal",
+            "a",
+            "x1-y2.example.com",
+            "under_score.local",
+        ] {
+            assert!(
+                hostname_rejection(name).is_none(),
+                "{name:?} must be accepted"
+            );
         }
-        for name in ["proxy.", "-proxy", "proxy-", ".proxy", "_proxy", "proxy_", "10.0.0.0/8"] {
-            assert!(hostname_rejection(name).is_some(), "{name:?} must be refused");
+        for name in [
+            "proxy.",
+            "-proxy",
+            "proxy-",
+            ".proxy",
+            "_proxy",
+            "proxy_",
+            "10.0.0.0/8",
+        ] {
+            assert!(
+                hostname_rejection(name).is_some(),
+                "{name:?} must be refused"
+            );
         }
     }
 
@@ -1348,7 +1390,10 @@ mod tests {
         // Served from cache the second time: the same allocation, no second lookup.
         assert!(Arc::ptr_eq(&resolved, &trusted.resolved().await));
 
-        assert!(!is_trusted(ip("203.0.113.9"), &resolved), "an unrelated address must not match");
+        assert!(
+            !is_trusted(ip("203.0.113.9"), &resolved),
+            "an unrelated address must not match"
+        );
     }
 
     /// Docker/Traefik shape: a container name alongside the bridge network CIDR. Either may match.
@@ -1356,9 +1401,18 @@ mod tests {
     async fn docker_style_configuration_matches_by_cidr_or_by_name() {
         let trusted = proxies("172.16.0.0/12, localhost").resolved().await;
 
-        assert!(is_trusted(ip("172.17.0.5"), &trusted), "docker bridge CIDR matches");
-        assert!(is_trusted(ip("127.0.0.1"), &trusted), "the named service matches");
-        assert!(!is_trusted(ip("192.0.2.7"), &trusted), "anything else does not");
+        assert!(
+            is_trusted(ip("172.17.0.5"), &trusted),
+            "docker bridge CIDR matches"
+        );
+        assert!(
+            is_trusted(ip("127.0.0.1"), &trusted),
+            "the named service matches"
+        );
+        assert!(
+            !is_trusted(ip("192.0.2.7"), &trusted),
+            "anything else does not"
+        );
     }
 
     /// Failing closed matters: a DNS outage must never be able to *widen* what is trusted, and it
@@ -1368,8 +1422,15 @@ mod tests {
         let trusted = proxies("this-host-does-not-exist.invalid, 10.0.0.0/8");
         let resolved = trusted.resolved().await;
 
-        assert!(is_trusted(ip("10.1.2.3"), &resolved), "the literal entry still applies");
-        assert_eq!(resolved.len(), 1, "the unresolvable name contributes nothing: {resolved:?}");
+        assert!(
+            is_trusted(ip("10.1.2.3"), &resolved),
+            "the literal entry still applies"
+        );
+        assert_eq!(
+            resolved.len(),
+            1,
+            "the unresolvable name contributes nothing: {resolved:?}"
+        );
         assert!(!is_trusted(ip("127.0.0.1"), &resolved));
     }
 
@@ -1397,7 +1458,10 @@ mod tests {
             .with_ttls(Duration::from_secs(30), Duration::ZERO);
 
         let first = trusted.resolved().await;
-        assert!(!Arc::ptr_eq(&first, &trusted.resolved().await), "a zero negative TTL re-resolves");
+        assert!(
+            !Arc::ptr_eq(&first, &trusted.resolved().await),
+            "a zero negative TTL re-resolves"
+        );
     }
 
     /// ...and so does a *successful* one, which is the direction that actually carries risk.
@@ -1428,7 +1492,10 @@ mod tests {
             attempted_at: Instant::now(),
             resolved: true,
         };
-        assert!(fresh.is_fresh(POSITIVE, NEGATIVE), "an attempt made just now is reusable");
+        assert!(
+            fresh.is_fresh(POSITIVE, NEGATIVE),
+            "an attempt made just now is reusable"
+        );
 
         let lapsed = HostnameState {
             attempted_at: Instant::now()
@@ -1436,7 +1503,10 @@ mod tests {
                 .expect("the monotonic clock is older than the TTL"),
             ..fresh.clone()
         };
-        assert!(!lapsed.is_fresh(POSITIVE, NEGATIVE), "an attempt one full TTL old is stale");
+        assert!(
+            !lapsed.is_fresh(POSITIVE, NEGATIVE),
+            "an attempt one full TTL old is stale"
+        );
         assert!(
             !lapsed.is_fresh(POSITIVE, Duration::from_secs(3600)),
             "a resolved entry must expire on the positive TTL, never on the negative one"
@@ -1482,8 +1552,14 @@ mod tests {
     /// rather than a generic "something is wrong".
     #[tokio::test]
     async fn priming_reports_only_the_entries_that_failed() {
-        assert!(proxies("10.0.0.0/8").prime().await.is_empty(), "no hostnames, nothing to report");
-        assert!(proxies("localhost").prime().await.is_empty(), "a resolvable name is not reported");
+        assert!(
+            proxies("10.0.0.0/8").prime().await.is_empty(),
+            "no hostnames, nothing to report"
+        );
+        assert!(
+            proxies("localhost").prime().await.is_empty(),
+            "a resolvable name is not reported"
+        );
 
         let failed = proxies("localhost, this-host-does-not-exist.invalid, 10.0.0.0/8")
             .prime()
@@ -1499,7 +1575,10 @@ mod tests {
         assert_eq!(failed.len(), 1);
 
         let resolved = trusted.resolved().await;
-        assert!(is_trusted(ip("192.0.2.7"), &resolved), "the literal entry serves normally");
+        assert!(
+            is_trusted(ip("192.0.2.7"), &resolved),
+            "the literal entry serves normally"
+        );
     }
 
     /// The core anti-spoofing property: with no trusted proxies configured, the forwarding headers
@@ -1507,7 +1586,10 @@ mod tests {
     #[test]
     fn forwarding_headers_are_ignored_when_nothing_is_trusted() {
         let hdrs = headers(&[("X-Forwarded-For", "8.8.8.8"), ("X-Real-IP", "8.8.8.8")]);
-        assert_eq!(resolve_client_ip(ip("203.0.113.9"), &hdrs, &[]), ip("203.0.113.9"));
+        assert_eq!(
+            resolve_client_ip(ip("203.0.113.9"), &hdrs, &[]),
+            ip("203.0.113.9")
+        );
     }
 
     /// The same, but from a peer that is merely *not on the list* while others are — the check is
@@ -1518,18 +1600,27 @@ mod tests {
         let hdrs = headers(&[("X-Forwarded-For", "10.0.0.1"), ("X-Real-IP", "10.0.0.1")]);
 
         // A hostile client claiming to be the trusted proxy itself still gets its own address used.
-        assert_eq!(resolve_client_ip(ip("203.0.113.9"), &hdrs, &trusted), ip("203.0.113.9"));
+        assert_eq!(
+            resolve_client_ip(ip("203.0.113.9"), &hdrs, &trusted),
+            ip("203.0.113.9")
+        );
 
         // ...including when it claims an address inside a key's bound CIDR.
         let hdrs = headers(&[("X-Forwarded-For", "192.168.1.1")]);
-        assert_eq!(resolve_client_ip(ip("203.0.113.9"), &hdrs, &trusted), ip("203.0.113.9"));
+        assert_eq!(
+            resolve_client_ip(ip("203.0.113.9"), &hdrs, &trusted),
+            ip("203.0.113.9")
+        );
     }
 
     #[test]
     fn a_trusted_peer_may_declare_the_client() {
         let trusted = only_networks("10.0.0.0/8");
         let hdrs = headers(&[("X-Forwarded-For", "203.0.113.50")]);
-        assert_eq!(resolve_client_ip(ip("10.0.0.1"), &hdrs, &trusted), ip("203.0.113.50"));
+        assert_eq!(
+            resolve_client_ip(ip("10.0.0.1"), &hdrs, &trusted),
+            ip("203.0.113.50")
+        );
     }
 
     /// Rightmost-first is what makes a client-supplied prefix unforgeable: a client that sends
@@ -1539,7 +1630,10 @@ mod tests {
     fn a_client_supplied_prefix_is_ignored_in_favour_of_the_proxy_appended_entry() {
         let trusted = only_networks("10.0.0.0/8");
         let hdrs = headers(&[("X-Forwarded-For", "8.8.8.8, 203.0.113.50")]);
-        assert_eq!(resolve_client_ip(ip("10.0.0.1"), &hdrs, &trusted), ip("203.0.113.50"));
+        assert_eq!(
+            resolve_client_ip(ip("10.0.0.1"), &hdrs, &trusted),
+            ip("203.0.113.50")
+        );
     }
 
     /// A chain of trusted proxies: the rightmost entries are proxies, and the first non-proxy
@@ -1548,11 +1642,17 @@ mod tests {
     fn trusted_hops_are_skipped_walking_right_to_left() {
         let trusted = only_networks("10.0.0.0/8,172.16.0.0/12");
         let hdrs = headers(&[("X-Forwarded-For", "203.0.113.50, 172.16.0.9, 10.0.0.2")]);
-        assert_eq!(resolve_client_ip(ip("10.0.0.1"), &hdrs, &trusted), ip("203.0.113.50"));
+        assert_eq!(
+            resolve_client_ip(ip("10.0.0.1"), &hdrs, &trusted),
+            ip("203.0.113.50")
+        );
 
         // A forged address to the left of the real client is still never reached.
         let hdrs = headers(&[("X-Forwarded-For", "8.8.8.8, 203.0.113.50, 10.0.0.2")]);
-        assert_eq!(resolve_client_ip(ip("10.0.0.1"), &hdrs, &trusted), ip("203.0.113.50"));
+        assert_eq!(
+            resolve_client_ip(ip("10.0.0.1"), &hdrs, &trusted),
+            ip("203.0.113.50")
+        );
     }
 
     /// The convergence fix: a hop identified by *hostname* must be skipped exactly like a CIDR one.
@@ -1574,7 +1674,10 @@ mod tests {
 
         // Both orders of the chain behave the same way.
         let hdrs = headers(&[("X-Forwarded-For", "203.0.113.50, 172.16.0.9, 127.0.0.1")]);
-        assert_eq!(resolve_client_ip(ip("127.0.0.1"), &hdrs, &trusted), ip("203.0.113.50"));
+        assert_eq!(
+            resolve_client_ip(ip("127.0.0.1"), &hdrs, &trusted),
+            ip("203.0.113.50")
+        );
     }
 
     /// A trusted peer identified purely by hostname must still have its forwarding header honoured.
@@ -1582,10 +1685,16 @@ mod tests {
     async fn a_hostname_identified_proxy_may_declare_the_client() {
         let trusted = proxies("localhost").resolved().await;
         let hdrs = headers(&[("X-Forwarded-For", "203.0.113.50")]);
-        assert_eq!(resolve_client_ip(ip("127.0.0.1"), &hdrs, &trusted), ip("203.0.113.50"));
+        assert_eq!(
+            resolve_client_ip(ip("127.0.0.1"), &hdrs, &trusted),
+            ip("203.0.113.50")
+        );
 
         // ...and a peer that does not resolve to that name still cannot.
-        assert_eq!(resolve_client_ip(ip("203.0.113.9"), &hdrs, &trusted), ip("203.0.113.9"));
+        assert_eq!(
+            resolve_client_ip(ip("203.0.113.9"), &hdrs, &trusted),
+            ip("203.0.113.9")
+        );
     }
 
     /// A header naming nothing but proxies carries no information about the client, so the peer is
@@ -1594,7 +1703,10 @@ mod tests {
     fn an_all_proxy_chain_falls_back_to_the_peer() {
         let trusted = only_networks("10.0.0.0/8");
         let hdrs = headers(&[("X-Forwarded-For", "10.0.0.2, 10.0.0.3")]);
-        assert_eq!(resolve_client_ip(ip("10.0.0.1"), &hdrs, &trusted), ip("10.0.0.1"));
+        assert_eq!(
+            resolve_client_ip(ip("10.0.0.1"), &hdrs, &trusted),
+            ip("10.0.0.1")
+        );
     }
 
     #[test]
@@ -1615,13 +1727,25 @@ mod tests {
         let trusted = only_networks("10.0.0.0/8");
 
         let hdrs = headers(&[("X-Real-IP", "203.0.113.50")]);
-        assert_eq!(resolve_client_ip(ip("10.0.0.1"), &hdrs, &trusted), ip("203.0.113.50"));
-        assert_eq!(resolve_client_ip(ip("203.0.113.9"), &hdrs, &trusted), ip("203.0.113.9"));
+        assert_eq!(
+            resolve_client_ip(ip("10.0.0.1"), &hdrs, &trusted),
+            ip("203.0.113.50")
+        );
+        assert_eq!(
+            resolve_client_ip(ip("203.0.113.9"), &hdrs, &trusted),
+            ip("203.0.113.9")
+        );
 
         // X-Forwarded-For wins when both are present, so a proxy that sets both cannot be played
         // off against itself.
-        let hdrs = headers(&[("X-Forwarded-For", "198.51.100.7"), ("X-Real-IP", "203.0.113.50")]);
-        assert_eq!(resolve_client_ip(ip("10.0.0.1"), &hdrs, &trusted), ip("198.51.100.7"));
+        let hdrs = headers(&[
+            ("X-Forwarded-For", "198.51.100.7"),
+            ("X-Real-IP", "203.0.113.50"),
+        ]);
+        assert_eq!(
+            resolve_client_ip(ip("10.0.0.1"), &hdrs, &trusted),
+            ip("198.51.100.7")
+        );
     }
 
     #[test]
@@ -1629,18 +1753,27 @@ mod tests {
         assert_eq!(parse_bind_addr(None, None).to_string(), "0.0.0.0:3000");
         // Empty strings are treated as "unset", so an unset variable in a unit or compose file
         // behaves the same as an absent one.
-        assert_eq!(parse_bind_addr(Some(""), Some("  ")).to_string(), "0.0.0.0:3000");
+        assert_eq!(
+            parse_bind_addr(Some(""), Some("  ")).to_string(),
+            "0.0.0.0:3000"
+        );
     }
 
     #[test]
     fn bind_addr_honors_host_and_port_overrides() {
-        assert_eq!(parse_bind_addr(Some("127.0.0.1"), Some("8080")).to_string(), "127.0.0.1:8080");
+        assert_eq!(
+            parse_bind_addr(Some("127.0.0.1"), Some("8080")).to_string(),
+            "127.0.0.1:8080"
+        );
         assert_eq!(
             parse_bind_addr(Some(" 127.0.0.1 "), Some(" 8080 ")).to_string(),
             "127.0.0.1:8080"
         );
         // Port 0 is passed through so the OS can assign an ephemeral port.
-        assert_eq!(parse_bind_addr(Some("127.0.0.1"), Some("0")).to_string(), "127.0.0.1:0");
+        assert_eq!(
+            parse_bind_addr(Some("127.0.0.1"), Some("0")).to_string(),
+            "127.0.0.1:0"
+        );
         // IPv6 literals bind too.
         let addr = parse_bind_addr(Some("::1"), Some("9000"));
         assert!(addr.is_ipv6());
@@ -1651,13 +1784,22 @@ mod tests {
     fn bind_addr_falls_back_on_malformed_values() {
         // A hostname is not a literal IP and is rejected rather than resolved — several addresses
         // with no principled way to choose, and binding the wrong interface is a security problem.
-        assert_eq!(parse_bind_addr(Some("localhost"), Some("8080")).to_string(), "0.0.0.0:8080");
+        assert_eq!(
+            parse_bind_addr(Some("localhost"), Some("8080")).to_string(),
+            "0.0.0.0:8080"
+        );
         assert_eq!(
             parse_bind_addr(Some("127.0.0.1"), Some("not-a-port")).to_string(),
             "127.0.0.1:3000"
         );
-        assert_eq!(parse_bind_addr(Some("127.0.0.1"), Some("70000")).to_string(), "127.0.0.1:3000");
-        assert_eq!(parse_bind_addr(Some("999.1.1.1"), Some("-1")).to_string(), "0.0.0.0:3000");
+        assert_eq!(
+            parse_bind_addr(Some("127.0.0.1"), Some("70000")).to_string(),
+            "127.0.0.1:3000"
+        );
+        assert_eq!(
+            parse_bind_addr(Some("999.1.1.1"), Some("-1")).to_string(),
+            "0.0.0.0:3000"
+        );
     }
 
     /// An IPv4-mapped peer must still match an IPv4 `TRUSTED_PROXIES` entry — otherwise a
@@ -1666,7 +1808,10 @@ mod tests {
     fn ipv4_mapped_addresses_are_normalized_on_both_sides() {
         let trusted = only_networks("10.0.0.0/8");
         let hdrs = headers(&[("X-Forwarded-For", "::ffff:203.0.113.50")]);
-        assert_eq!(resolve_client_ip(ip("::ffff:10.0.0.1"), &hdrs, &trusted), ip("203.0.113.50"));
+        assert_eq!(
+            resolve_client_ip(ip("::ffff:10.0.0.1"), &hdrs, &trusted),
+            ip("203.0.113.50")
+        );
     }
 
     /// Serializes the tests that read [`TRUSTED_PROXIES_ENV`].
@@ -1674,83 +1819,43 @@ mod tests {
     /// The environment is process-global and this suite runs in parallel, so two tests setting the
     /// same variable would interleave. Poisoning is recovered from rather than propagated: one
     /// failing test must not cascade into "the other four also failed", which hides the real cause.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Runs `body` with [`TRUSTED_PROXIES_ENV`] set to `value` (or unset when `None`), restoring
-    /// whatever was there before.
-    fn with_trusted_proxies_env<T>(value: Option<&str>, body: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous = std::env::var(TRUSTED_PROXIES_ENV).ok();
-
-        // SAFETY: `ENV_LOCK` is held for the whole body, and every test in this module that touches
-        // this variable goes through this helper, so no other thread reads or writes it meanwhile.
-        // The restore below runs on the success path; a panicking `body` aborts the test process's
-        // view of this variable only, and the next test sets it again before reading.
-        unsafe {
-            match value {
-                Some(raw) => std::env::set_var(TRUSTED_PROXIES_ENV, raw),
-                None => std::env::remove_var(TRUSTED_PROXIES_ENV),
-            }
-        }
-
-        let outcome = body();
-
-        // SAFETY: as above — still under `ENV_LOCK`.
-        unsafe {
-            match previous {
-                Some(raw) => std::env::set_var(TRUSTED_PROXIES_ENV, raw),
-                None => std::env::remove_var(TRUSTED_PROXIES_ENV),
-            }
-        }
-        outcome
-    }
-
     /// A syntactically impossible entry must stop the daemon **before** anything else happens.
-    ///
-    /// This is the abort half of the split that gives this module its shape. `from_env` is the exact
-    /// call `main` makes, and in `main` it sits ahead of the database connection and far ahead of
-    /// `prime_with_grace`, so an `Err` here *is* the refusal to start — there is no later stage that
-    /// could decide to carry on with a partial list.
-    ///
-    /// Every bad entry must come back, not just the first: an operator who mistyped three lines
-    /// should need one restart to find all three.
     #[test]
     fn a_malformed_entry_refuses_to_build_the_trust_boundary_at_all() {
-        let err = with_trusted_proxies_env(Some("10.0.0.0/99, 127.0.0.1, proxy., !nope"), || {
-            TrustedProxies::from_env().expect_err("a malformed entry must abort")
-        });
+        let err = TrustedProxies::from_raw(Some("10.0.0.0/99, 127.0.0.1, proxy., !nope"))
+            .expect_err("a malformed entry must abort");
 
         assert_eq!(
-            err.entries.iter().map(|e| e.entry.as_str()).collect::<Vec<_>>(),
+            err.entries
+                .iter()
+                .map(|e| e.entry.as_str())
+                .collect::<Vec<_>>(),
             ["10.0.0.0/99", "proxy.", "!nope"],
             "all three bad entries are reported, and the good one is not"
         );
 
-        // The `Display` an operator actually sees has to carry the entries and their reasons; an
-        // error that only says "invalid configuration" would send them back to the logs.
         let rendered = err.to_string();
-        assert!(rendered.contains("10.0.0.0/99"), "the rendered error names the entry: {rendered}");
-        assert!(rendered.contains("CIDR"), "...and why it was refused: {rendered}");
+        assert!(
+            rendered.contains("10.0.0.0/99"),
+            "the rendered error names the entry: {rendered}"
+        );
+        assert!(
+            rendered.contains("CIDR"),
+            "...and why it was refused: {rendered}"
+        );
     }
 
-    /// ...whereas a name that is merely *unresolvable* is not a configuration error at all.
-    ///
-    /// This is the other half, and the one that has to keep working: DNS is a runtime dependency
-    /// that goes away and comes back, and a daemon that refuses to boot while it is away turns a
-    /// brief resolver outage into a crash loop — strictly worse than serving with one proxy entry
-    /// disabled. `.invalid` is reserved by RFC 2606 precisely so it can never resolve.
-    ///
-    /// `prime` is what `prime_with_grace` calls, so driving it directly asserts the grace path's
-    /// substance — the name is *kept*, reported as failing, and left for the next retry — without
-    /// waiting out the 60-second timer.
     #[tokio::test]
     async fn an_unresolvable_hostname_is_kept_and_left_to_the_grace_period() {
         let trusted =
-            with_trusted_proxies_env(Some("127.0.0.1, definitely-not-a-real-host.invalid"), || {
-                TrustedProxies::from_env().expect("valid syntax must build even when DNS fails")
-            });
+            TrustedProxies::from_raw(Some("127.0.0.1, definitely-not-a-real-host.invalid"))
+                .expect("valid syntax must build even when DNS fails");
 
-        assert_eq!(trusted.matchers().len(), 2, "the unresolvable name is kept as a matcher");
+        assert_eq!(
+            trusted.matchers().len(),
+            2,
+            "the unresolvable name is kept as a matcher"
+        );
 
         let failed = trusted.prime().await;
         assert_eq!(
@@ -1759,67 +1864,48 @@ mod tests {
             "it is reported as failing, which is what the grace-period retry acts on"
         );
 
-        // Failing to resolve must not disturb the entries that did: the literal is still trusted,
-        // and the dead name simply contributes no addresses.
         let resolved = trusted.resolved().await;
-        assert!(is_trusted(ip("127.0.0.1"), &resolved), "the literal entry is unaffected");
-        assert_eq!(resolved.len(), 1, "the dead name contributes nothing rather than everything");
+        assert!(
+            is_trusted(ip("127.0.0.1"), &resolved),
+            "the literal entry is unaffected"
+        );
+        assert_eq!(
+            resolved.len(),
+            1,
+            "the dead name contributes nothing rather than everything"
+        );
     }
 
     /// An unset variable is the zero-configuration case, not a malformed one.
     #[test]
     fn an_unset_variable_trusts_nothing_without_complaining() {
-        let trusted = with_trusted_proxies_env(None, || {
-            TrustedProxies::from_env().expect("unset is not an error")
-        });
+        let trusted = TrustedProxies::from_raw(None).expect("unset is not an error");
         assert!(trusted.is_empty(), "unset means trust nothing");
     }
 
     // ── Database pool tuning ────────────────────────────────────────────
 
-    /// Runs `body` with environment variable `name` set to `value` (or unset when `None`),
-    /// restoring whatever was there before. Unlike [`with_trusted_proxies_env`], this takes the
-    /// variable name as a parameter rather than being pinned to one — every test below uses its own
-    /// name (`CONFIG_TEST_*`, never a real `DATABASE_*`/`WEBHOOK_*` constant), so no `ENV_LOCK`-style
-    /// mutex is needed: two tests using two different names cannot race on either.
-    fn with_env<T>(name: &str, value: Option<&str>, body: impl FnOnce() -> T) -> T {
-        let previous = std::env::var(name).ok();
-        // SAFETY: `name` is a `CONFIG_TEST_*` name unique to the calling test, never a real
-        // production variable and never shared with another test, so no other thread reads or
-        // writes it while this body runs.
-        unsafe {
-            match value {
-                Some(raw) => std::env::set_var(name, raw),
-                None => std::env::remove_var(name),
-            }
-        }
-        let outcome = body();
-        unsafe {
-            match previous {
-                Some(raw) => std::env::set_var(name, raw),
-                None => std::env::remove_var(name),
-            }
-        }
-        outcome
-    }
-
-    /// [`numeric_env`] itself is untested despite backing seven public settings (`WEBHOOK_WORKERS`,
-    /// `MAX_BODY_SIZE_MIB`, and now the four `DATABASE_*` pool settings) — this is the first direct
-    /// coverage of the shared parser all of them go through, not only the new callers.
     #[test]
     fn numeric_env_parses_falls_back_and_recovers_from_garbage() {
-        with_env("CONFIG_TEST_NUMERIC_VALID", Some("42"), || {
-            assert_eq!(numeric_env::<u32>("CONFIG_TEST_NUMERIC_VALID", 7), 42);
-        });
-        with_env("CONFIG_TEST_NUMERIC_UNSET", None, || {
-            assert_eq!(numeric_env::<u32>("CONFIG_TEST_NUMERIC_UNSET", 7), 7, "missing falls back to the default");
-        });
-        with_env("CONFIG_TEST_NUMERIC_GARBAGE", Some("not-a-number"), || {
-            assert_eq!(numeric_env::<u32>("CONFIG_TEST_NUMERIC_GARBAGE", 7), 7, "unparseable falls back rather than panicking");
-        });
-        with_env("CONFIG_TEST_NUMERIC_WHITESPACE", Some("  15  "), || {
-            assert_eq!(numeric_env::<u32>("CONFIG_TEST_NUMERIC_WHITESPACE", 7), 15, "surrounding whitespace is trimmed");
-        });
+        assert_eq!(
+            parse_numeric_env::<u32>("CONFIG_TEST_NUMERIC_VALID", Some("42"), 7),
+            42
+        );
+        assert_eq!(
+            parse_numeric_env::<u32>("CONFIG_TEST_NUMERIC_UNSET", None, 7),
+            7,
+            "missing falls back to the default"
+        );
+        assert_eq!(
+            parse_numeric_env::<u32>("CONFIG_TEST_NUMERIC_GARBAGE", Some("not-a-number"), 7),
+            7,
+            "unparseable falls back rather than panicking"
+        );
+        assert_eq!(
+            parse_numeric_env::<u32>("CONFIG_TEST_NUMERIC_WHITESPACE", Some("  15  "), 7),
+            15,
+            "surrounding whitespace is trimmed"
+        );
     }
 
     /// `DATABASE_MAX_CONNECTIONS=0` must not reach `sqlx::Pool`, which panics on it.
@@ -1827,7 +1913,11 @@ mod tests {
     fn pool_max_connections_is_clamped_to_at_least_one() {
         assert_eq!(clamp_pool_max(0), 1);
         assert_eq!(clamp_pool_max(1), 1);
-        assert_eq!(clamp_pool_max(50), 50, "an ordinary value passes through unchanged");
+        assert_eq!(
+            clamp_pool_max(50),
+            50,
+            "an ordinary value passes through unchanged"
+        );
     }
 
     /// `DATABASE_MIN_CONNECTIONS` greater than the configured max must not silently be ignored by
@@ -1835,9 +1925,21 @@ mod tests {
     /// down to the max here instead, where the effective value is visible.
     #[test]
     fn pool_min_connections_is_clamped_to_the_configured_max() {
-        assert_eq!(clamp_pool_min(10, 50), 10, "a min below max passes through unchanged");
-        assert_eq!(clamp_pool_min(100, 50), 50, "a min above max is pulled down to it");
-        assert_eq!(clamp_pool_min(50, 50), 50, "min == max is not treated as a violation");
+        assert_eq!(
+            clamp_pool_min(10, 50),
+            10,
+            "a min below max passes through unchanged"
+        );
+        assert_eq!(
+            clamp_pool_min(100, 50),
+            50,
+            "a min above max is pulled down to it"
+        );
+        assert_eq!(
+            clamp_pool_min(50, 50),
+            50,
+            "min == max is not treated as a violation"
+        );
     }
 
     /// The file-backed SQLite tier's ceiling composes [`clamp_pool_max`]'s floor of 1 with its own
@@ -1845,8 +1947,16 @@ mod tests {
     /// the PostgreSQL/MySQL tier's default, but never more than this tier allows.
     #[test]
     fn sqlite_file_max_is_clamped_to_one_and_ceilinged_at_ten() {
-        assert_eq!(clamp_sqlite_file_max(0), 1, "the same zero-floor as the shared pool clamp");
-        assert_eq!(clamp_sqlite_file_max(5), 5, "an ordinary value under the ceiling passes through");
+        assert_eq!(
+            clamp_sqlite_file_max(0),
+            1,
+            "the same zero-floor as the shared pool clamp"
+        );
+        assert_eq!(
+            clamp_sqlite_file_max(5),
+            5,
+            "an ordinary value under the ceiling passes through"
+        );
         assert_eq!(
             clamp_sqlite_file_max(SQLITE_FILE_MAX_CONNECTIONS_CEILING),
             SQLITE_FILE_MAX_CONNECTIONS_CEILING,
@@ -1867,7 +1977,11 @@ mod tests {
     fn acquire_timeout_is_clamped_to_at_least_one_second() {
         assert_eq!(clamp_acquire_timeout_secs(0), 1);
         assert_eq!(clamp_acquire_timeout_secs(1), 1);
-        assert_eq!(clamp_acquire_timeout_secs(10), 10, "an ordinary value passes through unchanged");
+        assert_eq!(
+            clamp_acquire_timeout_secs(10),
+            10,
+            "an ordinary value passes through unchanged"
+        );
     }
 
     /// The four `DATABASE_*_ENV` constants are exactly the names `AGENT_NOTES.MD` and `db.rs`'s
@@ -1880,6 +1994,94 @@ mod tests {
         assert_eq!(DATABASE_MAX_CONNECTIONS_ENV, "DATABASE_MAX_CONNECTIONS");
         assert_eq!(DATABASE_MIN_CONNECTIONS_ENV, "DATABASE_MIN_CONNECTIONS");
         assert_eq!(DATABASE_IDLE_TIMEOUT_ENV, "DATABASE_IDLE_TIMEOUT_SECS");
-        assert_eq!(DATABASE_ACQUIRE_TIMEOUT_ENV, "DATABASE_ACQUIRE_TIMEOUT_SECS");
+        assert_eq!(
+            DATABASE_ACQUIRE_TIMEOUT_ENV,
+            "DATABASE_ACQUIRE_TIMEOUT_SECS"
+        );
+    }
+
+    #[test]
+    fn resolve_client_ip_collects_multiple_xff_headers() {
+        let trusted: Vec<IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
+        let mut headers = axum::http::HeaderMap::new();
+        headers.append("x-forwarded-for", "198.51.100.9".parse().unwrap());
+        headers.append("x-forwarded-for", "10.0.0.5".parse().unwrap());
+        let peer: IpAddr = "10.0.0.2".parse().unwrap();
+
+        assert_eq!(
+            resolve_client_ip(peer, &headers, &trusted),
+            "198.51.100.9".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    mod master_key_tests {
+        use super::*;
+
+        /// What the service generates for itself must satisfy the rule it imposes on operators.
+        ///
+        /// The important assertion in this file. If `generate_random_key` and `MASTER_KEY_HEX_LEN` ever
+        /// drift apart, a deployment that let the service pick its own key would still boot while an
+        /// operator supplying an identically-shaped one would be refused — a rule the service does not
+        /// follow itself, and the kind of inconsistency that gets "fixed" by deleting the check.
+        #[test]
+        fn a_self_generated_key_passes_the_operator_rule() {
+            for _ in 0..64 {
+                let generated = crate::api::generate_random_key();
+                assert_eq!(generated.len(), MASTER_KEY_HEX_LEN);
+                assert!(validate_initial_master_key(&generated).is_ok());
+            }
+        }
+
+        #[test]
+        fn exactly_64_hex_characters_are_accepted_in_either_case() {
+            assert!(validate_initial_master_key(&"a".repeat(64)).is_ok());
+            assert!(validate_initial_master_key(&"F".repeat(64)).is_ok());
+            assert!(validate_initial_master_key(&"0123456789abcdefABCDEF".repeat(3)[..64]).is_ok());
+        }
+
+        /// Both failure directions, and the boundary on each side — 63 and 65 are the off-by-ones a
+        /// length check gets wrong.
+        #[test]
+        fn wrong_length_or_non_hex_is_refused() {
+            for bad in [
+                String::new(),
+                "a".repeat(63),
+                "a".repeat(65),
+                "changeme".to_owned(),
+                "e2e_master_secret_key_for_testing_123456789".to_owned(),
+                // 64 characters, but `g` is not a hex digit — the case a bare length check would pass.
+                format!("{}g", "a".repeat(63)),
+            ] {
+                assert!(
+                    validate_initial_master_key(&bad).is_err(),
+                    "{bad:?} must be refused"
+                );
+            }
+        }
+
+        /// The refusal has to tell an operator what to do; a bare "invalid" would send them guessing.
+        #[test]
+        fn the_refusal_names_the_requirement_and_the_remedy() {
+            let text = validate_initial_master_key("changeme")
+                .unwrap_err()
+                .to_string();
+            assert!(text.contains("64 hexadecimal characters"), "{text}");
+            assert!(text.contains("openssl rand -hex 32"), "{text}");
+            assert!(text.contains("Refusing to start"), "{text}");
+            assert!(
+                text.contains("Got 8 character(s)"),
+                "the actual length is reported: {text}"
+            );
+            assert!(
+                text.contains("non-hexadecimal"),
+                "a non-hex value says so, rather than only complaining about length: {text}"
+            );
+
+            // A right-length, wrong-alphabet key must not be told it is the wrong length.
+            let hex_only = validate_initial_master_key(&"a".repeat(63))
+                .unwrap_err()
+                .to_string();
+            assert!(!hex_only.contains("non-hexadecimal"), "{hex_only}");
+        }
     }
 }

@@ -83,8 +83,8 @@ pub enum MasterPinError {
          RBAC_MODEL.md §5 requires master uniqueness to be enforced by the database rather than by \
          application logic; without it a second master can be written at any time. Note that \
          re-running migrations will NOT restore it — m20260808_000009_derive_master_marker is \
-         already recorded as applied and will be skipped. Recreate it directly:\n  \
-         CREATE UNIQUE INDEX \"{MASTER_MARKER_INDEX}\" ON {API_KEYS_TABLE} (master_marker);"
+         already recorded as applied and will be skipped. Recreate {MASTER_MARKER_INDEX} as a \
+         unique index on the master_marker column of {API_KEYS_TABLE}."
     )]
     MissingUniquenessIndex,
 
@@ -112,8 +112,11 @@ pub struct MasterPin {
 
 impl MasterPin {
     /// An unresolved pin.
+    #[must_use]
     pub fn new() -> Self {
-        Self { cell: OnceLock::new() }
+        Self {
+            cell: OnceLock::new(),
+        }
     }
 
     /// A pin fixed to a known id, without consulting the database.
@@ -123,9 +126,10 @@ impl MasterPin {
     /// by construction — resolution only ever pins a row that really is the sole Master — so the
     /// alternative is dropping the §5 index and writing a second master row, which tests a different
     /// failure at the same time.
+    #[must_use]
     pub fn pinned_to(id: Uuid) -> Self {
         let cell = OnceLock::new();
-        cell.set(id).expect("a fresh OnceLock is empty");
+        let _ = cell.set(id);
         Self { cell }
     }
 
@@ -151,6 +155,10 @@ impl MasterPin {
     /// convenience: it is what makes the guarantee hold. If a second call could re-resolve, then
     /// anything able to trigger one — a reconnect, a reload, a future admin endpoint — could move the
     /// pin, and "fixed at boot" would be true only until the first such event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored master credential cannot be loaded.
     pub async fn pin_at_boot(&self, db: &DatabaseConnection) -> Result<Uuid, MasterPinError> {
         if let Some(pinned) = self.cell.get() {
             return Ok(*pinned);
@@ -306,14 +314,20 @@ mod tests {
         let dupes = MasterPinError::MultipleMasters(vec![Uuid::nil(), Uuid::max()]);
         let text = dupes.to_string();
         assert!(text.contains("2 keys"), "the count is stated: {text}");
-        assert!(text.contains(&Uuid::nil().to_string()), "the offending ids are named: {text}");
+        assert!(
+            text.contains(&Uuid::nil().to_string()),
+            "the offending ids are named: {text}"
+        );
         assert!(text.contains("Refusing to start rather than guessing"));
 
         // The index error must not say "re-run migrations": `m20260808_000009` is already recorded
         // as applied and would be skipped, so that advice sends an operator in a circle.
         let missing = MasterPinError::MissingUniquenessIndex.to_string();
         assert!(missing.contains(MASTER_MARKER_INDEX));
-        assert!(missing.contains("CREATE UNIQUE INDEX"), "the remedy is spelled out: {missing}");
+        assert!(
+            missing.contains("unique index on the master_marker column"),
+            "the remedy is spelled out: {missing}"
+        );
         assert!(
             missing.contains("will NOT restore it"),
             "the useless remedy is ruled out explicitly: {missing}"

@@ -75,7 +75,12 @@ impl MigrationTrait for Migration {
             WebhookExecutions::Cause,
         ] {
             manager
-                .alter_table(Table::alter().table(WebhookExecutions::Table).drop_column(column).to_owned())
+                .alter_table(
+                    Table::alter()
+                        .table(WebhookExecutions::Table)
+                        .drop_column(column)
+                        .to_owned(),
+                )
                 .await?;
         }
         Ok(())

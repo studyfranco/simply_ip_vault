@@ -69,12 +69,31 @@ enum Causes {
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         for (name, table, column) in [
-            ("idx-irgm-ip_record_id", Memberships::Table, Memberships::IpRecordId),
-            ("idx-irgm-group_id", Memberships::Table, Memberships::GroupId),
-            ("idx-irgm-last_seen_at", Memberships::Table, Memberships::LastSeenAt),
+            (
+                "idx-irgm-ip_record_id",
+                Memberships::Table,
+                Memberships::IpRecordId,
+            ),
+            (
+                "idx-irgm-group_id",
+                Memberships::Table,
+                Memberships::GroupId,
+            ),
+            (
+                "idx-irgm-last_seen_at",
+                Memberships::Table,
+                Memberships::LastSeenAt,
+            ),
         ] {
             manager
-                .create_index(SqIndex::create().if_not_exists().name(name).table(table).col(column).to_owned())
+                .create_index(
+                    SqIndex::create()
+                        .if_not_exists()
+                        .name(name)
+                        .table(table)
+                        .col(column)
+                        .to_owned(),
+                )
                 .await?;
         }
         manager
@@ -141,7 +160,9 @@ impl MigrationTrait for Migration {
             "idx-irc-membership_id",
             "idx-irc-created_at",
         ] {
-            manager.drop_index(SqIndex::drop().if_exists().name(name).to_owned()).await?;
+            manager
+                .drop_index(SqIndex::drop().if_exists().name(name).to_owned())
+                .await?;
         }
         Ok(())
     }

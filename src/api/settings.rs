@@ -31,7 +31,7 @@ where
         .into_tuple::<i64>()
         .one(db)
         .await?;
-    Ok(std::cmp::max(count.unwrap_or(0), 0) as u64)
+    Ok(u64::try_from(count.unwrap_or(0)).unwrap_or_default())
 }
 
 /// Runtime system configuration and entity counts shown on the System Settings tab.
@@ -81,10 +81,10 @@ pub async fn get_settings(
     // Prevents repeated expensive full table counts when multiple tabs or dashboard pollers refresh.
     {
         let cache_read = state.settings_cache.read().await;
-        if let Some((ts, ref payload)) = *cache_read {
-            if ts.elapsed() < std::time::Duration::from_secs(120) {
-                return Ok(Json(payload.clone()).into_response());
-            }
+        if let Some((ts, payload)) = &*cache_read
+            && ts.elapsed() < std::time::Duration::from_secs(120)
+        {
+            return Ok(Json(payload.clone()).into_response());
         }
     }
 
@@ -95,10 +95,10 @@ pub async fn get_settings(
     // Double-checked locking: check cache again after acquiring lock.
     {
         let cache_read = state.settings_cache.read().await;
-        if let Some((ts, ref payload)) = *cache_read {
-            if ts.elapsed() < std::time::Duration::from_secs(120) {
-                return Ok(Json(payload.clone()).into_response());
-            }
+        if let Some((ts, payload)) = &*cache_read
+            && ts.elapsed() < std::time::Duration::from_secs(120)
+        {
+            return Ok(Json(payload.clone()).into_response());
         }
     }
 
@@ -110,10 +110,18 @@ pub async fn get_settings(
     let audit_log_count = count_entity::<audit_log::Entity, _>(&state.db).await?;
 
     let response = SettingsResponse {
-        trusted_proxies: state.trusted_proxies.matchers().iter().map(ToString::to_string).collect(),
+        trusted_proxies: state
+            .trusted_proxies
+            .matchers()
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
         encryption_enabled: state.cipher.is_encrypting(),
         webhook_workers: crate::config::webhook_workers(),
-        webhook_dispatch_interval_ms: crate::config::webhook_dispatch_interval().as_millis() as u64,
+        webhook_dispatch_interval_ms: u64::try_from(
+            crate::config::webhook_dispatch_interval().as_millis(),
+        )
+        .unwrap_or(u64::MAX),
         webhook_queue_capacity: crate::config::webhook_queue_capacity(),
         webhook_max_retries: crate::config::webhook_max_retries(),
         normalize_ipv6_to_48: state.is_ipv6_48_normalization_enabled(),
@@ -228,7 +236,14 @@ mod tests {
         let _ = get_settings(State(state.clone()), Extension(master_key.clone()))
             .await
             .unwrap();
-        let cache_val = state.settings_cache.read().await.as_ref().unwrap().1.clone();
+        let cache_val = state
+            .settings_cache
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .1
+            .clone();
         assert_eq!(cache_val.ip_record_count, 0);
         assert!(cache_val.normalize_ipv6_to_48);
 
@@ -238,7 +253,9 @@ mod tests {
         let err = update_settings(
             State(state.clone()),
             Extension(non_master),
-            Extension(ClientIp(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))),
+            Extension(ClientIp(std::net::IpAddr::V4(
+                std::net::Ipv4Addr::LOCALHOST,
+            ))),
             StrictJson(UpdateSettingsPayload {
                 normalize_ipv6_to_48: false,
             }),
@@ -253,7 +270,9 @@ mod tests {
         let _ = update_settings(
             State(state.clone()),
             Extension(master_key.clone()),
-            Extension(ClientIp(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))),
+            Extension(ClientIp(std::net::IpAddr::V4(
+                std::net::Ipv4Addr::LOCALHOST,
+            ))),
             StrictJson(UpdateSettingsPayload {
                 normalize_ipv6_to_48: false,
             }),
@@ -266,7 +285,14 @@ mod tests {
         let _ = get_settings(State(state.clone()), Extension(master_key))
             .await
             .unwrap();
-        let refreshed = state.settings_cache.read().await.as_ref().unwrap().1.clone();
+        let refreshed = state
+            .settings_cache
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .1
+            .clone();
         assert!(!refreshed.normalize_ipv6_to_48);
     }
 }

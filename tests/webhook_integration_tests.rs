@@ -13,11 +13,18 @@ use serde_json::json;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use simply_ip_vault::{create_app, migration, state::{AppState, WebhookEvent}};
+use simply_ip_vault::{
+    create_app, migration,
+    state::{AppState, WebhookEvent},
+};
 
 const MASTER_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000002";
 
-async fn setup() -> (DatabaseConnection, axum::Router, tokio::sync::mpsc::Receiver<WebhookEvent>) {
+async fn setup() -> (
+    DatabaseConnection,
+    axum::Router,
+    tokio::sync::mpsc::Receiver<WebhookEvent>,
+) {
     let db = Database::connect("sqlite::memory:").await.unwrap();
     migration::Migrator::up(&db, None).await.unwrap();
 
@@ -49,7 +56,9 @@ async fn setup() -> (DatabaseConnection, axum::Router, tokio::sync::mpsc::Receiv
 fn signed_request(method: &str, uri: &str, body: String, offset: i64) -> Request<Body> {
     let secret = format!("signing-secret-for-{MASTER_KEY}");
     let ts = (chrono::Utc::now().timestamp() + offset).to_string();
-    let sig = simply_ip_vault::crypto::compute_signature(&secret, method, uri, &ts, body.as_bytes()).unwrap();
+    let sig =
+        simply_ip_vault::crypto::compute_signature(&secret, method, uri, &ts, body.as_bytes())
+            .unwrap();
     Request::builder()
         .method(method)
         .uri(uri)
@@ -57,7 +66,10 @@ fn signed_request(method: &str, uri: &str, body: String, offset: i64) -> Request
         .header("X-Timestamp", ts)
         .header("X-Signature-256", sig)
         .header("Content-Type", "application/json")
-        .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 8080))))
+        .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            8080,
+        ))))
         .body(Body::from(body))
         .unwrap()
 }
@@ -82,10 +94,21 @@ async fn create_webhook(app: &axum::Router, db: &DatabaseConnection, group: &str
         "payload_template": "{\"ip\":\"$target_address\",\"action\":\"$action\"}",
     })
     .to_string();
-    let res = app.clone().oneshot(signed_request("POST", "/api/webhooks", body, offset)).await.unwrap();
+    let res = app
+        .clone()
+        .oneshot(signed_request("POST", "/api/webhooks", body, offset))
+        .await
+        .unwrap();
     let status = res.status();
-    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
-    assert_eq!(status, axum::http::StatusCode::OK, "webhook creation for {group} must succeed: {}", String::from_utf8_lossy(&bytes));
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "webhook creation for {group} must succeed: {}",
+        String::from_utf8_lossy(&bytes)
+    );
 }
 
 async fn group_id_of(db: &DatabaseConnection, name: &str) -> Uuid {
@@ -100,9 +123,19 @@ async fn group_id_of(db: &DatabaseConnection, name: &str) -> Uuid {
 }
 
 async fn ban(app: &axum::Router, address: &str, group: &str, offset: i64) {
-    let body = json!({ "target_address": address, "group_name": group, "cause": "isolation probe" }).to_string();
-    let res = app.clone().oneshot(signed_request("POST", "/api/ban", body, offset)).await.unwrap();
-    assert_eq!(res.status(), axum::http::StatusCode::OK, "ban of {address} into {group} must succeed");
+    let body =
+        json!({ "target_address": address, "group_name": group, "cause": "isolation probe" })
+            .to_string();
+    let res = app
+        .clone()
+        .oneshot(signed_request("POST", "/api/ban", body, offset))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        axum::http::StatusCode::OK,
+        "ban of {address} into {group} must succeed"
+    );
 }
 
 /// **The reported defect.** An address already present in Group A is added to Group B. Only Group B
@@ -111,14 +144,24 @@ async fn ban(app: &axum::Router, address: &str, group: &str, offset: i64) {
 async fn adding_an_address_to_group_b_never_emits_an_event_for_group_a() {
     let (_db, app, mut rx) = setup().await;
 
-    ban(&app, "203.0.113.10", "group-a", 0).await;
+    ban(&app, "45.0.113.10", "group-a", 0).await;
     let group_a_events = drain(&mut rx);
-    assert_eq!(group_a_events.len(), 1, "the first ban produces exactly one event");
-    let group_a_id = group_a_events[0].group_id.expect("the event names its group");
+    assert_eq!(
+        group_a_events.len(),
+        1,
+        "the first ban produces exactly one event"
+    );
+    let group_a_id = group_a_events[0]
+        .group_id
+        .expect("the event names its group");
 
-    ban(&app, "203.0.113.10", "group-b", 1).await;
+    ban(&app, "45.0.113.10", "group-b", 1).await;
     let events = drain(&mut rx);
-    assert_eq!(events.len(), 1, "adding to group B produces exactly one event, for group B");
+    assert_eq!(
+        events.len(),
+        1,
+        "adding to group B produces exactly one event, for group B"
+    );
     assert_ne!(
         events[0].group_id,
         Some(group_a_id),
@@ -133,10 +176,10 @@ async fn adding_an_address_to_group_b_never_emits_an_event_for_group_a() {
 async fn group_a_webhook_is_not_selected_for_a_group_b_mutation() {
     let (db, app, mut rx) = setup().await;
 
-    ban(&app, "203.0.113.20", "group-a", 0).await;
+    ban(&app, "45.0.113.20", "group-a", 0).await;
     create_webhook(&app, &db, "group-a", 1).await;
     let _ = drain(&mut rx);
-    ban(&app, "203.0.113.20", "group-b", 2).await;
+    ban(&app, "45.0.113.20", "group-b", 2).await;
     let events = drain(&mut rx);
 
     let group_a = simply_ip_vault::entities::ip_group::Entity::find()
@@ -147,7 +190,10 @@ async fn group_a_webhook_is_not_selected_for_a_group_b_mutation() {
         .find(|g| g.name == "group-a")
         .expect("group-a exists");
 
-    let b_events: Vec<_> = events.iter().filter(|e| e.group_name.as_deref() == Some("group-b")).collect();
+    let b_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.group_name.as_deref() == Some("group-b"))
+        .collect();
     assert_eq!(b_events.len(), 1, "group B's add is reported once");
     assert!(
         b_events.iter().all(|e| e.group_id != Some(group_a.id)),
@@ -159,20 +205,20 @@ async fn group_a_webhook_is_not_selected_for_a_group_b_mutation() {
 async fn ban_normalizes_ipv6_to_48_in_db_while_dispatching_full_ipv6_in_webhooks() {
     let (db, app, mut rx) = setup().await;
 
-    ban(&app, "2001:db8:1234:5678::1", "Seedbox_Ban", 0).await;
+    ban(&app, "2606:4700:1234:5678::1", "Seedbox_Ban", 0).await;
     let first_events = drain(&mut rx);
     assert_eq!(first_events.len(), 1);
     assert_eq!(first_events[0].action, "IP_ADD");
-    assert_eq!(first_events[0].address, "2001:db8:1234:5678::1");
+    assert_eq!(first_events[0].address, "2606:4700:1234:5678::1");
     assert!(!first_events[0].is_whitelist);
 
     // Banning a second host IP in the same /48 updates the existing /48 record (IP_UPDATE)
     // while still emitting the new triggering host IP in the webhook event.
-    ban(&app, "2001:db8:1234:9999::2", "Seedbox_Ban", 1).await;
+    ban(&app, "2606:4700:1234:9999::2", "Seedbox_Ban", 1).await;
     let second_events = drain(&mut rx);
     assert_eq!(second_events.len(), 1);
     assert_eq!(second_events[0].action, "IP_UPDATE");
-    assert_eq!(second_events[0].address, "2001:db8:1234:9999::2");
+    assert_eq!(second_events[0].address, "2606:4700:1234:9999::2");
 
     // Database contains a single normalized /48 record.
     let records = simply_ip_vault::entities::ip_record::Entity::find()
@@ -180,7 +226,7 @@ async fn ban_normalizes_ipv6_to_48_in_db_while_dispatching_full_ipv6_in_webhooks
         .await
         .unwrap();
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0].target_address, "2001:db8:1234::/48");
+    assert_eq!(records[0].target_address, "2606:4700:1234::/48");
 }
 
 #[tokio::test]
@@ -221,8 +267,8 @@ async fn batch_ban_normalizes_ipv6_to_48_and_dispatches_full_ips() {
         "group_name": "Seedbox_Ban",
         "mode": "upsert",
         "records": [
-            { "target_address": "2001:db8:abcd:0001::10", "cause": "ssh brute" },
-            { "target_address": "2001:db8:abcd:0002::20", "cause": "port scan" }
+            { "target_address": "2606:4700:abcd:0001::10", "cause": "ssh brute" },
+            { "target_address": "2606:4700:abcd:0002::20", "cause": "port scan" }
         ]
     })
     .to_string();
@@ -238,21 +284,21 @@ async fn batch_ban_normalizes_ipv6_to_48_and_dispatches_full_ips() {
         .await
         .unwrap();
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0].target_address, "2001:db8:abcd::/48");
+    assert_eq!(records[0].target_address, "2606:4700:abcd::/48");
 
     let events = drain(&mut rx);
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].action, "IP_ADD");
-    assert_eq!(events[0].address, "2001:db8:abcd:1::10");
+    assert_eq!(events[0].address, "2606:4700:abcd:1::10");
     assert_eq!(events[1].action, "IP_UPDATE");
-    assert_eq!(events[1].address, "2001:db8:abcd:2::20");
+    assert_eq!(events[1].address, "2606:4700:abcd:2::20");
 }
 
 #[tokio::test]
 async fn delete_and_restore_by_host_ipv6_resolve_stored_48_membership() {
     let (db, app, mut rx) = setup().await;
 
-    ban(&app, "2001:db8:face:1111::42", "Seedbox_Ban", 0).await;
+    ban(&app, "2606:4700:face:1111::42", "Seedbox_Ban", 0).await;
     let _ = drain(&mut rx);
 
     // Soft-delete using another host IP inside the same /48 resolves the /48 record and
@@ -261,7 +307,7 @@ async fn delete_and_restore_by_host_ipv6_resolve_stored_48_membership() {
         .clone()
         .oneshot(signed_request(
             "DELETE",
-            "/api/ips?target_address=2001:db8:face:2222::99&group_name=Seedbox_Ban",
+            "/api/ips?target_address=2606:4700:face:2222::99&group_name=Seedbox_Ban",
             String::new(),
             1,
         ))
@@ -272,11 +318,11 @@ async fn delete_and_restore_by_host_ipv6_resolve_stored_48_membership() {
     let del_events = drain(&mut rx);
     assert_eq!(del_events.len(), 1);
     assert_eq!(del_events[0].action, "IP_DELETE");
-    assert_eq!(del_events[0].address, "2001:db8:face::/48");
+    assert_eq!(del_events[0].address, "2606:4700:face::/48");
 
     // Restore using the original bare host IPv6 also resolves the stored /48 membership.
     let restore_body = json!({
-        "target_address": "2001:db8:face:1111::42",
+        "target_address": "2606:4700:face:1111::42",
         "group_name": "Seedbox_Ban"
     })
     .to_string();
@@ -308,17 +354,17 @@ async fn disabling_ipv6_48_normalization_via_api_stores_exact_host_ipv6() {
         .unwrap();
     assert_eq!(put_res.status(), axum::http::StatusCode::OK);
 
-    ban(&app, "2001:db8:9999:aaaa::1", "Seedbox_Ban", 1).await;
+    ban(&app, "2606:4700:9999:aaaa::1", "Seedbox_Ban", 1).await;
     let events = drain(&mut rx);
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].address, "2001:db8:9999:aaaa::1");
+    assert_eq!(events[0].address, "2606:4700:9999:aaaa::1");
 
     let records = simply_ip_vault::entities::ip_record::Entity::find()
         .all(&db)
         .await
         .unwrap();
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0].target_address, "2001:db8:9999:aaaa::1");
+    assert_eq!(records[0].target_address, "2606:4700:9999:aaaa::1");
 }
 
 #[tokio::test]
@@ -326,8 +372,8 @@ async fn ban_and_batch_preserve_non_128_ipv6_cidrs_without_converting_to_48() {
     let (db, app, mut rx) = setup().await;
 
     // Single bans with explicit non-/128 prefixes (/56, /64, /32) must keep their exact prefix.
-    ban(&app, "2001:db8:5656:1234::1/56", "Seedbox_Ban", 0).await;
-    ban(&app, "2001:db8:6464:abcd::9/64", "Seedbox_Ban", 1).await;
+    ban(&app, "2606:4700:5656:1234::1/56", "Seedbox_Ban", 0).await;
+    ban(&app, "2606:4700:6464:abcd::9/64", "Seedbox_Ban", 1).await;
     ban(&app, "2001:3200::/32", "Seedbox_Ban", 2).await;
 
     // Batch with a bare host IPv6 (/48-normalized) alongside an explicit /64 and /120 must keep
@@ -336,9 +382,9 @@ async fn ban_and_batch_preserve_non_128_ipv6_cidrs_without_converting_to_48() {
         "group_name": "Seedbox_Ban",
         "mode": "upsert",
         "records": [
-            { "target_address": "2001:db8:c0de:1111::1", "cause": "bare host" },
-            { "target_address": "2001:db8:c0de:2222::/64", "cause": "explicit /64" },
-            { "target_address": "2001:db8:c0de:3333:1:2:3:9/120", "cause": "explicit /120" }
+            { "target_address": "2606:4700:c0de:1111::1", "cause": "bare host" },
+            { "target_address": "2606:4700:c0de:2222::/64", "cause": "explicit /64" },
+            { "target_address": "2606:4700:c0de:3333:1:2:3:9/120", "cause": "explicit /120" }
         ]
     })
     .to_string();
@@ -361,11 +407,11 @@ async fn ban_and_batch_preserve_non_128_ipv6_cidrs_without_converting_to_48() {
         stored,
         vec![
             "2001:3200::/32",
-            "2001:db8:5656:1200::/56",
-            "2001:db8:6464:abcd::/64",
-            "2001:db8:c0de:2222::/64",
-            "2001:db8:c0de:3333:1:2:3:0/120",
-            "2001:db8:c0de::/48",
+            "2606:4700:5656:1200::/56",
+            "2606:4700:6464:abcd::/64",
+            "2606:4700:c0de:2222::/64",
+            "2606:4700:c0de:3333:1:2:3:0/120",
+            "2606:4700:c0de::/48",
         ]
     );
 
@@ -374,12 +420,12 @@ async fn ban_and_batch_preserve_non_128_ipv6_cidrs_without_converting_to_48() {
     assert_eq!(
         event_addrs,
         vec![
-            "2001:db8:5656:1200::/56",
-            "2001:db8:6464:abcd::/64",
+            "2606:4700:5656:1200::/56",
+            "2606:4700:6464:abcd::/64",
             "2001:3200::/32",
-            "2001:db8:c0de:1111::1",
-            "2001:db8:c0de:2222::/64",
-            "2001:db8:c0de:3333:1:2:3:0/120",
+            "2606:4700:c0de:1111::1",
+            "2606:4700:c0de:2222::/64",
+            "2606:4700:c0de:3333:1:2:3:0/120",
         ]
     );
 
@@ -388,7 +434,7 @@ async fn ban_and_batch_preserve_non_128_ipv6_cidrs_without_converting_to_48() {
         .clone()
         .oneshot(signed_request(
             "DELETE",
-            "/api/ips?target_address=2001:db8:c0de:2222::/64&group_name=Seedbox_Ban",
+            "/api/ips?target_address=2606:4700:c0de:2222::/64&group_name=Seedbox_Ban",
             String::new(),
             4,
         ))
@@ -398,7 +444,7 @@ async fn ban_and_batch_preserve_non_128_ipv6_cidrs_without_converting_to_48() {
 
     let del_events = drain(&mut rx);
     assert_eq!(del_events.len(), 1);
-    assert_eq!(del_events[0].address, "2001:db8:c0de:2222::/64");
+    assert_eq!(del_events[0].address, "2606:4700:c0de:2222::/64");
 }
 
 #[tokio::test]
@@ -416,10 +462,7 @@ async fn webhook_send_normalized_ipv6_crud_and_clone_round_trip() {
         .await
         .unwrap();
     assert_eq!(group_res.status(), axum::http::StatusCode::OK);
-    let group_json: serde_json::Value = serde_json::from_slice(
-        &axum::body::to_bytes(group_res.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let group_json: serde_json::Value = response_json(group_res).await;
     let group_id = group_json["id"].as_str().unwrap();
 
     // 1. Default omitted -> send_normalized_ipv6 is false.
@@ -441,10 +484,7 @@ async fn webhook_send_normalized_ipv6_crud_and_clone_round_trip() {
         .await
         .unwrap();
     assert_eq!(create_default.status(), axum::http::StatusCode::OK);
-    let default_body: serde_json::Value = serde_json::from_slice(
-        &axum::body::to_bytes(create_default.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let default_body: serde_json::Value = response_json(create_default).await;
     assert_eq!(default_body["send_normalized_ipv6"], false);
     let default_id = default_body["id"].as_str().unwrap().to_owned();
 
@@ -468,10 +508,7 @@ async fn webhook_send_normalized_ipv6_crud_and_clone_round_trip() {
         .await
         .unwrap();
     assert_eq!(create_norm.status(), axum::http::StatusCode::OK);
-    let norm_body: serde_json::Value = serde_json::from_slice(
-        &axum::body::to_bytes(create_norm.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let norm_body: serde_json::Value = response_json(create_norm).await;
     assert_eq!(norm_body["send_normalized_ipv6"], true);
     let norm_id = norm_body["id"].as_str().unwrap().to_owned();
 
@@ -481,10 +518,7 @@ async fn webhook_send_normalized_ipv6_crud_and_clone_round_trip() {
         .await
         .unwrap();
     assert_eq!(list_res.status(), axum::http::StatusCode::OK);
-    let list_json: Vec<serde_json::Value> = serde_json::from_slice(
-        &axum::body::to_bytes(list_res.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let list_json: Vec<serde_json::Value> = response_json(list_res).await;
     let find_flag = |id: &str| {
         list_json
             .iter()
@@ -507,10 +541,7 @@ async fn webhook_send_normalized_ipv6_crud_and_clone_round_trip() {
         .await
         .unwrap();
     assert_eq!(put_res.status(), axum::http::StatusCode::OK);
-    let put_json: serde_json::Value = serde_json::from_slice(
-        &axum::body::to_bytes(put_res.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let put_json: serde_json::Value = response_json(put_res).await;
     assert_eq!(put_json["send_normalized_ipv6"], true);
 
     // Clone keeps send_normalized_ipv6 == true.
@@ -525,9 +556,170 @@ async fn webhook_send_normalized_ipv6_crud_and_clone_round_trip() {
         .await
         .unwrap();
     assert_eq!(clone_res.status(), axum::http::StatusCode::CREATED);
-    let clone_json: serde_json::Value = serde_json::from_slice(
-        &axum::body::to_bytes(clone_res.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let clone_json: serde_json::Value = response_json(clone_res).await;
     assert_eq!(clone_json["send_normalized_ipv6"], true);
+}
+
+#[tokio::test]
+async fn webhook_credentials_are_sealed_at_rest_across_create_update_clone() {
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    migration::Migrator::up(&db, None).await.unwrap();
+
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let cipher = simply_ip_vault::crypto::SecretCipher::from_hex_key(hex_key).unwrap();
+    let cipher_for_state = simply_ip_vault::crypto::SecretCipher::from_hex_key(hex_key).unwrap();
+    let secret = format!("signing-secret-for-{MASTER_KEY}");
+    simply_ip_vault::entities::api_key::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        key_hash: Set(simply_ip_vault::api::hash_key(MASTER_KEY)),
+        signing_secret: Set(Some(cipher.seal(&secret).unwrap())),
+        name: Set("Master".to_owned()),
+        bound_ips: Set(None),
+        is_master: Set(true),
+        can_manage_keys: Set(true),
+        can_manage_webhooks: Set(true),
+        can_create_groups: Set(true),
+        parent_key_id: Set(None),
+        prefix: Set("00000000".to_owned()),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+        updated_at: Set(chrono::Utc::now().naive_utc()),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let state = AppState::with_parts(db.clone(), tx, Vec::new(), cipher_for_state);
+    let app = create_app(state);
+
+    ban(&app, "45.0.113.55", "seal-group", 0).await;
+    let gid = group_id_of(&db, "seal-group").await;
+
+    let create_res = app
+        .clone()
+        .oneshot(signed_request(
+            "POST",
+            "/api/webhooks",
+            json!({
+                "name": "sealed-hook",
+                "target_url": "https://receiver.example.com/hook",
+                "secret_token": "plain-webhook-secret",
+                "api_key": "plain-remote-api-key",
+                "group_id": gid,
+                "payload_template": "{\"ip\":\"$ip\",\"cause\":\"$cause\"}"
+            })
+            .to_string(),
+            1,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_res.status(), axum::http::StatusCode::OK);
+    let created: serde_json::Value = response_json(create_res).await;
+    let hook_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+
+    let stored = simply_ip_vault::entities::webhook_config::Entity::find_by_id(hook_id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stored.secret_token.starts_with("v1.xchacha20poly1305."));
+    assert!(
+        stored
+            .api_key
+            .as_deref()
+            .unwrap()
+            .starts_with("v1.xchacha20poly1305.")
+    );
+    assert_eq!(
+        cipher.open(&stored.secret_token).unwrap(),
+        "plain-webhook-secret"
+    );
+    assert_eq!(
+        cipher.open(stored.api_key.as_deref().unwrap()).unwrap(),
+        "plain-remote-api-key"
+    );
+
+    assert_update_and_clone_credentials_are_sealed(db, app, cipher, hook_id).await;
+}
+
+async fn assert_update_and_clone_credentials_are_sealed(
+    db: DatabaseConnection,
+    app: axum::Router,
+    cipher: simply_ip_vault::crypto::SecretCipher,
+    hook_id: Uuid,
+) {
+    let update_res = app
+        .clone()
+        .oneshot(signed_request(
+            "PUT",
+            &format!("/api/webhooks/{hook_id}"),
+            json!({
+                "secret_token": "updated-webhook-secret",
+                "api_key": "updated-remote-api-key"
+            })
+            .to_string(),
+            2,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(update_res.status(), axum::http::StatusCode::OK);
+    let updated = simply_ip_vault::entities::webhook_config::Entity::find_by_id(hook_id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(updated.secret_token.starts_with("v1.xchacha20poly1305."));
+    assert!(
+        updated
+            .api_key
+            .as_deref()
+            .unwrap()
+            .starts_with("v1.xchacha20poly1305.")
+    );
+    assert_eq!(
+        cipher.open(&updated.secret_token).unwrap(),
+        "updated-webhook-secret"
+    );
+    assert_eq!(
+        cipher.open(updated.api_key.as_deref().unwrap()).unwrap(),
+        "updated-remote-api-key"
+    );
+
+    let clone_res = app
+        .oneshot(signed_request(
+            "POST",
+            &format!("/api/webhooks/{hook_id}/clone"),
+            json!({ "name": "sealed-hook-copy" }).to_string(),
+            3,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(clone_res.status(), axum::http::StatusCode::CREATED);
+    let cloned_json: serde_json::Value = response_json(clone_res).await;
+    let clone_id = Uuid::parse_str(cloned_json["id"].as_str().unwrap()).unwrap();
+    let cloned_row = simply_ip_vault::entities::webhook_config::Entity::find_by_id(clone_id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(cloned_row.secret_token.starts_with("v1.xchacha20poly1305."));
+    assert!(
+        cloned_row
+            .api_key
+            .as_deref()
+            .unwrap()
+            .starts_with("v1.xchacha20poly1305.")
+    );
+    assert_eq!(
+        cipher.open(cloned_row.api_key.as_deref().unwrap()).unwrap(),
+        "updated-remote-api-key"
+    );
+    assert_ne!(cloned_row.secret_token, updated.secret_token);
+}
+
+async fn response_json<T: serde::de::DeserializeOwned>(response: axum::response::Response) -> T {
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).unwrap()
 }

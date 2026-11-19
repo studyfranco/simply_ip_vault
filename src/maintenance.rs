@@ -11,7 +11,7 @@ use sea_orm::DatabaseConnection;
 use tokio::sync::mpsc;
 
 /// Seconds between maintenance passes. Twelve hours.
-pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
+pub const MAINTENANCE_INTERVAL: Duration = Duration::from_hours(12);
 
 /// Free pages reclaimed per pass. Bounded (50 pages = ~200 KB) so one pass completes in < 0.5s
 /// and never holds the SQLite write lock long enough to trigger slow statement alerts (threshold 1s).
@@ -29,9 +29,15 @@ pub async fn run_once(db: &DatabaseConnection) {
     }
     let started = std::time::Instant::now();
     if let Err(e) = crate::db::run_sqlite_optimize(db).await {
-        tracing::warn!("Maintenance: PRAGMA optimize failed after {:?}: {e}", started.elapsed());
+        tracing::warn!(
+            "Maintenance: PRAGMA optimize failed after {:?}: {e}",
+            started.elapsed()
+        );
     } else {
-        tracing::info!("Maintenance: PRAGMA optimize completed in {:?}", started.elapsed());
+        tracing::info!(
+            "Maintenance: PRAGMA optimize completed in {:?}",
+            started.elapsed()
+        );
     }
 }
 
