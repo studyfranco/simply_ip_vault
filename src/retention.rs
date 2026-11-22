@@ -152,7 +152,26 @@ pub async fn purge_expired_ip_records(
 /// sender is the shutdown signal, so the worker stops cleanly during graceful shutdown rather than
 /// being aborted mid-delete. The first tick fires immediately, so a process restarted more often
 /// than the sweep interval still clears its backlog.
-pub async fn run_retention_worker(db: DatabaseConnection, mut shutdown: mpsc::Receiver<()>) {
+pub async fn run_retention_worker(db: DatabaseConnection, shutdown: mpsc::Receiver<()>) {
+    run_membership_retention(&db, shutdown, || {}).await;
+}
+
+/// Runs the retention worker and invalidates the server's membership caches after each purge.
+pub async fn run_retention_worker_with_state(
+    state: crate::state::AppState,
+    shutdown: mpsc::Receiver<()>,
+) {
+    run_membership_retention(&state.db, shutdown, || {
+        state.invalidate_membership_queries();
+    })
+    .await;
+}
+
+async fn run_membership_retention(
+    db: &DatabaseConnection,
+    mut shutdown: mpsc::Receiver<()>,
+    invalidate: impl Fn(),
+) {
     let retention_days = retention_days_from_env();
     if retention_days <= 0 {
         tracing::info!(
@@ -183,9 +202,12 @@ pub async fn run_retention_worker(db: DatabaseConnection, mut shutdown: mpsc::Re
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                match purge_expired_ip_records(&db, retention_days).await {
+                match purge_expired_ip_records(db, retention_days).await {
                     Ok(0) => tracing::debug!("Retention sweep: nothing to purge."),
-                    Ok(n) => tracing::info!("Retention sweep: purged {n} soft-deleted IP record(s)."),
+                    Ok(n) => {
+                        invalidate();
+                        tracing::info!("Retention sweep: purged {n} soft-deleted IP record(s).");
+                    }
                     Err(e) => tracing::error!("Retention sweep failed: {e}"),
                 }
             }

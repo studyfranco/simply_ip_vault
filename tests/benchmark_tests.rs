@@ -262,7 +262,8 @@ async fn group_scoped_list_plan_has_no_temp_b_tree() {
     );
     assert!(
         plan.contains("idx_memberships_active_last_seen")
-            || plan.contains("idx_memberships_group_is_deleted_last_seen"),
+            || plan.contains("idx_memberships_group_is_deleted_last_seen")
+            || plan.contains("idx_memberships_active_group_seen_id"),
         "list query must use an active last seen index: {plan}"
     );
 }

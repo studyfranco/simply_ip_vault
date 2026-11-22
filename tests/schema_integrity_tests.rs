@@ -2143,6 +2143,10 @@ async fn the_delta_sync_columns_are_indexed() {
         "idx_memberships_group_deleted_at",
         "idx_memberships_is_deleted_last_seen",
         "idx_memberships_group_is_deleted_last_seen",
+        "idx_memberships_active_group_count",
+        "idx_memberships_active_seen_id",
+        "idx_memberships_active_group_seen_id",
+        "idx_memberships_record_active",
     ] {
         assert!(
             simply_ip_vault::db::has_index(&db, "ip_record_group_memberships", index)

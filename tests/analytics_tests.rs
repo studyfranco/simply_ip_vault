@@ -657,3 +657,206 @@ async fn add_test_group(
     .unwrap();
     id
 }
+
+async fn seed_listing_benchmark(db: &DatabaseConnection, base: i64) -> Vec<Uuid> {
+    use sea_orm::EntityTrait as _;
+
+    let groups: Vec<_> = (1..=4).map(Uuid::from_u128).collect();
+    let stamp = |seconds| {
+        chrono::DateTime::from_timestamp(base + seconds, 0)
+            .unwrap()
+            .naive_utc()
+    };
+    for (index, &id) in groups.iter().enumerate() {
+        ip_group::ActiveModel {
+            id: Set(id),
+            name: Set(format!("benchmark-{index}")),
+            group_type: Set("banlist".to_owned()),
+            created_at: Set(stamp(0)),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    for start in (0..4096).step_by(128) {
+        let fixture = (start..start + 128).map(|i| {
+            let seen = stamp(i64::from(i));
+            let record = Uuid::from_u128(u128::from(i + 100_u32));
+            let deleted = i % 5 == 0;
+            let address = ip_record::ActiveModel {
+                id: Set(record),
+                target_address: Set(format!("45.200.{}.{}", i / 256, i % 256)),
+                created_at: Set(seen),
+            };
+            let membership = ip_record_group_membership::ActiveModel {
+                id: Set(Uuid::from_u128(u128::from(i + 5000))),
+                ip_record_id: Set(record),
+                group_id: Set(groups[i as usize % groups.len()]),
+                is_locked: Set(false),
+                created_at: Set(seen),
+                last_seen_at: Set(seen),
+                is_deleted: Set(deleted),
+                deleted_at: Set(deleted.then_some(seen)),
+                deleted_by: Set(None),
+            };
+            (address, membership)
+        });
+        let (addresses, memberships): (Vec<_>, Vec<_>) = fixture.unzip();
+        ip_record::Entity::insert_many(addresses)
+            .exec(db)
+            .await
+            .unwrap();
+        ip_record_group_membership::Entity::insert_many(memberships)
+            .exec(db)
+            .await
+            .unwrap();
+    }
+    groups
+}
+
+async fn timed_listing(app: &axum::Router, label: &str, query: &str) -> Value {
+    let request = signed_request("GET", &format!("/api/ips?{query}"), "");
+    let started = std::time::Instant::now();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let time = started.elapsed();
+    eprintln!("{label}: {:.3} ms", time.as_secs_f64() * 1000.0);
+    assert!(
+        time < std::time::Duration::from_millis(250),
+        "{label}: {time:?}"
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+fn assert_listing(body: &Value, expected: Vec<u32>, limit: usize) {
+    assert_eq!(body["total"], expected.len());
+    let addresses: Vec<_> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["target_address"].as_str().unwrap())
+        .collect();
+    let expected: Vec<_> = expected
+        .into_iter()
+        .take(limit)
+        .map(|i| format!("45.200.{}.{}", i / 256, i % 256))
+        .collect();
+    assert_eq!(addresses, expected);
+}
+
+#[tokio::test]
+async fn benchmark_membership_count_global_group_and_address_search() {
+    let (db, app) = setup().await;
+    let base = 1_700_000_000;
+    let groups = seed_listing_benchmark(&db, base).await;
+    let active = (0..4096).rev().filter(|i| i % 5 != 0);
+    let envelope = "include_total=true&format=minimal";
+
+    let body = timed_listing(
+        &app,
+        "scoped membership count with blank filters",
+        &format!("{envelope}&groups=benchmark-1,benchmark-3&limit=0&ip=%20%20&cause=%20"),
+    )
+    .await;
+    assert_listing(&body, active.clone().filter(|i| i % 2 == 1).collect(), 0);
+
+    let since = base + 4000;
+    let body = timed_listing(
+        &app,
+        "global recent page",
+        &format!("{envelope}&limit=10&since={since}"),
+    )
+    .await;
+    assert_listing(&body, active.clone().filter(|&i| i >= 4000).collect(), 10);
+
+    let body = timed_listing(
+        &app,
+        "group recent page",
+        &format!("{envelope}&group_id={}&limit=10&since={since}", groups[1]),
+    )
+    .await;
+    assert_listing(
+        &body,
+        active
+            .clone()
+            .filter(|&i| i >= 4000 && i % 4 == 1)
+            .collect(),
+        10,
+    );
+
+    let body = timed_listing(
+        &app,
+        "address prefix page",
+        &format!("{envelope}&ip=45.200.15.&limit=10"),
+    )
+    .await;
+    assert_listing(&body, active.clone().filter(|&i| i >= 3840).collect(), 10);
+
+    let body = timed_listing(
+        &app,
+        "exact address page",
+        &format!("{envelope}&ip=45.200.15.23&limit=10"),
+    )
+    .await;
+    assert_listing(&body, vec![3863], 10);
+
+    let body = timed_listing(
+        &app,
+        "address infix fallback",
+        &format!("{envelope}&ip=.15.23&limit=10"),
+    )
+    .await;
+    assert_listing(
+        &body,
+        active
+            .filter(|i| i / 256 == 15 && (i % 256).to_string().starts_with("23"))
+            .collect(),
+        10,
+    );
+}
+
+#[tokio::test]
+async fn cached_membership_count_is_invalidated_by_soft_delete() {
+    let (db, app) = setup().await;
+    let now = Utc::now().naive_utc();
+    seed_analytics_fixture(&db, now).await;
+
+    let before = timed_listing(
+        &app,
+        "count before soft delete",
+        "groups=Fail2ban&limit=0&include_total=true",
+    )
+    .await;
+    assert_eq!(before["total"], 3);
+    let address = timed_listing(
+        &app,
+        "active membership before soft delete",
+        "groups=Fail2ban&limit=1&include_total=true",
+    )
+    .await["data"][0]["target_address"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let request = signed_request(
+        "DELETE",
+        &format!("/api/ips?group_name=Fail2ban&target_address={address}"),
+        "",
+    );
+    assert_eq!(
+        app.clone().oneshot(request).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let after = timed_listing(
+        &app,
+        "count after soft delete",
+        "include_total=true&groups=Fail2ban&limit=0",
+    )
+    .await;
+    assert_eq!(after["total"], 2);
+}

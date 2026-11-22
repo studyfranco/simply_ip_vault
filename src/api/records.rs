@@ -20,7 +20,7 @@ use sea_orm::{
     ActiveModelTrait,
     ActiveValue::Set,
     ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction, EntityTrait, JoinType,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait, SqlErr,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait, RelationTrait, SqlErr,
     SqliteTransactionMode, TransactionOptions, TransactionTrait,
     sea_query::{Expr, ExprTrait, Func, Query},
 };
@@ -487,7 +487,7 @@ pub(crate) async fn handle_ip_upsert(
     )
     .await?;
 
-    txn.commit().await?;
+    state.commit_membership_write(txn).await?;
 
     state.enqueue_webhook(WebhookEvent {
         action: action.to_owned(),
@@ -516,7 +516,7 @@ pub struct QueryFilters {
     pub group_name: Option<String>,
     /// Filter by a single group ID, in addition to `groups`/`group_name`.
     pub group_id: Option<Uuid>,
-    /// Filter by a substring of the target address.
+    /// Filter by an IP, CIDR, address prefix, or substring.
     pub ip: Option<String>,
     /// Filter by a substring of any cause reported against the membership.
     pub cause: Option<String>,
@@ -745,6 +745,18 @@ enum GroupScope {
     In(Vec<Uuid>),
 }
 
+impl GroupScope {
+    fn predicate(&self) -> Option<sea_orm::sea_query::SimpleExpr> {
+        match self {
+            Self::Unfiltered => None,
+            Self::Single(only_id) => Some(ip_record_group_membership::Column::GroupId.eq(*only_id)),
+            Self::Merge(ids) | Self::In(ids) => {
+                Some(ip_record_group_membership::Column::GroupId.is_in(ids.iter().copied()))
+            }
+        }
+    }
+}
+
 /// Combines a base [`Condition`] with an optional group predicate and an optional `since` window.
 ///
 /// When both `since` and `include_deleted` are active alongside a group predicate (`group_id = ?`
@@ -812,40 +824,72 @@ pub fn apply_group_and_since_scope(
     cond
 }
 
-/// Counts memberships matching `scoped`, joining `ip_records` only when an address filter is present.
-async fn count_matching(
-    db: &sea_orm::DatabaseConnection,
+fn membership_query(
+    address: Option<&Condition>,
     scoped: Condition,
-    address_filter_present: bool,
-) -> Result<u64, AppError> {
-    // One query, never split per group. `fetch_merged_page` splits because an `ORDER BY` across a
-    // `GroupId IN (...)` cannot be served from the per-group partial index without a sort. A count
-    // has no order to satisfy, so that reason never applied to it: `GroupId IN (...)` stays a
-    // covering-index scan (confirmed with `EXPLAIN QUERY PLAN` against this schema). Splitting it
-    // would only add round trips for no benefit.
-    let mut query = ip_record_group_membership::Entity::find();
-    if address_filter_present {
-        query = query.join(
-            JoinType::InnerJoin,
-            ip_record_group_membership::Relation::IpRecord.def(),
+    select_record: bool,
+) -> sea_orm::Select<ip_record_group_membership::Entity> {
+    use ip_record_group_membership::{Column as Membership, Entity as Memberships};
+
+    let mut query = Memberships::find();
+    if let Some(matching) = address {
+        // Keep the address seek on the outer side of the join. SQLite can then
+        // probe memberships by record ID before sorting just the matched rows.
+        QueryTrait::query(&mut query)
+            .from_clear()
+            .from(ip_record::Entity)
+            .cross_join(Memberships);
+        let query = query.filter(matching.clone()).filter(
+            Expr::col((Memberships, Membership::IpRecordId))
+                .equals((ip_record::Entity, ip_record::Column::Id)),
         );
+        // SQLite can prefer a covering group/status or sort index and scan it
+        // once per address. Keep the remaining scope as a residual predicate so
+        // the inner lookup uses the record ID before applying the scope.
+        if scoped.is_empty() {
+            query
+        } else {
+            let predicate: Expr = Expr::case(scoped, true).finally(false).into();
+            query.filter(predicate)
+        }
+    } else {
+        if select_record {
+            query = query.join(
+                JoinType::InnerJoin,
+                ip_record_group_membership::Relation::IpRecord.def(),
+            );
+        }
+        query.filter(scoped)
     }
+}
+
+/// Counts memberships matching the authorized scope and filters.
+async fn count_matching(
+    state: &AppState,
+    scoped: Condition,
+    address: Option<&Condition>,
+    cacheable: bool,
+) -> Result<u64, AppError> {
     // `COUNT(*)`, not `COUNT(id)`: the partial index on `(group_id, last_seen_at)` does not carry
     // `id`, so counting that column forces a table lookup per matching row and loses "COVERING
     // INDEX" — about 10x slower on this schema (measured: COUNT(id) 1.4ms vs COUNT(*) 0.14ms per
     // group at 100k rows; this is also what made the production `COUNT(... IN (?,?,?,?))` query
     // take 5.8s). `COUNT(*)` needs no column value, so SQLite answers it from the index alone.
-    let count: Option<i64> = query
-        .filter(scoped)
+    let query = membership_query(address, scoped, false)
         .select_only()
         .expr_as(
             Func::count(Expr::col(sea_orm::sea_query::Asterisk)),
             "row_count",
-        )
-        .into_tuple::<i64>()
-        .one(db)
-        .await?;
-    Ok(std::cmp::max(count.unwrap_or(0), 0).cast_unsigned())
+        );
+    let count = || async {
+        let result = query.clone().into_tuple::<i64>().one(&state.db).await?;
+        Ok(std::cmp::max(result.unwrap_or(0), 0).cast_unsigned())
+    };
+    if !cacheable {
+        return count().await;
+    }
+    let key = format!("{:?}", query.build(state.db.get_database_backend()));
+    state.cached_membership_count(key, count).await
 }
 
 /// Fetches one page across a small, explicit set of groups without an SQL `ORDER BY` that spans
@@ -1025,36 +1069,84 @@ async fn resolve_list_group_scope(
     Ok(Some(group_scope))
 }
 
+fn address_range(prefix: &str) -> sea_orm::sea_query::SimpleExpr {
+    // All callers supply a nonempty ASCII address prefix. Increment its last byte to
+    // get the exclusive upper bound, without including the next lexical prefix.
+    let (last, head) = prefix.split_at(prefix.len() - 1);
+    let upper = format!("{last}{}", char::from(head.as_bytes()[0] + 1));
+    ip_record::Column::TargetAddress
+        .gte(prefix)
+        .and(ip_record::Column::TargetAddress.lt(upper))
+}
+
+fn is_address_prefix(term: &str) -> bool {
+    if term.contains(':') {
+        // Complete a partial last hextet (including a trailing colon) and allow
+        // omitted trailing hextets. Parsing rejects invalid compression and lengths.
+        let completed = if term.ends_with(':') && !term.ends_with("::") {
+            format!("{term}0")
+        } else {
+            term.to_owned()
+        };
+        completed.parse::<Ipv6Addr>().is_ok()
+            || format!("{completed}::").parse::<Ipv6Addr>().is_ok()
+    } else if term.contains('.') {
+        let octets: Vec<_> = term.split('.').collect();
+        octets.len() <= 4
+            && octets.iter().enumerate().all(|(index, octet)| {
+                (octet.is_empty() && index > 0 && index + 1 == octets.len())
+                    || (octet.bytes().all(|b| b.is_ascii_digit()) && octet.parse::<u8>().is_ok())
+            })
+    } else {
+        false
+    }
+}
+
+fn address_condition(term: &str, normalize_ipv6: bool) -> Condition {
+    let mut matching = Condition::any();
+    if term.parse::<IpNet>().is_ok() || term.parse::<std::net::IpAddr>().is_ok() {
+        let canonical = normalize_ip_or_cidr(term);
+        if canonical.contains('/') {
+            return matching.add(ip_record::Column::TargetAddress.eq(canonical));
+        }
+        // Preserve lookup by a network's bare base address with a slash-bounded range.
+        matching = matching
+            .add(address_range(&format!("{canonical}/")))
+            .add(ip_record::Column::TargetAddress.eq(&canonical));
+        let normalized = normalize_ipv6_ban_storage(term, normalize_ipv6);
+        if normalized != canonical {
+            matching = matching.add(ip_record::Column::TargetAddress.eq(normalized));
+        }
+    } else if is_address_prefix(term) {
+        matching = matching.add(address_range(&term.to_ascii_lowercase()));
+    } else {
+        matching = matching.add(ip_record::Column::TargetAddress.contains(term));
+    }
+    matching
+}
+
 fn build_list_filter_condition(
     state: &AppState,
     filters: &QueryFilters,
     include_deleted: bool,
-) -> (Condition, bool) {
+) -> (Condition, Option<Condition>) {
     let mut condition = Condition::all();
     if !include_deleted {
         condition = condition.add(ip_record_group_membership::Column::IsDeleted.eq(false));
     }
 
-    let address_filter_present = matches!(&filters.ip, Some(ip) if !ip.is_empty());
-    if let Some(ip) = &filters.ip
-        && !ip.is_empty()
-    {
-        let norm_ip = normalize_ip_or_cidr(ip.trim());
-        let norm_48 =
-            normalize_ipv6_ban_storage(ip.trim(), state.is_ipv6_48_normalization_enabled());
-        if norm_48 == norm_ip {
-            condition = condition.add(ip_record::Column::TargetAddress.contains(norm_ip));
-        } else {
-            condition = condition.add(
-                Condition::any()
-                    .add(ip_record::Column::TargetAddress.contains(norm_ip))
-                    .add(ip_record::Column::TargetAddress.eq(norm_48)),
-            );
-        }
-    }
+    let address = filters
+        .ip
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|term| address_condition(term, state.is_ipv6_48_normalization_enabled()));
 
-    if let Some(cause) = &filters.cause
-        && !cause.is_empty()
+    if let Some(cause) = filters
+        .cause
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
     {
         let matching = Query::select()
             .column((
@@ -1062,7 +1154,7 @@ fn build_list_filter_condition(
                 ip_record_cause::Column::MembershipId,
             ))
             .from(ip_record_cause::Entity)
-            .and_where(ip_record_cause::Column::Cause.contains(cause.trim()))
+            .and_where(ip_record_cause::Column::Cause.contains(cause))
             .to_owned();
         condition = condition.add(
             Expr::col((
@@ -1078,7 +1170,7 @@ fn build_list_filter_condition(
         condition = condition.add(ip_record_group_membership::Column::LastSeenAt.gte(threshold));
     }
 
-    (condition, address_filter_present)
+    (condition, address)
 }
 
 async fn format_list_ips_response(
@@ -1205,6 +1297,7 @@ struct ListResponseOpts {
 
 struct ListPageRequest<'a> {
     condition: &'a Condition,
+    address: Option<&'a Condition>,
     group_predicate: Option<sea_orm::sea_query::SimpleExpr>,
     since_threshold: Option<chrono::NaiveDateTime>,
     include_deleted: bool,
@@ -1221,6 +1314,7 @@ async fn fetch_list_page(
 ) -> Result<Vec<(ip_record_group_membership::Model, Option<ip_record::Model>)>, AppError> {
     let ListPageRequest {
         condition,
+        address,
         group_predicate,
         since_threshold,
         include_deleted,
@@ -1239,7 +1333,7 @@ async fn fetch_list_page(
         Vec::new()
     } else {
         match group_scope {
-            GroupScope::Merge(ids) => {
+            GroupScope::Merge(ids) if address.is_none() => {
                 fetch_merged_page(
                     db,
                     MergedPageFetch {
@@ -1254,7 +1348,7 @@ async fn fetch_list_page(
                 )
                 .await?
             }
-            GroupScope::Unfiltered | GroupScope::Single(_) | GroupScope::In(_) => {
+            _ => {
                 let mut page_condition = apply_group_and_since_scope(
                     condition,
                     group_predicate,
@@ -1264,13 +1358,8 @@ async fn fetch_list_page(
                 if let Some(cursor) = cursor {
                     page_condition = page_condition.add(cursor.condition());
                 }
-                ip_record_group_membership::Entity::find()
-                    .join(
-                        JoinType::InnerJoin,
-                        ip_record_group_membership::Relation::IpRecord.def(),
-                    )
+                membership_query(address, page_condition, true)
                     .select_also(ip_record::Entity)
-                    .filter(page_condition)
                     .order_by_desc(ip_record_group_membership::Column::LastSeenAt)
                     .order_by_asc(ip_record_group_membership::Column::Id)
                     .limit(fetch_limit)
@@ -1304,6 +1393,12 @@ fn parse_list_cursor(
     })
 }
 
+fn parse_since_threshold(since: i64) -> Result<chrono::NaiveDateTime, AppError> {
+    chrono::DateTime::from_timestamp(since, 0)
+        .map(|ts| ts.naive_utc())
+        .ok_or_else(|| AppError::InvalidInput("Invalid `since` timestamp".to_owned()))
+}
+
 /// Handles `GET /api/ips`: lists memberships, scoped to groups the caller may read.
 pub async fn list_ips(
     State(state): State<AppState>,
@@ -1334,38 +1429,10 @@ pub async fn list_ips(
         ));
     };
 
-    let (condition, address_filter_present) =
-        build_list_filter_condition(&state, &filters, include_deleted);
-    let since_threshold = match filters.since {
-        Some(since) => Some(
-            chrono::DateTime::from_timestamp(since, 0)
-                .ok_or_else(|| AppError::InvalidInput("Invalid `since` timestamp".to_owned()))?
-                .naive_utc(),
-        ),
-        None => None,
-    };
+    let (condition, address) = build_list_filter_condition(&state, &filters, include_deleted);
+    let since_threshold = filters.since.map(parse_since_threshold).transpose()?;
 
-    let count_group_pred = match &group_scope {
-        GroupScope::Unfiltered => None,
-        GroupScope::Single(only_id) => {
-            Some(ip_record_group_membership::Column::GroupId.eq(*only_id))
-        }
-        GroupScope::Merge(ids) | GroupScope::In(ids) => {
-            Some(ip_record_group_membership::Column::GroupId.is_in(ids.iter().copied()))
-        }
-    };
-
-    let total = if include_total {
-        let count_cond = apply_group_and_since_scope(
-            &condition,
-            count_group_pred.clone(),
-            since_threshold,
-            include_deleted,
-        );
-        Some(count_matching(&state.db, count_cond, address_filter_present).await?)
-    } else {
-        None
-    };
+    let count_group_pred = group_scope.predicate();
 
     let needs_next_cursor = (cursor_mode || include_total) && limit > 0;
     let mut page = fetch_list_page(
@@ -1373,7 +1440,8 @@ pub async fn list_ips(
         &group_scope,
         ListPageRequest {
             condition: &condition,
-            group_predicate: count_group_pred,
+            address: address.as_ref(),
+            group_predicate: count_group_pred.clone(),
             since_threshold,
             include_deleted,
             cursor: parsed_cursor,
@@ -1383,6 +1451,32 @@ pub async fn list_ips(
         },
     )
     .await?;
+
+    let total = if !include_total {
+        None
+    } else if parsed_cursor.is_none()
+        && limit > 0
+        && (page.len() as u64) <= limit
+        && (offset == 0 || !page.is_empty())
+    {
+        Some(offset.saturating_add(page.len() as u64))
+    } else {
+        let count_cond = apply_group_and_since_scope(
+            &condition,
+            count_group_pred,
+            since_threshold,
+            include_deleted,
+        );
+        Some(
+            count_matching(
+                &state,
+                count_cond,
+                address.as_ref(),
+                !include_deleted && filters.max_age.is_none(),
+            )
+            .await?,
+        )
+    };
 
     let has_more = needs_next_cursor && (page.len() as u64) > limit;
     if has_more {
@@ -1693,7 +1787,7 @@ pub async fn delete_ip(
     )
     .await?;
 
-    txn.commit().await?;
+    state.commit_membership_write(txn).await?;
 
     if emit_webhook {
         state.enqueue_webhook(WebhookEvent {
@@ -1777,7 +1871,7 @@ pub async fn restore_ip_record(
         Some("Restored from soft delete".to_owned()),
     )
     .await?;
-    txn.commit().await?;
+    state.commit_membership_write(txn).await?;
 
     Ok(Json(serde_json::json!({
         "target_address": stored_address,
@@ -1826,6 +1920,9 @@ pub async fn purge_ip_records(
         }
     };
     let purged = crate::retention::purge_expired_ip_records(&state.db, retention_days).await?;
+    if purged > 0 {
+        state.invalidate_membership_queries();
+    }
     create_audit_log(
         &state.db,
         &key,
@@ -2439,7 +2536,7 @@ pub async fn batch_records(
     )
     .await?;
 
-    txn.commit().await?;
+    state.commit_membership_write(txn).await?;
 
     for event in webhook_events {
         state.enqueue_webhook(event);

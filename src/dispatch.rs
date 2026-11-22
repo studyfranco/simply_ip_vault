@@ -29,12 +29,17 @@ use sea_orm::{
 };
 use serde::Serialize;
 use sha2::Sha256;
+use std::collections::HashMap;
+use std::error::Error;
+use std::fmt::Write as _;
 use std::net::IpAddr;
 use std::str::FromStr;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinSet;
-use tracing::{error, info, warn};
+use tokio::time::Instant;
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -104,49 +109,58 @@ fn is_blocked_address(ip: IpAddr) -> bool {
     }
 }
 
-/// Screens a webhook target URL against the SSRF blocklist before any connection is attempted.
-///
-/// **Every** address the host resolves to is checked, not just the first. A hostname with two A
-/// records — one public, one `127.0.0.1` — would otherwise pass this gate on the public record while
-/// the HTTP client independently re-resolves and picks the loopback one.
-///
-/// This remains a check-then-connect design, so it cannot stop a DNS rebinding attack where the
-/// second resolution (the client's own) returns a different answer than the one screened here.
-/// Closing that requires resolving once and pinning the socket address, i.e. a custom `reqwest`
-/// connector — see the SSRF entry in `AGENT_NOTES.MD`.
-async fn is_url_safe(url_str: &str, allow_private: bool) -> bool {
+/// Screens every resolved address before making a webhook request.
+async fn screen_url(url_str: &str, allow_private: bool) -> Result<(), ScreenFailure> {
     if allow_private {
-        return true;
+        return Ok(());
     }
-
-    let Ok(url) = reqwest::Url::parse(url_str) else {
-        return false;
-    };
-
-    // Only http/https can be dispatched at all; anything else fails closed rather than relying on
-    // the HTTP client to reject it later.
-    if url.scheme() != "http" && url.scheme() != "https" {
-        return false;
+    let url = reqwest::Url::parse(url_str).map_err(|_| ScreenFailure::Blocked)?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(ScreenFailure::Blocked);
     }
-
-    let Some(host_str) = url.host_str() else {
-        return false;
+    let host = url.host().ok_or(ScreenFailure::Blocked)?;
+    let hostname = match host {
+        url::Host::Ipv4(ip) => return screen_address(ip.into()),
+        url::Host::Ipv6(ip) => return screen_address(ip.into()),
+        url::Host::Domain(name) => name,
     };
-
     let port = url.port_or_known_default().unwrap_or(80);
-
-    let addrs: Vec<IpAddr> = match tokio::net::lookup_host((host_str, port)).await {
-        Ok(addrs) => addrs.map(|a| a.ip()).collect(),
-        Err(_) => return false,
-    };
-
-    // A name that resolves to nothing is not dispatchable; fail closed rather than "no bad
-    // addresses found, therefore safe".
-    if addrs.is_empty() {
-        return false;
+    let mut addresses =
+        tokio::time::timeout(WEBHOOK_TIMEOUT, tokio::net::lookup_host((hostname, port)))
+            .await
+            .map_err(|_| ScreenFailure::Dns("DNS lookup timed out".to_owned()))?
+            .map_err(|error| {
+                ScreenFailure::Dns(format!("DNS lookup failed: {}", error_chain(&error)))
+            })?
+            .peekable();
+    if addresses.peek().is_none() {
+        return Err(ScreenFailure::Dns(
+            "DNS lookup returned no addresses".to_owned(),
+        ));
     }
+    addresses.try_for_each(|address| screen_address(address.ip()))
+}
 
-    !addrs.into_iter().any(is_blocked_address)
+enum ScreenFailure {
+    Blocked,
+    Dns(String),
+}
+
+impl ScreenFailure {
+    fn reason(self) -> String {
+        match self {
+            Self::Blocked => "target_url resolves to an address this service refuses to contact (SSRF protection)".to_owned(),
+            Self::Dns(reason) => reason,
+        }
+    }
+}
+
+fn screen_address(ip: IpAddr) -> Result<(), ScreenFailure> {
+    if is_blocked_address(ip) {
+        Err(ScreenFailure::Blocked)
+    } else {
+        Ok(())
+    }
 }
 
 /// Expands a `CANONICAL_V1` webhook's `hmac_template` into the exact bytes to be signed.
@@ -352,7 +366,7 @@ fn resolve_event_variables_with_mode(
 /// Builds the HTTP client every outbound webhook call — dispatch or live test — is made through.
 ///
 /// One function so the two paths cannot drift on the properties that matter: the timeout, and
-/// **redirects refused rather than followed**. `is_url_safe` screens the *configured* target; a
+/// **redirects refused rather than followed**. `screen_url` screens the *configured* target; a
 /// receiver answering `302 Location: http://169.254.169.254/latest/meta-data/` would otherwise be
 /// followed by `reqwest`'s default policy without re-screening, handing the signed payload and any
 /// `X-API-Key` to whatever the redirect points at. A 3xx response is surfaced as a failed delivery
@@ -366,7 +380,7 @@ fn build_webhook_client() -> reqwest::Result<Client> {
 }
 
 /// Whether `ALLOW_PRIVATE_WEBHOOKS=true` is set — the documented development escape hatch that lets
-/// [`is_url_safe`] pass every target unscreened. Read fresh on every call rather than cached: unlike
+/// [`screen_url`] pass every target unscreened. Read fresh on every call rather than cached: unlike
 /// the security-relevant startup variables in `config.rs`, this one is explicitly meant to be safe to
 /// flip on a running dev instance, and caching it would make that lie.
 fn allow_private_webhooks() -> bool {
@@ -428,11 +442,20 @@ fn prepare_dispatch_with_cipher(
     config: &webhook_config::Model,
     event: &WebhookEvent,
 ) -> Result<PreparedDispatch, String> {
+    prepare_dispatch_at(cipher, config, event, chrono::Utc::now().timestamp())
+}
+
+fn prepare_dispatch_at(
+    cipher: &crate::crypto::SecretCipher,
+    config: &webhook_config::Model,
+    event: &WebhookEvent,
+    timestamp: i64,
+) -> Result<PreparedDispatch, String> {
     // Computed once and reused everywhere a timestamp is needed in this dispatch — the `$timestamp`
     // template variable and (for `CANONICAL_V1`) the signed `X-Timestamp` header both mean "when
     // this attempt was prepared", so they must be the same number, not two calls to `Utc::now()`
     // a few instructions apart that happen to usually agree.
-    let timestamp = chrono::Utc::now().timestamp().to_string();
+    let timestamp = timestamp.to_string();
 
     let payload = resolve_event_variables(
         &config.payload_template,
@@ -515,7 +538,7 @@ fn prepare_dispatch_with_cipher(
             // `$action`/`$ip`/etc. variables already expanded — so the signature covers the path a
             // receiver will actually see on the wire, not a literal `$action` that was never
             // dispatched anywhere. A URL that failed to parse cannot be dispatched at all, so
-            // failing here loses nothing (`is_url_safe` would reject it moments later regardless).
+            // failing here loses nothing (`screen_url` would reject it moments later regardless).
             let path = reqwest::Url::parse(&target_url)
                 .map_err(|e| format!("unparseable webhook target URL: {e}"))?
                 .path()
@@ -578,15 +601,77 @@ fn snippet(body: &str) -> String {
     }
 }
 
+fn error_chain(error: &dyn Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let _ = write!(message, ": {cause}");
+        source = cause.source();
+    }
+    message
+}
+
+fn request_error(error: reqwest::Error) -> String {
+    let (timeout, connect) = (error.is_timeout(), error.is_connect());
+    let chain = error_chain(&error.without_url());
+    // Reqwest exposes timeout and connect flags. DNS and TLS are identified
+    // from the lower-level diagnostics where the connector exposes them.
+    let lower = chain.to_ascii_lowercase();
+    let dns = lower.contains("dns");
+    let tls = lower.contains("tls") || lower.contains("certificate");
+    format!("{chain} [timeout={timeout}, connect={connect}, dns={dns}, tls={tls}]")
+}
+
+fn retry_after(value: &str, now: SystemTime) -> Option<Duration> {
+    let value = value.trim();
+    value
+        .parse::<u64>()
+        .map(Duration::from_secs)
+        .ok()
+        .or_else(|| {
+            let date = httpdate::parse_http_date(value).ok()?;
+            Some(date.duration_since(now).unwrap_or_default())
+        })
+}
+
+struct RetryPolicy {
+    retries: u32,
+    initial_ms: u64,
+    cap_ms: u64,
+}
+
+impl RetryPolicy {
+    fn configured() -> Self {
+        Self {
+            retries: crate::config::webhook_max_retries(),
+            initial_ms: crate::config::webhook_retry_backoff_ms(),
+            cap_ms: crate::config::webhook_max_backoff_ms(),
+        }
+    }
+
+    fn delay(&self, attempt: u32, server_delay: Option<Duration>, jitter_percent: u64) -> Duration {
+        // Scale the default 2, 5, 15, 30 second schedule with the configured initial delay.
+        let multiplier_twice = [2, 5, 15, 30][(attempt - 1).min(3) as usize];
+        let base = self.initial_ms.saturating_mul(multiplier_twice) / 2;
+        let jittered = base.saturating_mul(jitter_percent) / 100;
+        Duration::from_millis(jittered.max(1))
+            .max(server_delay.unwrap_or_default())
+            .min(Duration::from_millis(self.cap_ms))
+    }
+}
+
 /// Whether a delivery attempt should be retried, and why it succeeded or failed when it should not
 /// be.
 enum DispatchOutcome {
     /// `2xx`. Nothing more to do.
     Success { status: u16 },
-    /// A network-level failure (timeout, connection refused, DNS failure, TLS error — anything that
-    /// never produced an HTTP response) or a `5xx` response. The receiver, or the network path to
+    /// A network-level failure or an HTTP 429 or 5xx response. The receiver, or the network path to
     /// it, may recover, so this is worth retrying.
-    Transient { status: Option<u16>, reason: String },
+    Transient {
+        status: Option<u16>,
+        reason: String,
+        retry_after: Option<Duration>,
+    },
     /// A `4xx` response (or any other non-`5xx`, non-`2xx`/`3xx` status this service does not
     /// otherwise treat as success). The request reached the receiver and the receiver rejected it
     /// outright — a bad signature, a missing permission, a URL the receiver does not serve. Retrying
@@ -614,14 +699,17 @@ async fn attempt_delivery(
     {
         Ok(resp) => {
             let status = resp.status();
-            let is_success = status.is_success();
+            let server_delay = matches!(status.as_u16(), 429 | 503)
+                .then(|| resp.headers().get(reqwest::header::RETRY_AFTER))
+                .flatten()
+                .and_then(|value| retry_after(value.to_str().ok()?, SystemTime::now()));
             let body = resp
                 .text()
                 .await
                 .ok()
                 .filter(|b| !b.is_empty())
                 .map(|b| snippet(&b));
-            if is_success {
+            if status.is_success() {
                 return (
                     DispatchOutcome::Success {
                         status: status.as_u16(),
@@ -630,11 +718,12 @@ async fn attempt_delivery(
                 );
             }
             let reason = format!("HTTP {status}");
-            if status.is_server_error() {
+            if status.is_server_error() || status.as_u16() == 429 {
                 (
                     DispatchOutcome::Transient {
                         status: Some(status.as_u16()),
                         reason,
+                        retry_after: server_delay,
                     },
                     body,
                 )
@@ -655,7 +744,8 @@ async fn attempt_delivery(
         Err(e) => (
             DispatchOutcome::Transient {
                 status: None,
-                reason: e.to_string(),
+                reason: request_error(e),
+                retry_after: None,
             },
             None,
         ),
@@ -664,8 +754,7 @@ async fn attempt_delivery(
 
 /// Identity and event context for one dispatch attempt — everything [`log_execution`] needs to
 /// describe *which* delivery a `webhook_executions` row belongs to, beyond what [`PreparedDispatch`]
-/// already carries. Bundled so passing it through [`dispatch_with_retries`]/
-/// [`dispatch_with_retries_config`] doesn't keep growing their own parameter lists as more of an
+/// already carries. Bundled so passing it through [`dispatch_with_retries_config`] doesn't keep growing their own parameter lists as more of an
 /// event's data becomes worth persisting per attempt.
 struct DispatchContext {
     webhook_id: Uuid,
@@ -678,29 +767,174 @@ struct DispatchContext {
     cause: Option<String>,
 }
 
-/// Delivers one webhook, retrying transient failures with exponential backoff up to
-/// `config::webhook_max_retries` times before giving up.
-///
-/// A thin wrapper around [`dispatch_with_retries_config`] that supplies the live, `OnceLock`-cached
-/// configuration — split out purely so the retry *loop itself* (attempt counting, backoff growth,
-/// when it stops) is reachable with small, fast, deterministic values in a test, the same reason
-/// `config::clamp_pool_max` and friends are split from the functions that cache their inputs.
-async fn dispatch_with_retries(
-    client: Client,
-    prepared: PreparedDispatch,
-    ctx: DispatchContext,
-    db: DatabaseConnection,
-) {
-    dispatch_with_retries_config(
-        client,
-        prepared,
-        ctx,
-        crate::config::webhook_max_retries(),
-        crate::config::webhook_retry_backoff_ms(),
-        db,
-    )
-    .await;
+const CIRCUIT_THRESHOLD: u32 = 3;
+const COOLDOWNS: [u64; 3] = [60, 300, 600];
+const LOG_WINDOW: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+enum CircuitPhase {
+    #[default]
+    Closed,
+    Open(Instant),
+    HalfOpen,
 }
+
+#[derive(Clone, Copy)]
+struct DeliveryPermit {
+    generation: u64,
+    probe: bool,
+}
+
+#[derive(Default)]
+struct CircuitState {
+    phase: CircuitPhase,
+    generation: u64,
+    failures: u32,
+    cooldown_level: usize,
+    last_warning: Option<Instant>,
+    suppressed_count: u64,
+}
+
+impl CircuitState {
+    fn suppress(&mut self) {
+        self.suppressed_count = self.suppressed_count.saturating_add(1);
+    }
+
+    fn admit(&mut self, now: Instant) -> Option<DeliveryPermit> {
+        let probe = match self.phase {
+            CircuitPhase::Closed => false,
+            CircuitPhase::Open(until) if now >= until => {
+                self.phase = CircuitPhase::HalfOpen;
+                true
+            }
+            CircuitPhase::Open(_) | CircuitPhase::HalfOpen => {
+                self.suppress();
+                return None;
+            }
+        };
+        Some(DeliveryPermit {
+            generation: self.generation,
+            probe,
+        })
+    }
+
+    fn succeeded(&mut self, permit: DeliveryPermit) -> Option<u64> {
+        if self.generation != permit.generation {
+            return None;
+        }
+        let recovery = self.last_warning.is_some() || self.suppressed_count > 0 || permit.probe;
+        let suppressed = self.suppressed_count;
+        *self = Self {
+            generation: self.generation,
+            ..Self::default()
+        };
+        recovery.then_some(suppressed)
+    }
+
+    fn failed(
+        &mut self,
+        permit: DeliveryPermit,
+        trips_circuit: bool,
+        now: Instant,
+    ) -> Option<Duration> {
+        if self.generation != permit.generation {
+            self.suppress();
+            return None;
+        }
+        self.failures = if trips_circuit { self.failures + 1 } else { 0 };
+        if permit.probe || self.failures >= CIRCUIT_THRESHOLD {
+            let cooldown = Duration::from_secs(COOLDOWNS[self.cooldown_level]);
+            self.cooldown_level = (self.cooldown_level + 1).min(COOLDOWNS.len() - 1);
+            self.phase = CircuitPhase::Open(now + cooldown);
+            self.generation += 1;
+            self.last_warning = Some(now);
+            return Some(cooldown);
+        }
+        if self
+            .last_warning
+            .is_some_and(|last| now.duration_since(last) < LOG_WINDOW)
+        {
+            self.suppress();
+            return None;
+        }
+        self.last_warning = Some(now);
+        Some(Duration::ZERO)
+    }
+}
+
+#[derive(Default)]
+struct WebhookCircuit {
+    state: Mutex<CircuitState>,
+    retry: tokio::sync::Mutex<()>,
+}
+
+impl WebhookCircuit {
+    fn lock_state(&self) -> MutexGuard<'_, CircuitState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn report_failure(
+        &self,
+        permit: DeliveryPermit,
+        ctx: &DispatchContext,
+        attempt: u32,
+        (status, reason, body): (Option<u16>, &str, Option<&str>),
+        trips_circuit: bool,
+    ) {
+        let mut state = self.lock_state();
+        if let Some(cooldown) = state.failed(permit, trips_circuit, Instant::now()) {
+            warn!(
+                webhook_id = %ctx.webhook_id, webhook = %ctx.webhook_name, status, attempt, %reason,
+                body = %body.unwrap_or(""),
+                cooldown_seconds = cooldown.as_secs(), suppressed_count = state.suppressed_count,
+                "Webhook delivery failed"
+            );
+        }
+    }
+
+    fn is_current(&self, permit: DeliveryPermit) -> bool {
+        let mut state = self.lock_state();
+        if state.generation == permit.generation {
+            return true;
+        }
+        state.suppress();
+        false
+    }
+}
+
+async fn screened_attempt(
+    client: &Client,
+    url: &str,
+    headers: HeaderMap,
+    payload: String,
+    allow_private: bool,
+) -> (DispatchOutcome, Option<String>, bool) {
+    match screen_url(url, allow_private).await {
+        Ok(()) => {
+            let (outcome, body) = attempt_delivery(client, url, headers, payload).await;
+            (outcome, body, true)
+        }
+        Err(ScreenFailure::Dns(reason)) => (
+            DispatchOutcome::Transient {
+                status: None,
+                reason,
+                retry_after: None,
+            },
+            None,
+            false,
+        ),
+        Err(blocked) => (
+            DispatchOutcome::Permanent {
+                status: None,
+                reason: blocked.reason(),
+            },
+            None,
+            false,
+        ),
+    }
+}
+
+type WebhookCircuits = Arc<Mutex<HashMap<Uuid, (Instant, Arc<WebhookCircuit>)>>>;
 
 /// Persists one `webhook_executions` row for a single HTTP attempt — success, transient, or
 /// permanent alike, one row per attempt including retries, never a row for the delivery as a whole.
@@ -737,42 +971,41 @@ async fn log_execution(
     }
 }
 
-/// Logs at `info` on success, `warn` on a transient failure that will be retried, and `error` on the
-/// final failure — transient-and-exhausted or permanent-on-the-first-attempt alike — with the target
-/// URL, HTTP status (when one was received), the error reason, the attempt count, and a response body
-/// snippet when one is available. An operator grepping logs for a broken integration should never
-/// need to reproduce the failure to learn what it was.
-///
-/// Every attempt — including ones that will be retried — is also persisted to `webhook_executions`
-/// via [`log_execution`], so the dashboard's Executions tab shows the same retry history these logs
-/// describe.
+/// Persists each HTTP attempt and reports only terminal failures or circuit recovery.
 async fn dispatch_with_retries_config(
     client: Client,
-    prepared: PreparedDispatch,
+    mut prepare: impl FnMut() -> Result<PreparedDispatch, String>,
     ctx: DispatchContext,
-    max_retries: u32,
-    base_backoff_ms: u64,
+    policy: RetryPolicy,
     db: DatabaseConnection,
+    circuit: &WebhookCircuit,
+    allow_private: bool,
 ) {
-    let PreparedDispatch {
-        target_url,
-        headers,
-        payload,
-    } = prepared;
-
-    let mut attempt: u32 = 1;
-    loop {
-        let started = std::time::Instant::now();
-        let (outcome, body) =
-            attempt_delivery(&client, &target_url, headers.clone(), payload.clone()).await;
+    let Some(permit) = circuit.lock_state().admit(Instant::now()) else {
+        return;
+    };
+    let mut retry_guard = None;
+    for attempt in 1..=policy.retries + 1 {
+        // Refresh templated timestamps and signatures because earlier attempts may
+        // have been accepted by the receiver's replay guard before returning a 5xx.
+        let prepared = match prepare() {
+            Ok(prepared) => prepared,
+            Err(reason) => {
+                circuit.report_failure(permit, &ctx, attempt, (None, &reason, None), false);
+                return;
+            }
+        };
+        let PreparedDispatch {
+            target_url,
+            headers,
+            payload,
+        } = prepared;
+        let started = Instant::now();
+        let (outcome, body, made_request) =
+            screened_attempt(&client, &target_url, headers, payload, allow_private).await;
         let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
-
-        match outcome {
+        let (status, reason, transient, server_delay) = match outcome {
             DispatchOutcome::Success { status } => {
-                info!(
-                    webhook = %ctx.webhook_name, url = %target_url, status, attempt,
-                    body = %body.as_deref().unwrap_or(""), "Webhook delivered"
-                );
                 log_execution(
                     &db,
                     &ctx,
@@ -783,49 +1016,56 @@ async fn dispatch_with_retries_config(
                     body.as_deref(),
                 )
                 .await;
+                let recovery = circuit.lock_state().succeeded(permit);
+                if let Some(suppressed_count) = recovery {
+                    info!(webhook = %ctx.webhook_name, status, attempt, suppressed_count, "Webhook recovered");
+                } else {
+                    debug!(webhook = %ctx.webhook_name, status, attempt, "Webhook delivered");
+                }
                 return;
             }
-            DispatchOutcome::Permanent { status, reason } => {
-                error!(
-                    webhook = %ctx.webhook_name, url = %target_url, status, attempt, reason = %reason,
-                    body = %body.as_deref().unwrap_or(""),
-                    "Webhook delivery failed with a non-retryable error; not retrying"
-                );
-                // Whatever the receiver actually said back, when it said anything — `reason` here is
-                // only ever the computed `"HTTP {status}"` string, which the body (when present) is
-                // strictly more informative than.
-                let detail = body.as_deref().or(Some(reason.as_str()));
-                log_execution(&db, &ctx, &target_url, status, false, duration_ms, detail).await;
-                return;
-            }
-            DispatchOutcome::Transient { status, reason } if attempt <= max_retries => {
-                // `attempt` is 1-based, so the first retry (attempt 1 -> 2) waits one base interval,
-                // the second waits two, and so on — genuine exponential growth rather than a fixed
-                // pause repeated `max_retries` times. Shifting is capped well short of overflow;
-                // `webhook_max_retries` is itself clamped to at most 10, so this never approaches it.
-                let backoff_ms = base_backoff_ms.saturating_mul(1u64 << (attempt - 1).min(20));
-                warn!(
-                    webhook = %ctx.webhook_name, url = %target_url, status, attempt, max_retries,
-                    backoff_ms, reason = %reason, body = %body.as_deref().unwrap_or(""),
-                    "Webhook delivery failed with a transient error; retrying"
-                );
-                let detail = body.as_deref().or(Some(reason.as_str()));
-                log_execution(&db, &ctx, &target_url, status, false, duration_ms, detail).await;
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                attempt += 1;
-            }
-            DispatchOutcome::Transient { status, reason } => {
-                error!(
-                    webhook = %ctx.webhook_name, url = %target_url, status, attempt, max_retries,
-                    reason = %reason, body = %body.as_deref().unwrap_or(""),
-                    "Webhook delivery failed with a transient error and exhausted its retries; \
-                     giving up"
-                );
-                let detail = body.as_deref().or(Some(reason.as_str()));
-                log_execution(&db, &ctx, &target_url, status, false, duration_ms, detail).await;
-                return;
-            }
+            DispatchOutcome::Permanent { status, reason } => (status, reason, false, None),
+            DispatchOutcome::Transient {
+                status,
+                reason,
+                retry_after,
+            } => (status, reason, true, retry_after),
+        };
+        let detail = body.as_deref().or(Some(&reason));
+        if made_request {
+            log_execution(&db, &ctx, &target_url, status, false, duration_ms, detail).await;
         }
+        if transient && !permit.probe && attempt <= policy.retries {
+            // Let only one delivery per webhook back off at a time. Other failures still
+            // get an execution-history row, without occupying workers during the delay.
+            if retry_guard.is_none() {
+                retry_guard = circuit.retry.try_lock().ok();
+            }
+            if retry_guard.is_none() {
+                circuit.lock_state().suppress();
+                return;
+            }
+            if !circuit.is_current(permit) {
+                return;
+            }
+            let delay = policy.delay(attempt, server_delay, rand::random_range(80..=120));
+            debug!(webhook = %ctx.webhook_name, status, attempt, ?delay, %reason, "Retrying webhook delivery");
+            tokio::time::sleep(delay).await;
+            if !circuit.is_current(permit) {
+                return;
+            }
+            continue;
+        }
+
+        let trips_circuit = transient || matches!(status, Some(401 | 403));
+        circuit.report_failure(
+            permit,
+            &ctx,
+            attempt,
+            (status, &reason, body.as_deref()),
+            trips_circuit,
+        );
+        return;
     }
 }
 
@@ -857,7 +1097,7 @@ pub struct WebhookTestResult {
 /// the dashboard's webhook editor.
 ///
 /// Runs the **exact same** request-construction path as a real dispatch ([`prepare_dispatch`]) and
-/// the **exact same** SSRF screen ([`is_url_safe`]) — a test that skipped either would validate a
+/// the **exact same** SSRF screen ([`screen_url`]) — a test that skipped either would validate a
 /// request the receiver would never actually get, or would turn "Test Webhook" into an SSRF probe an
 /// authorized-but-untrusted caller could aim at the deployment's internal network.
 ///
@@ -931,17 +1171,14 @@ async fn prepare_test_dispatch(
         }
     };
 
-    if !is_url_safe(&prepared.target_url, allow_private).await {
+    if let Err(failure) = screen_url(&prepared.target_url, allow_private).await {
         warn!(url = %prepared.target_url, webhook = %config.name, "Test dispatch blocked by SSRF protection");
         return Err(WebhookTestResult {
             success: false,
             status: None,
             headers: None,
             body: None,
-            error: Some(
-                "target_url resolves to an address this service refuses to contact (SSRF protection)"
-                    .to_owned(),
-            ),
+            error: Some(failure.reason()),
             blocked_by_ssrf_filter: true,
         });
     }
@@ -1041,7 +1278,7 @@ async fn send_test_dispatch_with_privacy(
             }
         }
         Err(e) => {
-            let reason = e.to_string();
+            let reason = request_error(e);
             log_execution(
                 db,
                 &ctx,
@@ -1105,6 +1342,7 @@ async fn run_webhook_worker_with_privacy(
 
     let shared = std::sync::Arc::new(tokio::sync::Mutex::new(rx));
     let mut pool = JoinSet::new();
+    let circuits = WebhookCircuits::default();
 
     info!(
         workers,
@@ -1117,13 +1355,42 @@ async fn run_webhook_worker_with_privacy(
         let db = db.clone();
         let cipher = cipher.clone();
         let shared = shared.clone();
+        let circuits = circuits.clone();
         pool.spawn(async move {
-            dispatch_worker(id, db, cipher, shared, interval, allow_private_override).await;
+            dispatch_worker(
+                id,
+                db,
+                cipher,
+                shared,
+                interval,
+                allow_private_override,
+                circuits,
+            )
+            .await;
         });
     }
 
     while pool.join_next().await.is_some() {}
     info!("Webhook dispatch pool shut down.");
+}
+
+fn get_circuit(
+    circuits: &WebhookCircuits,
+    id: Uuid,
+    last_pruned: &mut Instant,
+) -> Arc<WebhookCircuit> {
+    let now = Instant::now();
+    let mut map = circuits.lock().unwrap_or_else(PoisonError::into_inner);
+    if now.duration_since(*last_pruned) >= LOG_WINDOW {
+        map.retain(|_, (last_use, circuit)| {
+            now.duration_since(*last_use) < Duration::from_secs(3600)
+                || Arc::strong_count(circuit) > 1
+        });
+        *last_pruned = now;
+    }
+    let (last_use, circuit) = map.entry(id).or_insert_with(|| (now, Arc::default()));
+    *last_use = now;
+    circuit.clone()
 }
 
 /// One worker: take an event, dispatch it, pause, repeat.
@@ -1134,6 +1401,7 @@ async fn dispatch_worker(
     rx: std::sync::Arc<tokio::sync::Mutex<Receiver<WebhookEvent>>>,
     interval: Duration,
     allow_private_override: Option<bool>,
+    circuits: WebhookCircuits,
 ) {
     let client = match build_webhook_client() {
         Ok(c) => c,
@@ -1147,6 +1415,7 @@ async fn dispatch_worker(
     };
 
     let mut join_set = JoinSet::new();
+    let mut last_pruned = Instant::now();
 
     info!(worker = id, "Webhook worker started.");
 
@@ -1162,7 +1431,7 @@ async fn dispatch_worker(
             }
         };
 
-        info!(address = %event.address, action = %event.action, "Processing event for webhooks");
+        debug!(address = %event.address, action = %event.action, "Processing event for webhooks");
 
         let Some(gid) = event.group_id else {
             continue;
@@ -1195,14 +1464,6 @@ async fn dispatch_worker(
                 let _ = join_set.join_next().await;
             }
 
-            let prepared = match prepare_dispatch_with_cipher(cipher.as_ref(), &config, &event) {
-                Ok(p) => p,
-                Err(reason) => {
-                    error!(webhook = %config.name, reason = %reason, "Webhook dispatch could not be prepared; skipping");
-                    continue;
-                }
-            };
-
             let client = client.clone();
             let ctx = DispatchContext {
                 webhook_id: config.id,
@@ -1212,14 +1473,25 @@ async fn dispatch_worker(
                 cause: event.cause.clone(),
             };
             let exec_db = db.clone();
-
+            let circuit = get_circuit(&circuits, config.id, &mut last_pruned);
+            let cipher = cipher.clone();
+            let event = event.clone();
             join_set.spawn(async move {
                 let allow_private = allow_private_override.unwrap_or_else(allow_private_webhooks);
-                if !is_url_safe(&prepared.target_url, allow_private).await {
-                    warn!(url = %prepared.target_url, webhook = %ctx.webhook_name, "Webhook blocked by SSRF protection");
-                    return;
-                }
-                dispatch_with_retries(client, prepared, ctx, exec_db).await;
+                let mut last_timestamp = 0_i64;
+                dispatch_with_retries_config(
+                    client,
+                    || {
+                        last_timestamp = chrono::Utc::now().timestamp().max(last_timestamp + 1);
+                        prepare_dispatch_at(&cipher, &config, &event, last_timestamp)
+                    },
+                    ctx,
+                    RetryPolicy::configured(),
+                    exec_db,
+                    &circuit,
+                    allow_private,
+                )
+                .await;
             });
         }
 
@@ -1243,6 +1515,117 @@ async fn dispatch_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_chain_includes_nested_sources() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("delivery failed")]
+        struct DeliveryError(#[source] std::io::Error);
+
+        let error = DeliveryError(std::io::Error::other("resolver unavailable"));
+        assert_eq!(error_chain(&error), "delivery failed: resolver unavailable");
+
+        let error = Client::new().get("invalid-url").build().unwrap_err();
+        let chain = request_error(error);
+        assert!(chain.contains("relative URL"), "{chain}");
+        assert!(chain.contains("timeout=false, connect=false, dns=false, tls=false"));
+    }
+
+    #[test]
+    fn backoff_jitter_and_retry_after_respect_the_cap() {
+        let policy = RetryPolicy {
+            retries: 4,
+            initial_ms: 2_000,
+            cap_ms: 36_000,
+        };
+        for (attempt, secs) in (1..).zip([2, 5, 15, 30]) {
+            assert_eq!(policy.delay(attempt, None, 100), Duration::from_secs(secs));
+            assert_eq!(
+                policy.delay(attempt, None, 80),
+                Duration::from_millis(secs * 800)
+            );
+            assert_eq!(
+                policy.delay(attempt, None, 120),
+                Duration::from_millis(secs * 1200)
+            );
+        }
+
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let date = httpdate::fmt_http_date(now + Duration::from_secs(12));
+        for (header, expected) in [("90", 36), (date.as_str(), 12)] {
+            let wait = retry_after(header, now).unwrap();
+            assert_eq!(
+                policy.delay(1, Some(wait), 80),
+                Duration::from_secs(expected)
+            );
+        }
+        assert_eq!(
+            retry_after(&date, now + Duration::from_secs(15)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(retry_after("invalid", now), None);
+    }
+
+    #[test]
+    fn circuit_escalates_allows_a_single_probe_and_resets() {
+        let mut state = CircuitState::default();
+        let mut now = Instant::now();
+        let permit = state.admit(now).unwrap();
+        for _ in 1..CIRCUIT_THRESHOLD {
+            state.failed(permit, true, now);
+        }
+        assert_eq!(
+            state.failed(permit, true, now),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            state.succeeded(permit),
+            None,
+            "stale responses cannot close the circuit"
+        );
+
+        for (wait, next) in [(60, 300), (300, 600), (600, 600)] {
+            assert!(state.admit(now + Duration::from_secs(wait - 1)).is_none());
+            now += Duration::from_secs(wait);
+            let probe = state.admit(now).unwrap();
+            assert!(probe.probe);
+            assert!(state.admit(now).is_none());
+            assert_eq!(
+                state.failed(probe, true, now),
+                Some(Duration::from_secs(next))
+            );
+        }
+
+        now += Duration::from_secs(600);
+        let probe = state.admit(now).unwrap();
+        assert_eq!(state.succeeded(probe), Some(7));
+        assert!(matches!(state.phase, CircuitPhase::Closed));
+        assert_eq!(state.failures, 0);
+        assert_eq!(state.cooldown_level, 0);
+    }
+
+    #[test]
+    fn repeated_failure_logs_are_suppressed_until_window_expires_or_delivery_recovers() {
+        let mut state = CircuitState::default();
+        let now = Instant::now();
+        let permit = state.admit(now).unwrap();
+        assert_eq!(state.failed(permit, false, now), Some(Duration::ZERO));
+        for _ in 0..4 {
+            assert_eq!(
+                state.failed(permit, false, now + Duration::from_secs(1)),
+                None
+            );
+        }
+        assert_eq!(state.suppressed_count, 4);
+        assert_eq!(
+            state.failed(permit, false, now + LOG_WINDOW),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(state.succeeded(permit), Some(4));
+        assert_eq!(state.suppressed_count, 0);
+        assert_eq!(state.succeeded(permit), None);
+    }
+
     use sea_orm::PaginatorTrait;
 
     #[test]
@@ -1522,16 +1905,28 @@ mod tests {
     #[tokio::test]
     async fn url_screening_rejects_literals_and_non_http_schemes() {
         // Address literals need no DNS, so these assertions are hermetic.
-        assert!(!is_url_safe("http://127.0.0.1:8080/hook", false).await);
-        assert!(!is_url_safe("http://169.254.169.254/latest/meta-data/", false).await);
-        assert!(!is_url_safe("http://[::ffff:127.0.0.1]/hook", false).await);
-        assert!(!is_url_safe("http://10.0.0.1/hook", false).await);
-        assert!(!is_url_safe("file:///etc/passwd", false).await);
-        assert!(!is_url_safe("gopher://127.0.0.1:70/", false).await);
-        assert!(!is_url_safe("not a url", false).await);
+        assert!(
+            screen_url("http://127.0.0.1:8080/hook", false)
+                .await
+                .is_err()
+        );
+        assert!(
+            screen_url("http://169.254.169.254/latest/meta-data/", false)
+                .await
+                .is_err()
+        );
+        assert!(
+            screen_url("http://[::ffff:127.0.0.1]/hook", false)
+                .await
+                .is_err()
+        );
+        assert!(screen_url("http://10.0.0.1/hook", false).await.is_err());
+        assert!(screen_url("file:///etc/passwd", false).await.is_err());
+        assert!(screen_url("gopher://127.0.0.1:70/", false).await.is_err());
+        assert!(screen_url("not a url", false).await.is_err());
 
         // The documented development escape hatch still bypasses the whole check.
-        assert!(is_url_safe("http://127.0.0.1:8080/hook", true).await);
+        assert!(screen_url("http://127.0.0.1:8080/hook", true).await.is_ok());
     }
 
     #[test]
@@ -1724,6 +2119,7 @@ mod tests {
                     200 => "OK",
                     403 => "Forbidden",
                     404 => "Not Found",
+                    429 => "Too Many Requests",
                     500 => "Internal Server Error",
                     503 => "Service Unavailable",
                     _ => "Status",
@@ -1731,8 +2127,13 @@ mod tests {
                 tokio::spawn(async move {
                     let mut buf = [0u8; 1024];
                     let _ = socket.read(&mut buf).await;
+                    let retry = if status == 429 {
+                        "Retry-After: 7\r\n"
+                    } else {
+                        ""
+                    };
                     let response = format!(
-                        "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        "HTTP/1.1 {status} {reason}\r\n{retry}Content-Length: 0\r\nConnection: close\r\n\r\n"
                     );
                     let _ = socket.write_all(response.as_bytes()).await;
                 });
@@ -1933,6 +2334,24 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn rate_limited_response_is_transient_and_carries_retry_after() {
+        let (addr, _) = spawn_status_sequence_server(vec![429]).await;
+        let client = build_webhook_client().unwrap();
+        let (outcome, _) = attempt_delivery(
+            &client,
+            &format!("http://{addr}/"),
+            HeaderMap::new(),
+            String::new(),
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            DispatchOutcome::Transient { status: Some(429), retry_after: Some(wait), .. }
+                if wait == Duration::from_secs(7)
+        ));
+    }
+
     /// A receiver's actual reply must come back on **every** outcome that reached the network —
     /// success included, not only failure. Before this, the body was read only on a non-2xx
     /// response; a 200 with a JSON acknowledgement was discarded entirely.
@@ -1981,11 +2400,16 @@ mod tests {
 
         dispatch_with_retries_config(
             client,
-            dummy_prepared(format!("http://{addr}/")),
+            || Ok(dummy_prepared(format!("http://{addr}/"))),
             dummy_ctx(webhook_id, "IP_ADD"),
-            /* max_retries */ 5,
-            /* base_backoff_ms */ 1,
+            RetryPolicy {
+                retries: 5,
+                initial_ms: 1,
+                cap_ms: 20,
+            },
             db.clone(),
+            &WebhookCircuit::default(),
+            true,
         )
         .await;
 
@@ -2013,11 +2437,16 @@ mod tests {
 
         dispatch_with_retries_config(
             client,
-            dummy_prepared(format!("http://{addr}/")),
+            || Ok(dummy_prepared(format!("http://{addr}/"))),
             dummy_ctx(webhook_id, "IP_ADD"),
-            /* max_retries */ 5,
-            /* base_backoff_ms */ 1,
+            RetryPolicy {
+                retries: 5,
+                initial_ms: 1,
+                cap_ms: 20,
+            },
             db.clone(),
+            &WebhookCircuit::default(),
+            true,
         )
         .await;
 
@@ -2049,11 +2478,16 @@ mod tests {
 
         dispatch_with_retries_config(
             client,
-            dummy_prepared(format!("http://{addr}/")),
+            || Ok(dummy_prepared(format!("http://{addr}/"))),
             dummy_ctx(webhook_id, "IP_ADD"),
-            /* max_retries */ 2,
-            /* base_backoff_ms */ 1,
+            RetryPolicy {
+                retries: 2,
+                initial_ms: 1,
+                cap_ms: 20,
+            },
             db.clone(),
+            &WebhookCircuit::default(),
+            true,
         )
         .await;
 
@@ -2082,11 +2516,16 @@ mod tests {
 
         dispatch_with_retries_config(
             client,
-            dummy_prepared(format!("http://{addr}/")),
+            || Ok(dummy_prepared(format!("http://{addr}/"))),
             dummy_ctx(webhook_id, "IP_ADD"),
-            /* max_retries */ 5,
-            /* base_backoff_ms */ 1,
+            RetryPolicy {
+                retries: 5,
+                initial_ms: 1,
+                cap_ms: 20,
+            },
             db.clone(),
+            &WebhookCircuit::default(),
+            true,
         )
         .await;
 
@@ -2126,11 +2565,16 @@ mod tests {
 
         dispatch_with_retries_config(
             client,
-            dummy_prepared(resolved_url.clone()),
+            || Ok(dummy_prepared(resolved_url.clone())),
             ctx,
-            /* max_retries */ 5,
-            /* base_backoff_ms */ 1,
+            RetryPolicy {
+                retries: 5,
+                initial_ms: 1,
+                cap_ms: 20,
+            },
             db.clone(),
+            &WebhookCircuit::default(),
+            true,
         )
         .await;
 
@@ -2160,11 +2604,16 @@ mod tests {
 
         dispatch_with_retries_config(
             client,
-            dummy_prepared(format!("http://{addr}/")),
+            || Ok(dummy_prepared(format!("http://{addr}/"))),
             dummy_ctx(webhook_id, "IP_ADD"),
-            /* max_retries */ 5,
-            /* base_backoff_ms */ 1,
+            RetryPolicy {
+                retries: 5,
+                initial_ms: 1,
+                cap_ms: 20,
+            },
             db.clone(),
+            &WebhookCircuit::default(),
+            true,
         )
         .await;
 

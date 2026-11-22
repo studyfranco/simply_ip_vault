@@ -363,8 +363,7 @@ class PagedCache {
             this._visible = null;
             this.serverOffset += chunk.length;
             this.hasMoreOnServer = chunk.length === this.chunkSize;
-            this.prefetching = null;
-        })();
+        })().finally(() => { this.prefetching = null; });
         return this.prefetching;
     }
 
@@ -421,7 +420,7 @@ class PagedCache {
     _maybePrefetch() {
         if (!this.hasMoreOnServer || this.prefetching) return;
         if (this.localPage === this.totalLocalPages - 2) {
-            this.fetchNextChunk();
+            this.fetchNextChunk().catch(() => {});
         }
     }
 }
@@ -522,8 +521,6 @@ class FirewallClient {
             // at once. `null` the rest of the time, including after key-rotation's own use of the
             // same reveal modal.
             pendingCloneEditId: null,
-            analyticsData: null,
-            analyticsDataTime: 0,
             intersectionPage: 0,
             intersectionLimit: 25,
             intersectionTotal: 0,
@@ -533,7 +530,7 @@ class FirewallClient {
         // IP records and audit logs are both large, append-only lists — fetched from the server
         // 100 at a time and paginated locally 15 at a time via PagedCache, instead of one small
         // network round-trip per page.
-        this.ipCache = new PagedCache({ fetchChunk: (offset, limit) => this.fetchIpsChunk(offset, limit) });
+        this.ipCache = new PagedCache({ fetchChunk: async () => [] });
         this.auditCache = new PagedCache({ fetchChunk: (offset, limit) => this.fetchAuditLogsChunk(offset, limit) });
         this.executionsCache = new PagedCache({ fetchChunk: (offset, limit) => this.fetchExecutionsChunk(offset, limit) });
 
@@ -541,7 +538,7 @@ class FirewallClient {
         // setOptions() on each. The IP-group filter is free-text (its value IS the substring
         // filter sent to the API); the other two require picking an actual existing group.
         // Explicitly selecting a suggestion is a deliberate action (not a keystroke), so it's
-        // exempt from the "search fires on Enter/button only" rule and searches immediately.
+        // Selecting a suggestion applies the filter immediately.
         this.groupFilterCombobox = new SearchableSelect({
             rootId: 'group-filter-combobox',
             searchId: 'group-filter',
@@ -758,6 +755,7 @@ class FirewallClient {
         // requesting the full URL. Mutating fields all travel in the (signed) body. Computed fresh
         // on *every* call — including every retry, since a fresh timestamp is what a retry needs to
         // avoid the anti-replay guard (see the class doc comment above).
+        options.signal?.throwIfAborted();
         const method = (options.method || 'GET').toUpperCase();
         const rawBody = options.body ?? '';
         let nowSec = Math.floor(Date.now() / 1000);
@@ -863,6 +861,7 @@ class FirewallClient {
      * outcome. Split out so `apiFetch` itself reads as "one attempt", not "an attempt plus a retry
      * loop tangled into the same function". */
     async _retryTransientFailureOrGiveUp(endpoint, options, attempt, error) {
+        options.signal?.throwIfAborted();
         if (attempt >= FirewallClient.API_FETCH_MAX_RETRIES) {
             this.showToast('Server busy or network error. Please try again.', 'error');
             throw error;
@@ -1107,17 +1106,14 @@ class FirewallClient {
         await Promise.allSettled(tasks);
     }
 
-    // Fetches one chunk (up to 100 records) from the server for the current filter values —
-    // called by PagedCache, both for the initial page and for background prefetches. Filter
-    // values are read fresh on every call (not captured once) so a prefetch mid-typing session
-    // still reflects whatever was actually searched, not stale values from page load.
-    async fetchIpsChunk(offset, limit) {
+    // Snapshot the filters once so prefetches stay on the same result set.
+    ipSearchParams() {
         const ipQ = document.getElementById('ip-filter').value;
         const groupQ = document.getElementById('group-filter').value;
         const causeQ = document.getElementById('cause-filter').value;
         const statQ = document.getElementById('status-filter').value;
 
-        const params = new URLSearchParams({ limit, offset, include_total: 'true' });
+        const params = new URLSearchParams();
         if (ipQ) params.append('ip', ipQ);
         if (groupQ) params.append('group_name', groupQ);
         if (causeQ) params.append('cause', causeQ);
@@ -1136,12 +1132,16 @@ class FirewallClient {
             }
         }
 
-        // `include_total=true` above wraps the response as `{data, total, ...}` instead of the
-        // bare array `GET /api/ips` returns by default; re-shaped here to the `{items, total}`
-        // form `PagedCache._absorbChunk` expects, so PagedCache itself stays ignorant of which
-        // tab's fetcher happens to report an exact count.
-        const body = await this.apiFetch(`/ips?${params.toString()}`);
-        return { items: body.data ?? [], total: body.total };
+        return params;
+    }
+
+    async fetchIpsChunk(filters, offset, limit, signal) {
+        const params = new URLSearchParams(filters);
+        params.set('limit', limit);
+        params.set('offset', offset);
+        if (offset === 0) params.set('include_total', 'true');
+        const body = await this.apiFetch(`/ips?${params.toString()}`, { signal });
+        return offset === 0 ? { items: body.data ?? [], total: body.total } : body;
     }
 
     // Client-side half of the date range: the upper bound. Returns null when no bound is set, so
@@ -1163,25 +1163,43 @@ class FirewallClient {
         };
     }
 
-    async loadIps() {
+    async loadIps(force = false) {
+        if (!force && (this.ipSearchTimer || this.ipLoading)) return;
+        this.ipRequest?.abort();
+        const request = new AbortController();
+        this.ipRequest = request;
+        this.ipLoading = true;
+        const filters = this.ipSearchParams();
+        const cache = new PagedCache({
+            pageSize: this.ipCache.pageSize,
+            fetchChunk: (offset, limit) => this.fetchIpsChunk(filters, offset, limit, request.signal)
+        });
         try {
+            cache.setFilter(this.ipDateFilter());
+            await cache.loadFirstChunk();
+            request.signal.throwIfAborted();
             this.state.selectedIpIds.clear();
-            this.ipCache.setFilter(this.ipDateFilter());
-            await this.ipCache.loadFirstChunk();
+            this.ipCache = cache;
             this.renderIpTable();
             this.updatePaginationUI();
-            // After the first render, and not before: "Auto" sizes itself by measuring a real row,
-            // which only exists once something has been drawn. Re-renders internally if the
-            // measurement disagrees with the current page size.
             this.syncIpTableViewport();
-        } catch(e) {}
+        } catch (e) {
+            // apiFetch reports request errors. Superseded searches leave the current view in place.
+        } finally {
+            if (this.ipRequest === request) this.ipLoading = false;
+        }
     }
 
-    // Discards the current IP cache and fetches fresh from the server with whatever's currently
-    // in the filter inputs — the explicit "search" action (button click / Enter / combobox pick),
-    // never fired on every keystroke.
     triggerIpSearch() {
-        this.loadIps();
+        clearTimeout(this.ipSearchTimer);
+        this.ipSearchTimer = null;
+        this.loadIps(true);
+    }
+
+    scheduleIpSearch() {
+        clearTimeout(this.ipSearchTimer);
+        this.ipRequest?.abort();
+        this.ipSearchTimer = setTimeout(() => this.triggerIpSearch(), 350);
     }
 
     async loadKeys() {
@@ -1303,13 +1321,7 @@ class FirewallClient {
         `).join('');
     }
 
-    async loadAnalytics(force = false) {
-        // Cache analytics data for 5 minutes unless forced to avoid repeated heavy queries
-        if (!force && this.state.analyticsData && this.state.analyticsDataTime && (Date.now() - this.state.analyticsDataTime < 300000)) {
-            this.renderAnalytics(this.state.analyticsData);
-            return;
-        }
-
+    async loadAnalytics() {
         if (this._analyticsLoading) return;
         this._analyticsLoading = true;
 
@@ -1325,8 +1337,6 @@ class FirewallClient {
 
         try {
             const data = await this.apiFetch('/stats/analytics');
-            this.state.analyticsData = data;
-            this.state.analyticsDataTime = Date.now();
             this.renderAnalytics(data);
         } catch (e) {
             console.error('Failed to load analytics', e);
@@ -2949,7 +2959,7 @@ class FirewallClient {
         try {
             await this.apiFetch(`/groups/${id}`, { method: 'DELETE' });
             this.loadGroups();
-            this.loadIps();
+            this.triggerIpSearch();
         } catch(e) {}
     }
 
@@ -2973,7 +2983,7 @@ class FirewallClient {
             failed === 0 ? 'success' : 'error'
         );
         this.loadGroups();
-        this.loadIps();
+        this.triggerIpSearch();
     }
 
     /**
@@ -3567,7 +3577,7 @@ class FirewallClient {
                 const panel = document.getElementById(`tab-${trg.dataset.tab}`);
                 if (panel) panel.classList.add('active');
                 if (trg.dataset.tab === 'analytics') {
-                    this.loadAnalytics(false);
+                    this.loadAnalytics();
                 }
             });
         });
@@ -3594,8 +3604,9 @@ class FirewallClient {
             }
         });
 
-        // Filters — explicit search only: the search button, Enter in a text filter, or the
-        // status dropdown's own change event. Typing alone no longer fires a request.
+        for (const id of ['ip-filter', 'group-filter', 'cause-filter']) {
+            document.getElementById(id).addEventListener('input', () => this.scheduleIpSearch());
+        }
         document.getElementById('ip-search-btn').addEventListener('click', () => this.triggerIpSearch());
         document.getElementById('ip-filter').addEventListener('keydown', (e) => {
             if (e.key === 'Enter') { e.preventDefault(); this.triggerIpSearch(); }
@@ -3967,7 +3978,7 @@ class FirewallClient {
         });
 
         // Analytics & Recidivism
-        document.getElementById('refresh-analytics-btn')?.addEventListener('click', () => this.loadAnalytics(true));
+        document.getElementById('refresh-analytics-btn')?.addEventListener('click', () => this.loadAnalytics());
         document.getElementById('intersection-compare-btn')?.addEventListener('click', () => this.loadIntersection(0));
         document.getElementById('intersection-btn-prev')?.addEventListener('click', () => {
             if (this.state.intersectionPage > 0) {

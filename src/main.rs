@@ -379,9 +379,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Retention sweep for soft-deleted IP records. Its own shutdown channel, so it drains on
     // SIGTERM instead of being cancelled mid-delete.
     let (retention_tx, retention_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let retention_db = db.clone();
+    let retention_state = state.clone();
     let retention_handle = tokio::spawn(async move {
-        simply_ip_vault::retention::run_retention_worker(retention_db, retention_rx).await;
+        simply_ip_vault::retention::run_retention_worker_with_state(retention_state, retention_rx)
+            .await;
     });
 
     // Incremental vacuum and WAL truncation every 12 hours. Same shutdown pattern as retention.

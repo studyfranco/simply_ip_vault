@@ -34,6 +34,7 @@ mod m20261111_190000_fix_sqlite_listing_index_regression;
 mod m20261114_120000_add_webhook_send_normalized_ipv6;
 mod m20261119_120000_widen_variable_length_columns;
 mod m20261119_130000_add_ip_group_ban_policy;
+mod m20261119_140000_add_membership_lookup_indexes;
 
 /// The ordered set of all schema migrations for `simply_ip_vault`.
 pub struct Migrator;
@@ -75,6 +76,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261114_120000_add_webhook_send_normalized_ipv6::Migration),
             Box::new(m20261119_120000_widen_variable_length_columns::Migration),
             Box::new(m20261119_130000_add_ip_group_ban_policy::Migration),
+            Box::new(m20261119_140000_add_membership_lookup_indexes::Migration),
         ]
     }
 }

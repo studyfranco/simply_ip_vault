@@ -290,7 +290,7 @@ async fn group_name_resolution_and_scoped_listing_plan_cleanly() {
         "group name lookup must not scan the groups table: {plan}"
     );
 
-    // Verify single-group count and listing use idx_memberships_group_is_deleted_last_seen
+    // Verify single-group counts use a covering seek on both equality predicates.
     let count_plan = explain(
         &db,
         "SELECT COUNT(*) AS row_count FROM ip_record_group_memberships WHERE is_deleted = ? AND group_id = ?",
@@ -298,9 +298,10 @@ async fn group_name_resolution_and_scoped_listing_plan_cleanly() {
     .await;
     println!("single group count plan: {count_plan}");
     assert!(
-        count_plan.contains("idx_memberships_group_is_deleted_last_seen")
-            || count_plan.contains("idx_memberships_group_is_deleted_ip_record"),
-        "single group count must use an index leading with (group_id, is_deleted): {count_plan}"
+        count_plan.contains("USING COVERING INDEX")
+            && (count_plan.contains("(group_id=? AND is_deleted=?)")
+                || count_plan.contains("(is_deleted=? AND group_id=?)")),
+        "single group count must seek by both group_id and is_deleted: {count_plan}"
     );
 
     let list_plan = explain(

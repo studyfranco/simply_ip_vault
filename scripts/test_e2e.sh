@@ -486,6 +486,8 @@ DATABASE_URL="sqlite://$DB_PATH?mode=rwc" RUST_LOG=info INITIAL_MASTER_KEY="$MAS
     INITIAL_MASTER_SIGNING_SECRET="$MASTER_SIGNING_SECRET" \
     VAULT_ENCRYPTION_KEY="$E2E_ENCRYPTION_KEY" \
     ALLOW_PRIVATE_WEBHOOKS=true \
+    WEBHOOK_INITIAL_BACKOFF_MS="${WEBHOOK_INITIAL_BACKOFF_MS:-20}" \
+    WEBHOOK_MAX_BACKOFF_MS="${WEBHOOK_MAX_BACKOFF_MS:-300}" \
     TRUSTED_PROXIES="localhost" \
     PORT="$VAULT_PORT" \
     "$PROJECT_ROOT/target/debug/simply_ip_vault" >"$SERVER_LOG" 2>&1 &
@@ -3806,22 +3808,33 @@ log_section "31. Webhook Integration via simply_hook_executor (live receiver)"
 HOOK_EXECUTOR_DIR="$PROJECT_ROOT/example/simply_hook_executor"
 HOOK_EXECUTOR_AVAILABLE=0
 
-if [ ! -d "$HOOK_EXECUTOR_DIR" ]; then
+# Use an existing executable when the sibling checkout must stay read-only.
+if [ -n "${HOOK_EXECUTOR_BIN:-}" ]; then
+    if [ ! -x "$HOOK_EXECUTOR_BIN" ]; then
+        err "HOOK_EXECUTOR_BIN is not executable: $HOOK_EXECUTOR_BIN"
+        exit 1
+    fi
+    HOOK_EXECUTOR_AVAILABLE=1
+elif [ ! -d "$HOOK_EXECUTOR_DIR" ]; then
     warn "example/simply_hook_executor not found — skipping §31 (live webhook integration)."
 elif ! command -v cargo >/dev/null 2>&1; then
     warn "cargo not found — skipping §31 (live webhook integration)."
 else
     log "Building simply_hook_executor from $HOOK_EXECUTOR_DIR ..."
+    HOOK_EXECUTOR_BIN="$HOOK_EXECUTOR_DIR/target/debug/simply_hook_executor"
     if ! (cd "$HOOK_EXECUTOR_DIR" && cargo build --quiet 2>"$WORK_DIR/hook_executor_build.log"); then
         warn "simply_hook_executor failed to build — skipping §31. Build log:"
         cat "$WORK_DIR/hook_executor_build.log" >&2
-    elif [ ! -x "$HOOK_EXECUTOR_DIR/target/debug/simply_hook_executor" ]; then
+    elif [ ! -x "$HOOK_EXECUTOR_BIN" ]; then
         warn "simply_hook_executor binary not found after build — skipping §31."
-    elif command -v fuser >/dev/null 2>&1 && fuser "$HOOK_EXECUTOR_PORT/tcp" >/dev/null 2>&1; then
-        warn "Port $HOOK_EXECUTOR_PORT is already in use — skipping §31."
     else
         HOOK_EXECUTOR_AVAILABLE=1
     fi
+fi
+
+if [ "$HOOK_EXECUTOR_AVAILABLE" -eq 1 ] && port_in_use "$HOOK_EXECUTOR_PORT"; then
+    err "Port $HOOK_EXECUTOR_PORT is already in use."
+    exit 1
 fi
 
 if [ "$HOOK_EXECUTOR_AVAILABLE" -eq 1 ]; then
@@ -3849,7 +3862,7 @@ if [ "$HOOK_EXECUTOR_AVAILABLE" -eq 1 ]; then
         INITIAL_MASTER_KEY="$HOOK_EXECUTOR_MASTER_KEY" \
         ALLOWED_SCRIPT_ROOTS="$HOOK_SCRIPT_DIR" \
         BIND_HOST="127.0.0.1" PORT="$HOOK_EXECUTOR_PORT" \
-        "$HOOK_EXECUTOR_DIR/target/debug/simply_hook_executor" >"$HOOK_EXECUTOR_LOG" 2>&1 &
+        "$HOOK_EXECUTOR_BIN" >"$HOOK_EXECUTOR_LOG" 2>&1 &
     HOOK_EXECUTOR_PID=$!
 
     HOOK_EXECUTOR_READY=0

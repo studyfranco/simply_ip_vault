@@ -265,7 +265,7 @@ pub async fn create_ip_group(
         .await?
         .pop()
         .ok_or(AppError::Internal)?;
-    txn.commit().await?;
+    state.commit_membership_write(txn).await?;
     Ok(Json(response))
 }
 
@@ -335,7 +335,7 @@ pub async fn update_ip_group(
         .await?
         .pop()
         .ok_or(AppError::Internal)?;
-    txn.commit().await?;
+    state.commit_membership_write(txn).await?;
     Ok(Json(response))
 }
 
@@ -400,6 +400,7 @@ pub async fn delete_ip_group(
     guard_resource_lifecycle(&key, group.owner_key_id, "group", "delete")?;
 
     let result = IpGroup::delete_by_id(id).exec(&state.db).await?;
+    state.invalidate_membership_queries();
     if result.rows_affected == 0 {
         return Err(AppError::NotFound);
     }
@@ -449,6 +450,7 @@ pub async fn reassign_group_owner(
     let mut active: ip_group::ActiveModel = group.into();
     active.owner_key_id = Set(owner);
     active.update(&state.db).await?;
+    state.invalidate_membership_queries();
 
     create_audit_log(
         &state.db,

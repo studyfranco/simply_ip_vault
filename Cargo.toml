@@ -21,6 +21,8 @@ sea-orm = { version = "2", features = ["sqlx-postgres", "sqlx-mysql", "sqlx-sqli
 sea-orm-migration = { version = "2", features = ["runtime-tokio-rustls", "sqlx-postgres", "sqlx-mysql", "sqlx-sqlite"] }
 ipnet = "2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+httpdate = "1"
+url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 serde = { version = "1", features = ["derive"] }

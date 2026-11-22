@@ -146,8 +146,7 @@ pub const WEBHOOK_QUEUE_ENV: &str = "WEBHOOK_QUEUE_CAPACITY";
 /// Maximum retry attempts for a transient webhook delivery failure. Env `WEBHOOK_MAX_RETRIES`.
 pub const WEBHOOK_MAX_RETRIES_ENV: &str = "WEBHOOK_MAX_RETRIES";
 
-/// Base backoff between retry attempts, in milliseconds, doubled on each subsequent attempt. Env
-/// `WEBHOOK_RETRY_BACKOFF_MS`.
+/// Legacy initial retry delay override. Env `WEBHOOK_RETRY_BACKOFF_MS`.
 pub const WEBHOOK_RETRY_BACKOFF_ENV: &str = "WEBHOOK_RETRY_BACKOFF_MS";
 
 /// Number of worker tasks consuming the webhook channel. **Clamped to at least 1.**
@@ -199,26 +198,28 @@ pub fn webhook_queue_capacity() -> usize {
     *VALUE.get_or_init(|| numeric_env::<usize>(WEBHOOK_QUEUE_ENV, 4_096).max(1))
 }
 
-/// Maximum number of retry attempts after an initial transient delivery failure. **Clamped to at
-/// most 10** — an unbounded value would let one stuck receiver hold a dispatch worker's attention
-/// indefinitely via exponential backoff, at the expense of every other event waiting behind it.
-///
-/// Only *transient* failures are retried at all — a connection timeout, a network error, or a `5xx`
-/// response. A `4xx` response is treated as a configuration or authorization problem the target will
-/// not resolve by being asked again, and fails on the first attempt. See
-/// `dispatch::classify_dispatch_outcome`.
+/// Maximum retries after a transient delivery failure, capped at 10.
 pub fn webhook_max_retries() -> u32 {
     static VALUE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *VALUE.get_or_init(|| numeric_env::<u32>(WEBHOOK_MAX_RETRIES_ENV, 3).min(10))
+    *VALUE.get_or_init(|| numeric_env::<u32>(WEBHOOK_MAX_RETRIES_ENV, 4).min(10))
 }
 
-/// Base delay before the first retry, in milliseconds, doubled on each subsequent attempt
-/// (`backoff * 2^(attempt - 1)`, so with the default 1000ms: 1s, 2s, 4s, ...). **Clamped to at least
-/// 1ms** — `0` would turn "backoff" into an immediate, tight retry loop against a receiver that just
-/// said it was struggling.
+/// Initial delay before jitter, in milliseconds. The legacy override remains supported.
 pub fn webhook_retry_backoff_ms() -> u64 {
     static VALUE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *VALUE.get_or_init(|| numeric_env::<u64>(WEBHOOK_RETRY_BACKOFF_ENV, 1_000).max(1))
+    *VALUE.get_or_init(|| {
+        numeric_env::<u64>(
+            "WEBHOOK_INITIAL_BACKOFF_MS",
+            numeric_env(WEBHOOK_RETRY_BACKOFF_ENV, 2_000),
+        )
+        .max(1)
+    })
+}
+
+/// Maximum retry delay including jitter and Retry-After, in milliseconds.
+pub fn webhook_max_backoff_ms() -> u64 {
+    static VALUE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| numeric_env::<u64>("WEBHOOK_MAX_BACKOFF_MS", 36_000).clamp(1, 600_000))
 }
 
 /// Maximum request body size in mebibytes. Env `MAX_BODY_SIZE_MIB`, default 10.

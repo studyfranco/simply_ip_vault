@@ -529,7 +529,8 @@ pub async fn wal_checkpoint_truncate(db: &DatabaseConnection) -> Result<(), DbEr
 /// Returns a database error if SQLite cannot open or maintain the file.
 pub async fn run_sqlite_optimize(db: &DatabaseConnection) -> Result<(), DbErr> {
     // The maintenance connection has no query history. Consider all tables while keeping
-    // SQLite's usual checks for whether statistics are missing or stale.
+    // SQLite's usual checks for whether statistics are missing or stale. This also
+    // gives the planner statistics for the membership indexes installed at startup.
     run_sqlite_maintenance(db, "optimize", "0x10002".into()).await
 }
 

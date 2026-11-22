@@ -300,7 +300,7 @@ pub async fn get_analytics(
         .into_response());
     }
 
-    // Analytics caching per authorization scope (TTL 300s = 5 minutes).
+    // Analytics caching per authorization scope and committed membership revision.
     let cache_key: Option<Vec<Uuid>> = authorized_groups.as_ref().map(|g| {
         let mut v: Vec<Uuid> = g.iter().copied().collect();
         v.sort();
@@ -309,8 +309,9 @@ pub async fn get_analytics(
 
     {
         let cache_read = state.analytics_cache.read().await;
-        if let Some((ts, payload)) = cache_read.get(&cache_key)
-            && ts.elapsed() < std::time::Duration::from_secs(300)
+        if let Some((revision, ts, payload)) = cache_read.get(&cache_key)
+            && *revision == state.membership_revision()
+            && ts.elapsed() < crate::state::MEMBERSHIP_CACHE_TTL
         {
             return Ok(Json(payload.clone()).into_response());
         }
@@ -324,8 +325,9 @@ pub async fn get_analytics(
 
     {
         let cache_read = state.analytics_cache.read().await;
-        if let Some((ts, payload)) = cache_read.get(&cache_key)
-            && ts.elapsed() < std::time::Duration::from_secs(300)
+        if let Some((revision, ts, payload)) = cache_read.get(&cache_key)
+            && *revision == state.membership_revision()
+            && ts.elapsed() < crate::state::MEMBERSHIP_CACHE_TTL
         {
             return Ok(Json(payload.clone()).into_response());
         }
@@ -350,6 +352,7 @@ async fn compute_and_cache_analytics(
     authorized_groups: Option<HashSet<Uuid>>,
     cache_key: Option<Vec<Uuid>>,
 ) -> Result<AnalyticsResponse, AppError> {
+    let revision = state.membership_revision();
     // 1. Groups & active counts by group
     let mut groups_query = ip_group::Entity::find();
     if let Some(ref allowed) = authorized_groups {
@@ -449,7 +452,12 @@ async fn compute_and_cache_analytics(
 
     if let Ok(val) = serde_json::to_value(&response) {
         let mut cache_write = state.analytics_cache.write().await;
-        cache_write.insert(cache_key, (std::time::Instant::now(), val));
+        cache_write.retain(|_, (cached_revision, ts, _)| {
+            *cached_revision == revision && ts.elapsed() < crate::state::MEMBERSHIP_CACHE_TTL
+        });
+        if cache_write.len() < 256 && revision == state.membership_revision() {
+            cache_write.insert(cache_key, (revision, std::time::Instant::now(), val));
+        }
     }
 
     Ok(response)

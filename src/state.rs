@@ -63,10 +63,21 @@ pub enum StartupConfigError {
     TrustedProxies(#[from] crate::config::InvalidTrustedProxies),
 }
 
+pub(crate) const MEMBERSHIP_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3);
+
+struct MembershipCount {
+    revision: u64,
+    started: std::time::Instant,
+    value: Arc<tokio::sync::OnceCell<u64>>,
+}
+
 /// In-memory cache type for analytical statistics (`GET /api/stats/analytics`).
 pub type AnalyticsCache = Arc<
     tokio::sync::RwLock<
-        std::collections::HashMap<Option<Vec<uuid::Uuid>>, (std::time::Instant, serde_json::Value)>,
+        std::collections::HashMap<
+            Option<Vec<uuid::Uuid>>,
+            (u64, std::time::Instant, serde_json::Value),
+        >,
     >,
 >;
 
@@ -107,9 +118,11 @@ pub struct AppState {
     /// would let each handler resolve its own, which is the bug the type exists to prevent,
     /// reintroduced one `#[derive(Clone)]` at a time.
     pub master_pin: Arc<MasterPin>,
-    /// In-memory cache for analytical statistics (`GET /api/stats/analytics`), TTL ~300s (5 minutes).
+    /// In-memory cache for analytical statistics (`GET /api/stats/analytics`), with a short, write-invalidated TTL.
     /// Prevents repeated expensive full-table queries when multiple dashboard tabs or users refresh.
     pub analytics_cache: AnalyticsCache,
+    membership_revision: Arc<std::sync::atomic::AtomicU64>,
+    membership_counts: Arc<tokio::sync::Mutex<std::collections::HashMap<String, MembershipCount>>>,
     /// Singleflight lock to prevent cache stampedes when computing analytical statistics.
     pub analytics_lock: Arc<tokio::sync::Mutex<()>>,
     /// In-memory cache for system settings and entity counts (`GET /api/settings`), TTL ~120s (2 minutes).
@@ -129,6 +142,59 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Invalidates derived membership counts and analytics after a committed write.
+    pub fn invalidate_membership_queries(&self) {
+        self.membership_revision
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) async fn commit_membership_write(
+        &self,
+        transaction: sea_orm::DatabaseTransaction,
+    ) -> Result<(), sea_orm::DbErr> {
+        transaction.commit().await?;
+        self.invalidate_membership_queries();
+        Ok(())
+    }
+
+    pub(crate) fn membership_revision(&self) -> u64 {
+        self.membership_revision
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) async fn cached_membership_count<
+        Fut: Future<Output = Result<u64, crate::error::AppError>>,
+    >(
+        &self,
+        key: String,
+        count: impl FnOnce() -> Fut,
+    ) -> Result<u64, crate::error::AppError> {
+        let cell = {
+            let mut cache = self.membership_counts.lock().await;
+            let revision = self.membership_revision();
+            cache.retain(|_, entry| {
+                entry.revision == revision
+                    && (entry.started.elapsed() < MEMBERSHIP_CACHE_TTL
+                        || (entry.value.get().is_none() && Arc::strong_count(&entry.value) > 1))
+            });
+            if cache.len() >= 256 && !cache.contains_key(&key) {
+                Arc::new(tokio::sync::OnceCell::new())
+            } else {
+                Arc::clone(
+                    &cache
+                        .entry(key)
+                        .or_insert_with(|| MembershipCount {
+                            revision,
+                            started: std::time::Instant::now(),
+                            value: Arc::new(tokio::sync::OnceCell::new()),
+                        })
+                        .value,
+                )
+            }
+        };
+        cell.get_or_try_init(count).await.copied()
+    }
+
     /// Builds state with the trusted-proxy list and cipher read from the environment.
     ///
     /// Returns an error if either security-relevant variable is malformed, and neither failure is
@@ -156,6 +222,8 @@ impl AppState {
             replay: Arc::new(ReplayGuard::default()),
             master_pin: Arc::new(MasterPin::new()),
             analytics_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            membership_revision: Arc::default(),
+            membership_counts: Arc::default(),
             analytics_lock: Arc::new(tokio::sync::Mutex::new(())),
             settings_cache: Arc::new(tokio::sync::RwLock::new(None)),
             settings_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -186,6 +254,8 @@ impl AppState {
             replay: Arc::new(ReplayGuard::default()),
             master_pin: Arc::new(MasterPin::new()),
             analytics_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            membership_revision: Arc::default(),
+            membership_counts: Arc::default(),
             analytics_lock: Arc::new(tokio::sync::Mutex::new(())),
             settings_cache: Arc::new(tokio::sync::RwLock::new(None)),
             settings_lock: Arc::new(tokio::sync::Mutex::new(())),

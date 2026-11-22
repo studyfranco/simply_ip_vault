@@ -8,6 +8,30 @@
 > compile at the start of this session (see Finding 0 below), and several real gaps existed. This
 > file replaces the previous notes with an honest, current record of what was found and fixed.
 
+## 2026-11-19 — Membership query and webhook delivery performance
+
+- Added four membership indexes for active group counts, ordered listing, and record-ID lookups.
+  The address filter trims blank terms, seeks canonical addresses or ASCII ranges, and keeps
+  substring matching for other terms. SQLite's planner preferred a covering sort index even
+  after an address seek. The address-first join applies the membership scope as a residual
+  predicate so lookup proceeds by record ID before sorting the matches.
+- Exact counts are inferred from terminal pages where possible. Active membership counts and
+  analytics use a three-second process-local cache with request coalescing and revision
+  invalidation on committed writes and retention purges. The dashboard debounces IP filters
+  for 350 ms, cancels superseded fetches, and requests an exact count only for the first chunk.
+- Webhook retries default to 2, 5, 15, and 30 seconds with ±20% jitter. HTTP 429 and 503 can
+  extend the wait with Retry-After up to the configured cap, which defaults to 36 seconds.
+  Operators can set WEBHOOK_INITIAL_BACKOFF_MS, WEBHOOK_MAX_BACKOFF_MS, and WEBHOOK_MAX_RETRIES.
+  The dispatch pool shares breaker state per webhook ID and limits concurrent retries for the
+  same webhook. Three qualifying failures open the circuit for 60 seconds, with failed probes
+  extending cooldown to 300 and then 600 seconds. Every HTTP attempt still creates an execution
+  row. The console records the terminal failure and recovery, including suppressed counts.
+- The live E2E script accepts HOOK_EXECUTOR_BIN so it can run against an existing sibling binary
+  without building in that checkout.
+- With 4,096 memberships across four groups, the authenticated count, global page, group
+  page, and prefix page took 0.534, 0.301, 0.337, and 0.457 ms. The benchmark verified totals
+  and address ordering. Rust tests passed 439 of 439, and live E2E passed 1,019 of 1,019.
+
 ## 2026-11-19 — Chantiers 3 and 5A
 
 - Moved group, webhook, and group-rights forms into dialogs above their tables. Group editing uses the
