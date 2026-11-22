@@ -154,7 +154,7 @@ pub trait MigratorTrait {
     /// # Errors
     ///
     /// Returns an error if the migration history is unknown or a migration fails.
-    #[must_use]
+    #[must_use = "migration errors must be handled"]
     async fn up(db: &DatabaseConnection, steps: Option<u32>) -> Result<(), DbErr> {
         run(db, Self::migrations(), steps, Direction::Up).await
     }
@@ -164,7 +164,7 @@ pub trait MigratorTrait {
     /// # Errors
     ///
     /// Returns an error if the migration history is unknown or a rollback fails.
-    #[must_use]
+    #[must_use = "migration rollback errors must be handled"]
     async fn down(db: &DatabaseConnection, steps: Option<u32>) -> Result<(), DbErr> {
         run(db, Self::migrations(), steps, Direction::Down).await
     }

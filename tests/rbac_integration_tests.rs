@@ -1827,7 +1827,10 @@ async fn test_key_deletion_revokes_access_and_cascades_permissions() {
         .all(&db)
         .await
         .unwrap();
-    assert!(perms_after.is_empty());
+    assert_eq!(
+        perms_after,
+        [] as [simply_ip_vault::entities::api_key_group_permission::Model; 0]
+    );
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -2386,7 +2389,11 @@ async fn test_delete_ip_accepts_query_or_json_body() {
         .await
         .unwrap();
     let items: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
-    assert!(items.is_empty(), "both records should be gone: {items:?}");
+    assert_eq!(
+        items,
+        [] as [serde_json::Value; 0],
+        "both records should be gone: {items:?}"
+    );
 }
 
 /// A group granted/looked-up by `group_id` and one looked up by `group_name` must be the same
@@ -2763,7 +2770,7 @@ async fn test_revoke_group_permission_by_name_and_by_id() {
         .await
         .unwrap();
     let items: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
-    assert!(items.is_empty());
+    assert_eq!(items, [] as [serde_json::Value; 0]);
 }
 
 /// Revocation is bounded by the caller's own group access, exactly as granting is.
@@ -3191,8 +3198,9 @@ async fn a_group_manager_may_revoke_and_reduce_its_own_access() {
         .all(&db)
         .await
         .unwrap();
-    assert!(
-        remaining.is_empty(),
+    assert_eq!(
+        remaining,
+        [] as [simply_ip_vault::entities::api_key_group_permission::Model; 0],
         "the row is genuinely gone, not merely reported as removed"
     );
 
@@ -3280,8 +3288,9 @@ async fn a_group_left_ungoverned_by_self_revocation_stays_visible_to_a_master() 
         .all(&db)
         .await
         .unwrap();
-    assert!(
-        rows.is_empty(),
+    assert_eq!(
+        rows,
+        [] as [simply_ip_vault::entities::api_key_group_permission::Model; 0],
         "precondition: the group is genuinely ungoverned"
     );
 
@@ -3888,8 +3897,9 @@ async fn a_group_left_ungoverned_via_per_group_manage_stays_visible_to_a_master(
         .all(&db)
         .await
         .unwrap();
-    assert!(
-        rows.is_empty(),
+    assert_eq!(
+        rows,
+        [] as [simply_ip_vault::entities::api_key_group_permission::Model; 0],
         "precondition: the group is genuinely ungoverned"
     );
 
@@ -5412,8 +5422,8 @@ async fn test_created_key_returns_a_usable_signing_secret() {
     let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let new_key = created["plaintext_key"].as_str().unwrap().to_owned();
     let new_signing_secret = created["signing_secret"].as_str().unwrap().to_owned();
-    assert!(
-        !new_signing_secret.is_empty(),
+    assert_ne!(
+        new_signing_secret, "",
         "creation must return a signing secret"
     );
     assert_ne!(
@@ -6458,7 +6468,7 @@ async fn test_rotate_secret_swaps_only_the_signing_secret() {
     );
     assert_eq!(rotated["name"], "Worker Bot", "the key name is preserved");
     let new_secret = rotated["signing_secret"].as_str().unwrap().to_owned();
-    assert!(!new_secret.is_empty());
+    assert_ne!(new_secret, "");
     assert_ne!(new_secret, old_secret, "a genuinely new secret is issued");
     // The response must not hand back a new API key — that is `/rotate`'s job, not this one's.
     assert!(
@@ -8460,7 +8470,7 @@ async fn clone_webhook_duplicates_configuration_under_a_fresh_secret_and_owner()
     let generated_secret = cloned_body["secret_token"]
         .as_str()
         .expect("CANONICAL_V1 requires a secret, so one is generated");
-    assert!(!generated_secret.is_empty());
+    assert_ne!(generated_secret, "");
 
     assert_cloned_webhook_storage(db, source_id, cloned_id, owner_id).await;
 }
@@ -10680,8 +10690,9 @@ async fn test_batch_payload_internal_duplicates() {
         .all(&db)
         .await
         .unwrap();
-    assert!(
-        stored.is_empty(),
+    assert_eq!(
+        stored,
+        [] as [simply_ip_vault::entities::ip_record::Model; 0],
         "a refused batch must write nothing at all, got {} row(s)",
         stored.len()
     );
@@ -11014,8 +11025,9 @@ async fn test_key_with_zero_assigned_groups_returns_empty_list() {
     let arr = groups
         .as_array()
         .expect("response body must be a JSON array");
-    assert!(
-        arr.is_empty(),
+    assert_eq!(
+        *arr,
+        [] as [serde_json::Value; 0],
         "a key with no group rows must receive an empty list []"
     );
 }

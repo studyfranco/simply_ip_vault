@@ -1363,7 +1363,10 @@ mod tests {
 
     #[test]
     fn hostname_entries_contribute_no_literal_networks() {
-        assert!(only_networks("traefik, proxy.internal").is_empty());
+        assert_eq!(
+            only_networks("traefik, proxy.internal"),
+            [] as [ipnet::IpNet; 0]
+        );
         assert_eq!(only_networks("traefik, 172.16.0.0/12").len(), 1);
     }
 
@@ -1448,7 +1451,7 @@ mod tests {
         // second lookup happened.
         assert!(Arc::ptr_eq(&first, &trusted.resolved().await));
         assert!(Arc::ptr_eq(&first, &trusted.resolved().await));
-        assert!(first.is_empty());
+        assert_eq!(*first, [] as [ipnet::IpNet; 0]);
     }
 
     /// ...but the negative entry does expire, so a name that starts working is picked up without a
@@ -1516,8 +1519,9 @@ mod tests {
         // End to end: the cache must actually act on that.
         let trusted = proxies("localhost").with_ttls(POSITIVE, NEGATIVE);
         let first = trusted.resolved().await;
-        assert!(
-            !first.is_empty(),
+        assert_ne!(
+            *first,
+            [] as [ipnet::IpNet; 0],
             "localhost must resolve, or this test would be exercising the negative path instead"
         );
 
@@ -1553,12 +1557,14 @@ mod tests {
     /// rather than a generic "something is wrong".
     #[tokio::test]
     async fn priming_reports_only_the_entries_that_failed() {
-        assert!(
-            proxies("10.0.0.0/8").prime().await.is_empty(),
+        assert_eq!(
+            proxies("10.0.0.0/8").prime().await,
+            [] as [String; 0],
             "no hostnames, nothing to report"
         );
-        assert!(
-            proxies("localhost").prime().await.is_empty(),
+        assert_eq!(
+            proxies("localhost").prime().await,
+            [] as [String; 0],
             "a resolvable name is not reported"
         );
 

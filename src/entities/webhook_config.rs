@@ -1,7 +1,10 @@
 //! The `webhook_configs` table: HTTP endpoints notified when IP events occur within a specific
 //! IP group.
 
-use sea_orm::entity::prelude::{TimeDateTime as DateTime, *};
+use sea_orm::entity::prelude::{
+    ActiveModelBehavior, DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EntityTrait,
+    EnumIter, PrimaryKeyTrait, Related, RelationDef, RelationTrait, TimeDateTime as DateTime, Uuid,
+};
 use serde::{Deserialize, Serialize};
 
 /// A single webhook subscription: where to send events for a group, and how to sign/shape them.

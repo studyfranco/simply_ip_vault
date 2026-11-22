@@ -4,7 +4,10 @@
 //! here, and a change to one never touches the other. `last_seen_at` is the single timestamp for
 //! the latest observation in this group.
 
-use sea_orm::entity::prelude::{TimeDateTime as DateTime, *};
+use sea_orm::entity::prelude::{
+    ActiveModelBehavior, DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EntityTrait,
+    EnumIter, PrimaryKeyTrait, Related, RelationDef, RelationTrait, TimeDateTime as DateTime, Uuid,
+};
 use serde::{Deserialize, Serialize};
 
 /// One address's stateful membership in one group.

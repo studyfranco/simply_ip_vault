@@ -74,8 +74,9 @@ fn syntax_errors(relative: &str) -> Vec<String> {
 #[test]
 fn app_js_has_no_syntax_errors() {
     let errors = syntax_errors("static/app.js");
-    assert!(
-        errors.is_empty(),
+    assert_eq!(
+        errors,
+        [] as [String; 0],
         "static/app.js has {} syntax error(s) and will not load in a browser:\n  {}",
         errors.len(),
         errors.join("\n  ")

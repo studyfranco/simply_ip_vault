@@ -1848,8 +1848,9 @@ async fn s7_referential_integrity_holds_where_ddl_cannot_express_it() {
             .filter_map(|r| r.try_get::<String>("", "from").ok())
             .filter(|c| c == "parent_key_id" || c == "owner_key_id")
             .collect();
-        assert!(
-            referencing.is_empty(),
+        assert_eq!(
+            referencing,
+            [] as [String; 0],
             "{table} gained a DDL foreign key on {referencing:?} — good, but this test and the \
              application-side checks it covers now need revisiting rather than silently duplicating it"
         );

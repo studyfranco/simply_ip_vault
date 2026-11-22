@@ -1,7 +1,10 @@
 //! The `webhook_executions` table: one row per outbound HTTP attempt a webhook dispatch makes,
 //! including retries. The delivery history behind the dashboard's "Executions" tab.
 
-use sea_orm::entity::prelude::{TimeDateTime as DateTime, *};
+use sea_orm::entity::prelude::{
+    ActiveModelBehavior, DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EntityTrait,
+    EnumIter, PrimaryKeyTrait, Related, RelationDef, RelationTrait, TimeDateTime as DateTime, Uuid,
+};
 use serde::{Deserialize, Serialize};
 
 /// One HTTP attempt's outcome, on the way to or from `webhook_configs`.

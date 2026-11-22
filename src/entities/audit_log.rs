@@ -1,7 +1,10 @@
 //! The `audit_logs` table: the security audit trail tracking mutating operations across the
 //! application.
 
-use sea_orm::entity::prelude::{TimeDateTime as DateTime, *};
+use sea_orm::entity::prelude::{
+    ActiveModelBehavior, DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EntityTrait,
+    EnumIter, PrimaryKeyTrait, Related, RelationDef, RelationTrait, TimeDateTime as DateTime, Uuid,
+};
 use serde::{Deserialize, Serialize};
 
 /// A single audit trail entry for a mutating operation.

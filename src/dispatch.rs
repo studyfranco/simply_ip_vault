@@ -335,7 +335,7 @@ fn resolve_event_variables_with_mode(
     send_normalized_ipv6: bool,
     escape_json: bool,
 ) -> String {
-    let group_id = event.group_id.map(|g| g.to_string()).unwrap_or_default();
+    let group_id = event.group_id.map_or_default(|g| g.to_string());
     let group_name = event.group_name.as_deref().unwrap_or("");
     let cause = event.cause.as_deref().unwrap_or("Unknown");
     let normalized_address =

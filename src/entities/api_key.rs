@@ -1,6 +1,9 @@
 //! The `api_keys` table: authentication tokens, global access rights, and CIDR network bindings.
 
-use sea_orm::entity::prelude::{TimeDateTime as DateTime, *};
+use sea_orm::entity::prelude::{
+    ActiveModelBehavior, DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EntityTrait,
+    EnumIter, PrimaryKeyTrait, Related, RelationDef, RelationTrait, TimeDateTime as DateTime, Uuid,
+};
 use serde::{Deserialize, Serialize};
 
 /// A single API key: its identity, global RBAC scopes, and network binding rule.

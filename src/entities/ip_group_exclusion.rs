@@ -1,6 +1,9 @@
 //! Whitelist groups whose active ranges are protected from bans in a specific banlist.
 
-use sea_orm::entity::prelude::*;
+use sea_orm::entity::prelude::{
+    ActiveModelBehavior, DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EntityTrait,
+    EnumIter, PrimaryKeyTrait, Related, RelationDef, RelationTrait, Uuid,
+};
 
 /// One banlist-to-whitelist exclusion.
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]

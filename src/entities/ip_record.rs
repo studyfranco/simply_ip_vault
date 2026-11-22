@@ -4,7 +4,10 @@
 //! lock, last observation, soft delete, cause — lives on
 //! [`ip_record_group_membership`](crate::entities::ip_record_group_membership).
 
-use sea_orm::entity::prelude::{TimeDateTime as DateTime, *};
+use sea_orm::entity::prelude::{
+    ActiveModelBehavior, DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EntityTrait,
+    EnumIter, PrimaryKeyTrait, TimeDateTime as DateTime, Uuid,
+};
 use serde::{Deserialize, Serialize};
 
 /// A single IP address or CIDR range, shared by every group it belongs to.

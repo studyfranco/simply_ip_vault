@@ -361,7 +361,8 @@ external services required.
 See `AGENT.MD` for the full architectural/security ruleset this project is built and audited
 against, `FILE_MAP.MD` for a file-by-file map of `src/`, `SCHEMA.MD` for the database schema,
 `RBAC_MODEL.md` for the normative authorization specification (shared byte-identically with
-`simply_hook_executor`), and `AGENT_NOTES.MD` for the running audit worklog.
+`simply_hook_executor`), [the in-repo agent skill](.agents/skills/use-ip-vault/SKILL.md) for API
+operation recipes, and `AGENT_NOTES.MD` for the running audit worklog.
 
 ## License
 

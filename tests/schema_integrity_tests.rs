@@ -920,8 +920,9 @@ async fn deleting_a_key_and_a_group_leaves_no_orphans_in_either_join_table() {
             .unwrap(),
         2
     );
-    assert!(
-        join_table_orphans(&db).await.is_empty(),
+    assert_eq!(
+        join_table_orphans(&db).await,
+        [] as [String; 0],
         "the fixture starts clean"
     );
 
@@ -1033,7 +1034,7 @@ async fn deleting_a_key_does_not_touch_ip_record_memberships() {
             .unwrap()
             .is_some()
     );
-    assert!(join_table_orphans(&db).await.is_empty());
+    assert_eq!(join_table_orphans(&db).await, [] as [String; 0]);
 }
 
 /// **The control.** With `foreign_keys` OFF, the same delete leaves orphans behind.
@@ -1951,8 +1952,9 @@ async fn assert_membership_upgrade_cascade_and_indexes(
         .all(db)
         .await
         .expect("query succeeds");
-    assert!(
-        remaining.is_empty(),
+    assert_eq!(
+        remaining,
+        [] as [simply_ip_vault::entities::ip_record_group_membership::Model; 0],
         "ON DELETE CASCADE must still cascade after the rebuild"
     );
 

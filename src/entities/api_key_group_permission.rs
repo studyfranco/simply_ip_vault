@@ -1,7 +1,10 @@
 //! The `api_key_group_permissions` M:N junction table: fine-grained read/write/delete rights
 //! that a given API key holds over a given IP group.
 
-use sea_orm::entity::prelude::{TimeDateTime as DateTime, *};
+use sea_orm::entity::prelude::{
+    ActiveModelBehavior, DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EntityTrait,
+    EnumIter, PrimaryKeyTrait, Related, RelationDef, RelationTrait, TimeDateTime as DateTime, Uuid,
+};
 use serde::{Deserialize, Serialize};
 
 /// A single (API key, IP group) permission grant.

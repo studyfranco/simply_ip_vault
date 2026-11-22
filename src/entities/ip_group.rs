@@ -1,7 +1,10 @@
 //! The `ip_groups` table: logical, named collections of IP rules (e.g. `fail2ban`, `sshd`,
 //! `vpn_whitelist`), each tagged as either a `banlist` or a `whitelist`.
 
-use sea_orm::entity::prelude::{TimeDateTime as DateTime, *};
+use sea_orm::entity::prelude::{
+    ActiveModelBehavior, DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EntityTrait,
+    EnumIter, PrimaryKeyTrait, Related, RelationDef, RelationTrait, TimeDateTime as DateTime, Uuid,
+};
 use serde::{Deserialize, Serialize};
 
 /// A named collection of IP records, tagged as a `banlist` or `whitelist`.

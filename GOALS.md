@@ -29,3 +29,4 @@ Attach the vault to `ext` only if outbound webhooks or remote peering require eg
 - Apply SSRF protection to outbound webhook requests.
 - Build database queries with SeaORM and SeaQuery, with zero raw SQL apart from the existing constant readiness probe.
 - Forbid unsafe Rust and require `cargo audit --deny warnings` with zero ignored advisories.
+- Operate and integrate via [the in-repo agent skill](.agents/skills/use-ip-vault/SKILL.md).

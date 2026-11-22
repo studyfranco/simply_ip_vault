@@ -1061,12 +1061,12 @@ async fn group_policy_replaces_exclusions_and_cascades() {
     );
     api.call("DELETE", &white_path, Value::Null, StatusCode::NO_CONTENT)
         .await;
-    assert!(
+    assert_eq!(
         ip_group_exclusion::Entity::find()
             .all(&api.db)
             .await
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        [] as [ip_group_exclusion::Model; 0]
     );
     let updates = audit_log::Entity::find()
         .filter(audit_log::Column::Action.eq("GROUP_UPDATE"))
