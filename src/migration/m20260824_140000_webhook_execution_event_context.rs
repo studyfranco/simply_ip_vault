@@ -26,10 +26,15 @@
 //! `ADD COLUMN`/`DROP COLUMN` per statement, the same constraint `m20260801_000005`'s module header
 //! documents.
 
-use sea_orm_migration::prelude::*;
+use super::prelude::*;
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20260824_140000_webhook_execution_event_context"
+    }
+}
 
 #[derive(DeriveIden)]
 enum WebhookExecutions {
@@ -41,7 +46,7 @@ enum WebhookExecutions {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()
@@ -68,7 +73,7 @@ impl MigrationTrait for Migration {
             .await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         for column in [
             WebhookExecutions::ResolvedTargetUrl,
             WebhookExecutions::TargetAddress,

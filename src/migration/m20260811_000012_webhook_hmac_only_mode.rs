@@ -34,7 +34,7 @@
 //! throughout, and `scripts/verify_convergence.sh` asserts that the prefix is mandatory rather than
 //! stripped-if-present. A per-row algorithm column would be the one place that could quietly opt out.
 
-use sea_orm_migration::prelude::*;
+use super::prelude::*;
 
 /// The value replacing `BODY_ONLY` in `webhook_configs.auth_mode`.
 const HMAC_ONLY: &str = "HMAC_ONLY";
@@ -42,8 +42,13 @@ const HMAC_ONLY: &str = "HMAC_ONLY";
 /// The value being replaced.
 const BODY_ONLY: &str = "BODY_ONLY";
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20260811_000012_webhook_hmac_only_mode"
+    }
+}
 
 #[derive(DeriveIden)]
 enum WebhookConfigs {
@@ -55,7 +60,7 @@ enum WebhookConfigs {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         for column in [
             WebhookConfigs::SignatureHeader,
             WebhookConfigs::SignaturePrefix,
@@ -76,7 +81,7 @@ impl MigrationTrait for Migration {
         rewrite_mode(manager, BODY_ONLY, HMAC_ONLY).await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         // Data first, then the columns it might have referenced — the reverse of `up`.
         rewrite_mode(manager, HMAC_ONLY, BODY_ONLY).await?;
 

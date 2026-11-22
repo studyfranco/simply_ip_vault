@@ -27,11 +27,16 @@
 //!    `list_audit_logs` filters by actor API key ID and orders by `timestamp DESC`.
 //!    Serves the filter and sort without temporary sorting.
 
+use super::prelude::*;
 use sea_orm::sea_query::{Index as SqIndex, IndexOrder};
-use sea_orm_migration::prelude::*;
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20261014_120000_add_query_optimization_indexes"
+    }
+}
 
 #[derive(DeriveIden)]
 enum WebhookExecutions {
@@ -60,7 +65,7 @@ enum AuditLogs {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .create_index(
                 SqIndex::create()
@@ -123,7 +128,7 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .drop_index(
                 SqIndex::drop()

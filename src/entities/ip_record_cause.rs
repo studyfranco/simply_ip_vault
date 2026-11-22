@@ -3,7 +3,7 @@
 //! One row per reported cause. A report with no cause writes no row, so an absent cause is simply
 //! the absence of rows.
 
-use sea_orm::entity::prelude::*;
+use sea_orm::entity::prelude::{TimeDateTime as DateTime, *};
 use serde::{Deserialize, Serialize};
 
 /// One cause reported against a membership, with the time it was reported.
@@ -18,6 +18,7 @@ pub struct Model {
     /// The cause text.
     pub cause: String,
     /// When this cause was reported.
+    #[serde(with = "crate::time_serde")]
     pub created_at: DateTime,
 }
 

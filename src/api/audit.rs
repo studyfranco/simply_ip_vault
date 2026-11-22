@@ -93,9 +93,9 @@ pub async fn list_audit_logs(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        let since_dt = chrono::DateTime::parse_from_rfc3339(since_raw)
-            .map_err(|_| AppError::InvalidInput("Malformed 'since' RFC 3339 timestamp".to_owned()))?
-            .naive_utc();
+        let since_dt = crate::time_serde::parse_rfc3339(since_raw).map_err(|_| {
+            AppError::InvalidInput("Malformed 'since' RFC 3339 timestamp".to_owned())
+        })?;
         q = q.filter(audit_log::Column::Timestamp.gte(since_dt));
     }
     if let Some(until_raw) = query
@@ -104,9 +104,9 @@ pub async fn list_audit_logs(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        let until_dt = chrono::DateTime::parse_from_rfc3339(until_raw)
-            .map_err(|_| AppError::InvalidInput("Malformed 'until' RFC 3339 timestamp".to_owned()))?
-            .naive_utc();
+        let until_dt = crate::time_serde::parse_rfc3339(until_raw).map_err(|_| {
+            AppError::InvalidInput("Malformed 'until' RFC 3339 timestamp".to_owned())
+        })?;
         q = q.filter(audit_log::Column::Timestamp.lte(until_dt));
     }
 

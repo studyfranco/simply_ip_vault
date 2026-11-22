@@ -4,7 +4,7 @@
 //! lock, last observation, soft delete, cause — lives on
 //! [`ip_record_group_membership`](crate::entities::ip_record_group_membership).
 
-use sea_orm::entity::prelude::*;
+use sea_orm::entity::prelude::{TimeDateTime as DateTime, *};
 use serde::{Deserialize, Serialize};
 
 /// A single IP address or CIDR range, shared by every group it belongs to.
@@ -19,6 +19,7 @@ pub struct Model {
     #[sea_orm(unique)]
     pub target_address: String,
     /// When the address was first recorded anywhere.
+    #[serde(with = "crate::time_serde")]
     pub created_at: DateTime,
 }
 

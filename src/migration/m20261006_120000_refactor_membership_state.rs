@@ -40,14 +40,19 @@
 //! membership's state cannot be split back onto a shared row without choosing which group's copy
 //! wins. `down` refuses rather than guessing.
 
+use super::prelude::*;
 use sea_orm::{
-    DatabaseBackend,
+    ConnectionTrait, DatabaseBackend,
     sea_query::{Alias, Asterisk, Expr, ExprTrait, Func, Index as SqIndex, IndexOrder, Query},
 };
-use sea_orm_migration::prelude::*;
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20261006_120000_refactor_membership_state"
+    }
+}
 
 /// The pre-refactor `ip_records`, read by the copies below.
 #[derive(DeriveIden)]
@@ -146,7 +151,7 @@ async fn count(manager: &SchemaManager<'_>, table: impl IntoIden) -> Result<i64,
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         copy_canonical_records(manager).await?;
         create_membership_replacement(manager).await?;
         copy_memberships(manager).await?;
@@ -157,7 +162,7 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, _manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         Err(DbErr::Migration(
             "m20261006_120000_refactor_membership_state is not reversible: membership state cannot be \
              split back onto a shared address row without choosing which group's copy wins."

@@ -6,13 +6,13 @@ use std::collections::{HashMap, HashSet};
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use axum::{Extension, Json};
-use chrono::NaiveDateTime;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Func, Query as SqQuery};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
     QueryOrder, QuerySelect, QueryTrait,
 };
 use serde::{Deserialize, Serialize};
+use time::PrimitiveDateTime;
 use uuid::Uuid;
 
 use crate::entities::{
@@ -58,9 +58,11 @@ pub struct RecidivistIp {
     /// Names of the active groups containing this IP.
     pub group_names: Vec<String>,
     /// Earliest recorded creation timestamp across memberships.
-    pub first_seen: Option<NaiveDateTime>,
+    #[serde(with = "crate::time_serde::option")]
+    pub first_seen: Option<PrimitiveDateTime>,
     /// Most recent `last_seen` timestamp across memberships.
-    pub last_seen: Option<NaiveDateTime>,
+    #[serde(with = "crate::time_serde::option")]
+    pub last_seen: Option<PrimitiveDateTime>,
     /// Most recent ban causes across memberships.
     pub latest_causes: Vec<String>,
 }
@@ -151,13 +153,16 @@ pub struct IntersectionItem {
     /// IP address string.
     pub target_address: String,
     /// Last seen timestamp mapped by group name.
-    pub group_last_seen: HashMap<String, Option<NaiveDateTime>>,
+    #[serde(with = "crate::time_serde::map")]
+    pub group_last_seen: HashMap<String, Option<PrimitiveDateTime>>,
     /// Last seen timestamp in the first group (for backward compatibility).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_seen_a: Option<NaiveDateTime>,
+    #[serde(with = "crate::time_serde::option")]
+    pub last_seen_a: Option<PrimitiveDateTime>,
     /// Last seen timestamp in the second group (for backward compatibility).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_seen_b: Option<NaiveDateTime>,
+    #[serde(with = "crate::time_serde::option")]
+    pub last_seen_b: Option<PrimitiveDateTime>,
 }
 
 /// Response payload for `GET /api/stats/intersection`.
@@ -214,7 +219,7 @@ fn to_subnet_prefix(raw: &str) -> Option<String> {
 async fn compute_velocity(
     db: &sea_orm::DatabaseConnection,
     authorized_groups: Option<&HashSet<Uuid>>,
-    threshold: NaiveDateTime,
+    threshold: PrimitiveDateTime,
 ) -> Result<VelocityStat, AppError> {
     // For active memberships, last_seen_at is always >= created_at. Filtering by last_seen_at >= threshold
     // covers both newly created and re-seen active memberships, allowing SQLite to use the composite
@@ -429,9 +434,9 @@ async fn compute_and_cache_analytics(
     };
 
     // 8. Velocity breakdown (24h & 7d)
-    let now = chrono::Utc::now().naive_utc();
-    let threshold_24h = now - chrono::Duration::hours(24);
-    let threshold_7d = now - chrono::Duration::days(7);
+    let now = crate::time_serde::now_utc();
+    let threshold_24h = now - time::Duration::hours(24);
+    let threshold_7d = now - time::Duration::days(7);
 
     let velocity_24h =
         compute_velocity(&state.db, authorized_groups.as_ref(), threshold_24h).await?;
@@ -854,7 +859,7 @@ async fn load_top_recidivists(
             .await?;
 
         let mut group_names_by_ip: HashMap<Uuid, Vec<String>> = HashMap::new();
-        let mut times_by_ip: HashMap<Uuid, (Option<NaiveDateTime>, Option<NaiveDateTime>)> =
+        let mut times_by_ip: HashMap<Uuid, (Option<PrimitiveDateTime>, Option<PrimitiveDateTime>)> =
             HashMap::new();
         let mut membership_to_ip: HashMap<Uuid, Uuid> = HashMap::new();
 

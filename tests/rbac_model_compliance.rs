@@ -34,8 +34,8 @@ use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, Database, DatabaseConnection, EntityTrait,
     QueryFilter,
 };
-use sea_orm_migration::MigratorTrait;
 use serde_json::json;
+use simply_ip_vault::migration::MigratorTrait;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -124,7 +124,7 @@ fn sign_with(
                 .map_or_else(|| u.path().to_owned(), |pq| pq.as_str().to_owned())
         },
     );
-    let timestamp = (chrono::Utc::now().timestamp() + offset).to_string();
+    let timestamp = (time::OffsetDateTime::now_utc().unix_timestamp() + offset).to_string();
 
     let mut builder = builder.header("X-Timestamp", &timestamp);
     if let Some(secret) = secret {
@@ -223,8 +223,8 @@ async fn key(
         can_create_groups: Set(scopes.can_create_groups),
         parent_key_id: Set(None),
         prefix: Set("compl001".to_owned()),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
+        updated_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(db)
     .await
@@ -241,7 +241,7 @@ async fn group(db: &DatabaseConnection, name: &str, owner: Option<Uuid>) -> Uuid
         group_type: Set("banlist".to_owned()),
         description: Set(None),
         owner_key_id: Set(owner),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(db)
     .await
@@ -285,7 +285,7 @@ async fn grant(
         can_write: Set(capabilities.can_write),
         can_delete: Set(capabilities.can_delete),
         can_manage: Set(manage),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(db)
     .await

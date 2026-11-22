@@ -1,7 +1,7 @@
 //! The `api_key_group_permissions` M:N junction table: fine-grained read/write/delete rights
 //! that a given API key holds over a given IP group.
 
-use sea_orm::entity::prelude::*;
+use sea_orm::entity::prelude::{TimeDateTime as DateTime, *};
 use serde::{Deserialize, Serialize};
 
 /// A single (API key, IP group) permission grant.
@@ -33,6 +33,7 @@ pub struct Model {
     /// that is itself scoped to one group. See `AGENT.MD` §2.
     pub can_manage: bool,
     /// Assignment timestamp.
+    #[serde(with = "crate::time_serde")]
     pub created_at: DateTime,
 }
 

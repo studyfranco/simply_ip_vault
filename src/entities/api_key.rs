@@ -1,6 +1,6 @@
 //! The `api_keys` table: authentication tokens, global access rights, and CIDR network bindings.
 
-use sea_orm::entity::prelude::*;
+use sea_orm::entity::prelude::{TimeDateTime as DateTime, *};
 use serde::{Deserialize, Serialize};
 
 /// A single API key: its identity, global RBAC scopes, and network binding rule.
@@ -83,8 +83,10 @@ pub struct Model {
     #[serde(default)]
     pub parent_key_id: Option<Uuid>,
     /// Key generation timestamp.
+    #[serde(with = "crate::time_serde")]
     pub created_at: DateTime,
     /// Key last-update timestamp.
+    #[serde(with = "crate::time_serde")]
     pub updated_at: DateTime,
 }
 

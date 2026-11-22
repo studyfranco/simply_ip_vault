@@ -21,11 +21,16 @@
 //! need beyond what an existing composite or partial index already serves. Kept anyway because it
 //! was asked for directly.
 
+use super::prelude::*;
 use sea_orm::sea_query::Index as SqIndex;
-use sea_orm_migration::prelude::*;
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20261008_120000_add_simple_foreign_key_indexes"
+    }
+}
 
 #[derive(DeriveIden)]
 enum Memberships {
@@ -67,7 +72,7 @@ enum Causes {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         for (name, table, column) in [
             (
                 "idx-irgm-ip_record_id",
@@ -149,7 +154,7 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         for name in [
             "idx-irgm-ip_record_id",
             "idx-irgm-group_id",

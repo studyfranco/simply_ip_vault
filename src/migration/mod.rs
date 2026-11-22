@@ -1,5 +1,14 @@
 //! Database migration registry for `simply_ip_vault`. Migrations run automatically on startup.
-pub use sea_orm_migration::prelude::*;
+pub use runner::{MigrationName, MigrationTrait, MigratorTrait, SchemaManager};
+pub use sea_orm::{DbErr, DeriveIden, entity::prelude::async_trait, sea_query::*};
+
+/// Shared migration imports for migration modules and the runner.
+pub mod prelude {
+    pub use super::runner::{MigrationName, MigrationTrait, MigratorTrait, SchemaManager};
+    pub use sea_orm::{DbErr, DeriveIden, entity::prelude::async_trait, sea_query::*};
+}
+
+mod runner;
 
 mod m20230101_000001_initial_schema;
 mod m20260729_000002_add_api_key_signing_secret;

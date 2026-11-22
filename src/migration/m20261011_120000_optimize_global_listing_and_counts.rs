@@ -20,11 +20,16 @@
 //!    on `(last_seen_at DESC, id ASC)` and `idx_memberships_global_deleted_at` on
 //!    `(deleted_at DESC, id ASC) WHERE is_deleted = TRUE`, enabling `MULTI-INDEX OR` seeks.
 
+use super::prelude::*;
 use sea_orm::sea_query::{Expr, ExprTrait, Index as SqIndex, IndexOrder};
-use sea_orm_migration::prelude::*;
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20261011_120000_optimize_global_listing_and_counts"
+    }
+}
 
 #[derive(DeriveIden)]
 enum Memberships {
@@ -43,7 +48,7 @@ enum Memberships {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         // 1. Recreate `idx_memberships_global_active_last_seen` with `id ASC` directly after `last_seen_at DESC`.
         manager
             .drop_index(
@@ -102,7 +107,7 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         for name in [
             "idx_memberships_global_deleted_at",
             "idx_memberships_global_last_seen",

@@ -126,7 +126,7 @@ async fn bootstrap_master_key(
         std::env::var("BOOTSTRAP_SUBNET").unwrap_or_else(|_| "0.0.0.0/0,::/0".to_owned());
 
     let prefix = plaintext_key.chars().take(8).collect::<String>();
-    let now = chrono::Utc::now().naive_utc();
+    let now = simply_ip_vault::time_serde::now_utc();
 
     let model = api_key::ActiveModel {
         id: Set(Uuid::new_v4()),
@@ -471,7 +471,7 @@ mod tests {
         signing_secret: &str,
     ) {
         use entities::api_key;
-        let now = chrono::Utc::now().naive_utc();
+        let now = simply_ip_vault::time_serde::now_utc();
         let model = api_key::ActiveModel {
             id: Set(Uuid::new_v4()),
             key_hash: Set(api::hash_key("irrelevant-for-this-test")),

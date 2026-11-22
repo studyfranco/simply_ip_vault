@@ -16,6 +16,11 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
-      - name: Run cargo test
-        run: cargo test --workspace --verbose
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: Run pre-push checks
+        run: ./scripts/pre_push.sh

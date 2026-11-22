@@ -34,8 +34,8 @@
 //! TABLE` would mean guessing how `SeaORM` renders `uuid` and `date_time` on each backend, and a near
 //! miss would silently change a column's affinity while every test still passed.
 
+use super::prelude::*;
 use sea_orm::DatabaseBackend;
-use sea_orm_migration::prelude::*;
 
 /// The value written where attribution was never recorded.
 ///
@@ -49,8 +49,13 @@ const ATTRIBUTION_COLUMNS: [AuditLogs; 3] = [
     AuditLogs::ClientIp,
 ];
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20260811_000010_audit_attribution_not_null"
+    }
+}
 
 /// `audit_logs`, and the transient name its SQLite rebuild lands in.
 #[derive(Clone, Copy, DeriveIden)]
@@ -223,7 +228,7 @@ async fn backfill(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         // Order matters: the constraint cannot be applied while a single NULL remains, and on the
         // rebuild path the copy would fail rather than the ALTER.
         backfill(manager).await?;
@@ -245,7 +250,7 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         // Relaxing a constraint needs no backfill; the rows already satisfy the looser shape.
         if manager.get_database_backend() == DatabaseBackend::Sqlite {
             return rebuild(manager, false).await;

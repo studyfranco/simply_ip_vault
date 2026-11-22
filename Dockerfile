@@ -5,6 +5,7 @@ WORKDIR /app
 
 # Copy the source code
 COPY Cargo.toml Cargo.lock* ./
+COPY vendor vendor
 COPY src src
 COPY static static
 

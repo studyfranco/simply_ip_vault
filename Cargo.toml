@@ -17,18 +17,18 @@ tokio = { version = "1", features = ["full"] }
 # All three SQL drivers stay enabled on purpose: AGENT.MD requires the data layer to remain
 # SQL-agnostic and PostgreSQL-ready, so `sqlx-postgres`/`sqlx-mysql` are a deliberate retention and
 # not dead weight, even though SQLite is the zero-config default this suite runs on.
-sea-orm = { version = "2", features = ["sqlx-postgres", "sqlx-mysql", "sqlx-sqlite", "runtime-tokio-rustls", "macros", "with-uuid", "with-chrono"] }
-sea-orm-migration = { version = "2", features = ["runtime-tokio-rustls", "sqlx-postgres", "sqlx-mysql", "sqlx-sqlite"] }
+sea-orm = { version = "=2.0.4", default-features = false, features = ["sqlx-postgres", "sqlx-mysql", "sqlx-sqlite", "runtime-tokio-rustls", "macros", "with-uuid", "with-time", "with-json", "schema-sync"] }
+sea-schema = { version = "0.18", default-features = false, features = ["discovery", "probe", "runtime-tokio-rustls", "sqlx-sqlite", "sqlx-postgres", "sqlx-mysql"] }
 ipnet = "2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 httpdate = "1"
-url = "2"
+url = "2.5.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
 sha2 = "0.11"
 hmac = "0.13"
 tower-http = { version = "0.7", features = ["fs", "trace"] }
@@ -75,3 +75,6 @@ oxc_span = "0.158"
 
 [profile.test]
 opt-level = 1
+
+[patch.crates-io]
+sea-orm = { path = "vendor/sea-orm" }

@@ -442,7 +442,12 @@ fn prepare_dispatch_with_cipher(
     config: &webhook_config::Model,
     event: &WebhookEvent,
 ) -> Result<PreparedDispatch, String> {
-    prepare_dispatch_at(cipher, config, event, chrono::Utc::now().timestamp())
+    prepare_dispatch_at(
+        cipher,
+        config,
+        event,
+        time::OffsetDateTime::now_utc().unix_timestamp(),
+    )
 }
 
 fn prepare_dispatch_at(
@@ -453,7 +458,7 @@ fn prepare_dispatch_at(
 ) -> Result<PreparedDispatch, String> {
     // Computed once and reused everywhere a timestamp is needed in this dispatch — the `$timestamp`
     // template variable and (for `CANONICAL_V1`) the signed `X-Timestamp` header both mean "when
-    // this attempt was prepared", so they must be the same number, not two calls to `Utc::now()`
+    // this attempt was prepared", so they must be the same number, not two calls to `time::OffsetDateTime::now_utc()`
     // a few instructions apart that happen to usually agree.
     let timestamp = timestamp.to_string();
 
@@ -964,7 +969,7 @@ async fn log_execution(
         resolved_target_url: Set(Some(resolved_target_url.to_owned())),
         target_address: Set(Some(ctx.target_address.clone())),
         cause: Set(ctx.cause.clone()),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(crate::time_serde::now_utc()),
     };
     if let Err(e) = row.insert(db).await {
         error!(webhook_id = %ctx.webhook_id, "Failed to record webhook execution history: {e}");
@@ -1482,7 +1487,9 @@ async fn dispatch_worker(
                 dispatch_with_retries_config(
                     client,
                     || {
-                        last_timestamp = chrono::Utc::now().timestamp().max(last_timestamp + 1);
+                        last_timestamp = time::OffsetDateTime::now_utc()
+                            .unix_timestamp()
+                            .max(last_timestamp + 1);
                         prepare_dispatch_at(&cipher, &config, &event, last_timestamp)
                     },
                     ctx,
@@ -1782,7 +1789,7 @@ mod tests {
             send_normalized_ipv6: false,
             events: None,
             owner_key_id: None,
-            created_at: chrono::Utc::now().naive_utc(),
+            created_at: crate::time_serde::now_utc(),
         };
         let event = sample_event();
 
@@ -1817,7 +1824,7 @@ mod tests {
             send_normalized_ipv6: false,
             events: None,
             owner_key_id: None,
-            created_at: chrono::Utc::now().naive_utc(),
+            created_at: crate::time_serde::now_utc(),
         };
         let event = sample_event();
 
@@ -1954,8 +1961,8 @@ mod tests {
     #[tokio::test]
     async fn the_db_connection_is_released_before_the_slow_http_call_returns() {
         const SLOW_RESPONSE_DELAY: Duration = Duration::from_secs(2);
+        use crate::migration::MigratorTrait;
         use sea_orm::{ActiveModelTrait, Database, Set};
-        use sea_orm_migration::MigratorTrait;
 
         let db = Database::connect("sqlite::memory:")
             .await
@@ -1974,7 +1981,7 @@ mod tests {
             group_type: Set("banlist".to_owned()),
             owner_key_id: Set(None),
             description: Set(None),
-            created_at: Set(chrono::Utc::now().naive_utc()),
+            created_at: Set(crate::time_serde::now_utc()),
         }
         .insert(&db)
         .await
@@ -1997,7 +2004,7 @@ mod tests {
             send_normalized_ipv6: Set(false),
             events: Set(None),
             owner_key_id: Set(None),
-            created_at: Set(chrono::Utc::now().naive_utc()),
+            created_at: Set(crate::time_serde::now_utc()),
         }
         .insert(&db)
         .await
@@ -2215,7 +2222,7 @@ mod tests {
             group_type: Set("banlist".to_owned()),
             owner_key_id: Set(None),
             description: Set(None),
-            created_at: Set(chrono::Utc::now().naive_utc()),
+            created_at: Set(crate::time_serde::now_utc()),
         }
         .insert(db)
         .await
@@ -2239,7 +2246,7 @@ mod tests {
             send_normalized_ipv6: Set(false),
             events: Set(None),
             owner_key_id: Set(None),
-            created_at: Set(chrono::Utc::now().naive_utc()),
+            created_at: Set(crate::time_serde::now_utc()),
         }
         .insert(db)
         .await
@@ -2259,7 +2266,7 @@ mod tests {
     }
 
     async fn migrated_memory_db() -> DatabaseConnection {
-        use sea_orm_migration::MigratorTrait;
+        use crate::migration::MigratorTrait;
         let db = sea_orm::Database::connect("sqlite::memory:")
             .await
             .expect("in-memory sqlite opens");
@@ -2656,7 +2663,7 @@ mod tests {
             send_normalized_ipv6: false,
             events: None,
             owner_key_id: None,
-            created_at: chrono::Utc::now().naive_utc(),
+            created_at: crate::time_serde::now_utc(),
         };
         let event = WebhookEvent {
             action: "TEST".to_owned(),
@@ -2727,7 +2734,7 @@ mod tests {
             send_normalized_ipv6: false,
             events: None,
             owner_key_id: None,
-            created_at: chrono::Utc::now().naive_utc(),
+            created_at: crate::time_serde::now_utc(),
         };
         let event = WebhookEvent {
             action: "TEST".to_owned(),
@@ -2785,7 +2792,7 @@ mod tests {
             send_normalized_ipv6: false,
             events: None,
             owner_key_id: None,
-            created_at: chrono::Utc::now().naive_utc(),
+            created_at: crate::time_serde::now_utc(),
         };
 
         let host_ban = WebhookEvent {
@@ -2916,7 +2923,7 @@ mod tests {
             send_normalized_ipv6: false,
             events: None,
             owner_key_id: None,
-            created_at: chrono::Utc::now().naive_utc(),
+            created_at: crate::time_serde::now_utc(),
         };
         let event = sample_event();
         let prepared = prepare_dispatch_with_cipher(&cipher, &sealed_config, &event)

@@ -9,7 +9,7 @@
 //! `NOT NULL` with a default (rather than nullable) keeps the entity a plain `String`: there is no
 //! meaningful "unset" mode, and every dispatch must pick one.
 
-use sea_orm_migration::prelude::*;
+use super::prelude::*;
 
 /// Identifiers this migration touches. `Table` is re-declared locally rather than imported from the
 /// initial-schema migration so that module can stay private (exporting it would leak a pile of
@@ -23,12 +23,17 @@ enum WebhookConfigs {
     SignatureMode,
 }
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20260730_000003_add_webhook_signature_mode"
+    }
+}
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()
@@ -44,7 +49,7 @@ impl MigrationTrait for Migration {
             .await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()

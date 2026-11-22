@@ -11,7 +11,6 @@
 
 use std::time::Duration;
 
-use chrono::Utc;
 use sea_orm::{
     ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, SqliteTransactionMode,
     TransactionOptions, TransactionTrait,
@@ -91,7 +90,7 @@ pub async fn purge_expired_ip_records(
         return Ok(0);
     }
 
-    let threshold = (Utc::now() - chrono::Duration::days(retention_days)).naive_utc();
+    let threshold = crate::time_serde::now_utc() - time::Duration::days(retention_days);
 
     let txn = db
         .begin_with_options(TransactionOptions {
@@ -278,7 +277,8 @@ pub async fn purge_expired_webhook_executions(
     let mut removed = 0u64;
 
     if success_retention_hours > 0 {
-        let threshold = (Utc::now() - chrono::Duration::hours(success_retention_hours)).naive_utc();
+        let threshold =
+            crate::time_serde::now_utc() - time::Duration::hours(success_retention_hours);
         let result = webhook_execution::Entity::delete_many()
             .filter(webhook_execution::Column::IsSuccess.eq(true))
             .filter(webhook_execution::Column::CreatedAt.lt(threshold))
@@ -288,7 +288,8 @@ pub async fn purge_expired_webhook_executions(
     }
 
     if failure_retention_hours > 0 {
-        let threshold = (Utc::now() - chrono::Duration::hours(failure_retention_hours)).naive_utc();
+        let threshold =
+            crate::time_serde::now_utc() - time::Duration::hours(failure_retention_hours);
         let result = webhook_execution::Entity::delete_many()
             .filter(webhook_execution::Column::IsSuccess.eq(false))
             .filter(webhook_execution::Column::CreatedAt.lt(threshold))
@@ -392,7 +393,7 @@ pub async fn purge_expired_audit_logs(
         return Ok(0);
     }
 
-    let threshold = (Utc::now() - chrono::Duration::days(retention_days)).naive_utc();
+    let threshold = crate::time_serde::now_utc() - time::Duration::days(retention_days);
     let result = audit_log::Entity::delete_many()
         .filter(audit_log::Column::Timestamp.lt(threshold))
         .exec(db)
@@ -457,8 +458,8 @@ mod tests {
             .expect("sqlite memory");
         crate::db::run_migrations(&db).await.expect("migrations");
 
-        let old_ts = (Utc::now() - chrono::Duration::days(400)).naive_utc();
-        let fresh_ts = (Utc::now() - chrono::Duration::days(10)).naive_utc();
+        let old_ts = crate::time_serde::now_utc() - time::Duration::days(400);
+        let fresh_ts = crate::time_serde::now_utc() - time::Duration::days(10);
 
         for (id_byte, ts) in [(1u8, old_ts), (2u8, fresh_ts)] {
             audit_log::ActiveModel {

@@ -66,8 +66,8 @@ fn validate_timestamp(headers: &axum::http::HeaderMap) -> Result<String, AppErro
         .parse()
         .map_err(|_| AppError::Unauthorized("Malformed X-Timestamp header".to_owned()))?;
 
-    let skew = chrono::Utc::now()
-        .timestamp()
+    let skew = time::OffsetDateTime::now_utc()
+        .unix_timestamp()
         .saturating_sub(supplied)
         .abs();
     if skew > MAX_TIMESTAMP_SKEW_SECS {

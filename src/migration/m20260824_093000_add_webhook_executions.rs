@@ -31,10 +31,15 @@
 //! `webhook_configs` rows already go with a deleted `ip_groups` row with no pre-flight step of their
 //! own (`m20230101_000001_initial_schema`'s `ip_groups` -> `webhook_configs` cascade).
 
-use sea_orm_migration::prelude::*;
+use super::prelude::*;
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20260824_093000_add_webhook_executions"
+    }
+}
 
 /// The `webhook_configs` table, referenced by this migration's foreign key.
 #[derive(DeriveIden)]
@@ -58,7 +63,7 @@ enum WebhookExecutions {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .create_table(
                 Table::create()
@@ -161,7 +166,7 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .drop_table(Table::drop().table(WebhookExecutions::Table).to_owned())
             .await

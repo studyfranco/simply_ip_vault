@@ -37,10 +37,11 @@ fn collect_files(dir: &Path, extensions: &[&str], recursive: bool, paths: &mut V
                 .is_dir()
         {
             collect_files(&path, extensions, recursive, paths);
-        } else if path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| extensions.contains(&ext))
+        } else if extensions.is_empty()
+            || path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| extensions.contains(&ext))
         {
             paths.push(
                 path.strip_prefix(repo_path(""))
@@ -785,13 +786,43 @@ fn check_manifest(source: &str) -> Vec<String> {
             .filter(|feature| feature.starts_with("sqlx-"))
             .collect()
     };
-    let orm = sqlx_features("sea-orm");
-    let migration = sqlx_features("sea-orm-migration");
-    for feature in orm.difference(&migration) {
-        violations.push(format!("sea-orm-migration is missing {feature:?}"));
+    let required = HashSet::from(["sqlx-sqlite", "sqlx-postgres", "sqlx-mysql"]);
+    for dependency in ["sea-orm", "sea-schema"] {
+        let features = sqlx_features(dependency);
+        if features != required {
+            violations.push(format!(
+                "{dependency} must enable exactly the three SQLx backends"
+            ));
+        }
     }
-    for feature in migration.difference(&orm) {
-        violations.push(format!("sea-orm is missing {feature:?}"));
+    for dependency in ["chrono", "chrono-tz", "sea-orm-migration"] {
+        if assignments.iter().any(|(path, value)| {
+            path.split('.').collect::<Vec<_>>().windows(2).any(|pair| {
+                matches!(
+                    pair[0],
+                    "dependencies" | "dev-dependencies" | "build-dependencies"
+                ) && pair[1] == dependency
+            }) || (path.contains("dependencies")
+                && value.windows(3).any(|tokens| {
+                    tokens[0] == "package"
+                        && tokens[1] == "="
+                        && literal(tokens[2]) == Some(dependency)
+                }))
+                || (path.ends_with(".package")
+                    && value.len() == 1
+                    && literal(value[0]) == Some(dependency)
+                    && path.contains("dependencies"))
+        }) {
+            violations.push(format!("{dependency} is forbidden"));
+        }
+    }
+    if field("dependencies.time.features")
+        .into_iter()
+        .flatten()
+        .filter_map(literal)
+        .any(|feature| feature == "local-offset")
+    {
+        violations.push("time/local-offset is forbidden".to_owned());
     }
     violations.sort();
     violations
@@ -817,9 +848,10 @@ fn the_manifest_check_rejects_policy_regressions() {
         all = { priority = -2, level = "warn" }
         pedantic = { level = "warn", priority = -1 }
         [dependencies]
-        sea-orm = {features = ["sqlx-sqlite", "sqlx-postgres"]}
-        [dependencies.sea-orm-migration]
+        sea-orm = {features = ["sqlx-sqlite", "sqlx-postgres", "sqlx-mysql"]}
+        [dependencies.sea-schema]
         features = [
+            "sqlx-mysql",
             "sqlx-postgres", # another backend
             'sqlx-sqlite',
         ]
@@ -835,6 +867,15 @@ fn the_manifest_check_rejects_policy_regressions() {
         .replace("\"sqlx-postgres\", # another backend", "");
     let violations = check_manifest(&bad);
     assert_eq!(violations.len(), 8, "{violations:#?}");
+    for dependency in ["chrono", "chrono-tz", "sea-orm-migration"] {
+        let bad = format!("{good}\n[dev-dependencies]\n{dependency} = \"1\"");
+        assert_eq!(check_manifest(&bad), [format!("{dependency} is forbidden")]);
+    }
+    let bad_time = format!("{good}\n[dependencies.time]\nfeatures = [\"serde\", \"local-offset\"]");
+    assert_eq!(
+        check_manifest(&bad_time),
+        ["time/local-offset is forbidden"]
+    );
 }
 
 fn model_expectation(code: &[&str], start: usize, end: usize) -> bool {
@@ -1824,5 +1865,79 @@ fn the_offline_asset_check_rejects_external_resources_and_svg_data_uris() {
         ),
     ] {
         assert!(asset_violations(path, input).is_empty(), "flagged {input}");
+    }
+}
+
+#[test]
+fn audit_checks_have_no_advisory_exceptions() {
+    let mut paths = files(".github/workflows", &[], true);
+    paths.extend(files("scripts", &[], true));
+    paths.push(".cargo/audit.toml".to_owned());
+
+    for path in paths {
+        let source = read(&path).replace("\\\n", "");
+        let words: Vec<_> = source.split_whitespace().collect();
+        assert!(
+            !words
+                .windows(2)
+                .any(|pair| pair[0].ends_with("--ignore") && pair[1].contains("RUSTSEC-"))
+                && !words
+                    .iter()
+                    .any(|word| word.contains("--ignore=") && word.contains("RUSTSEC-")),
+            "{path} contains an advisory exception"
+        );
+        if std::path::Path::new(&path)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
+        {
+            for (key, value) in manifest_assignments(&source) {
+                if key == "ignore" || key.ends_with(".ignore") {
+                    assert_eq!(value, ["[", "]"], "{path} contains an audit ignore list");
+                }
+            }
+        } else {
+            assert!(
+                !source.lines().any(|line| {
+                    let line = line.trim_start();
+                    let Some(value) = line.strip_prefix("ignore").map(str::trim_start) else {
+                        return false;
+                    };
+                    value.starts_with(':')
+                        || value
+                            .strip_prefix('=')
+                            .is_some_and(|list| list.trim() != "[]")
+                }),
+                "{path} contains an audit ignore setting"
+            );
+        }
+    }
+}
+
+#[test]
+fn goals_use_documentation_addresses_and_domains() {
+    let source = read("GOALS.md");
+
+    for token in
+        source.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '-' | '_')))
+    {
+        let token = token.trim_matches('.');
+        let host = token.split(':').next().unwrap_or_default();
+        if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+            let [a, b, c, _] = ip.octets();
+            assert!(
+                matches!((a, b, c), (192, 0, 2) | (198, 51, 100) | (203, 0, 113)),
+                "GOALS.md contains a non-documentation IP: {ip}"
+            );
+        } else if token.parse::<std::net::Ipv6Addr>().is_ok() {
+            panic!("GOALS.md contains an IPv6 address: {token}");
+        } else if host.contains('.') {
+            let host = host.to_ascii_lowercase();
+            assert!(
+                host.ends_with(".example.test")
+                    || host.ends_with(".example.com")
+                    || (host == "rbac_model.md" && source.contains("(RBAC_MODEL.md)")),
+                "GOALS.md contains a non-documentation domain: {host}"
+            );
+        }
     }
 }

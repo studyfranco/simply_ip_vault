@@ -5,15 +5,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::NaiveDateTime;
 use sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseConnection, EntityTrait, sea_query::Query,
 };
-use sea_orm_migration::{MigratorTrait, SchemaManager, prelude::DeriveIden};
+use simply_ip_vault::migration::{DeriveIden, MigratorTrait, SchemaManager};
 use simply_ip_vault::{
     entities::{ip_record, ip_record_cause, ip_record_group_membership},
     migration,
 };
+use time::PrimitiveDateTime;
 use uuid::Uuid;
 
 const BUDGET: Duration = Duration::from_secs(2);
@@ -69,8 +69,8 @@ fn address(n: i64) -> String {
     format!("10.0.{}.{}", n >> 8, n & 255)
 }
 
-fn observation_time(created_at: NaiveDateTime, record: i64, group: i64) -> NaiveDateTime {
-    created_at - chrono::Duration::seconds(record * GROUPS + group)
+fn observation_time(created_at: PrimitiveDateTime, record: i64, group: i64) -> PrimitiveDateTime {
+    created_at - time::Duration::seconds(record * GROUPS + group)
 }
 
 #[tokio::test]
@@ -93,7 +93,7 @@ async fn membership_refactor_preserves_legacy_data_within_budget() {
         .await
         .unwrap();
 
-    let created_at = NaiveDateTime::parse_from_str("2026-10-05 12:00:00", "%F %T").unwrap();
+    let created_at = time::macros::datetime!(2026-10-05 12:00:00);
     seed_legacy_backfill_rows(&db, created_at).await;
 
     let migration_started = Instant::now();
@@ -123,7 +123,7 @@ async fn membership_refactor_preserves_legacy_data_within_budget() {
     );
 }
 
-async fn assert_backfill(db: &DatabaseConnection, created_at: NaiveDateTime) {
+async fn assert_backfill(db: &DatabaseConnection, created_at: PrimitiveDateTime) {
     let records: HashMap<_, _> = ip_record::Entity::find()
         .all(db)
         .await
@@ -198,7 +198,7 @@ fn legacy_groups(record: i64) -> impl Iterator<Item = i64> {
     std::iter::once(primary).chain(secondary)
 }
 
-async fn seed_legacy_backfill_rows(db: &DatabaseConnection, created_at: NaiveDateTime) {
+async fn seed_legacy_backfill_rows(db: &DatabaseConnection, created_at: PrimitiveDateTime) {
     let mut groups = Query::insert();
     groups.into_table(Groups::Table).columns([
         Groups::Id,
@@ -234,7 +234,7 @@ async fn seed_legacy_backfill_rows(db: &DatabaseConnection, created_at: NaiveDat
             Records::DeletedBy,
         ]);
         for i in n..=end {
-            let seen = created_at - chrono::Duration::seconds(i);
+            let seen = created_at - time::Duration::seconds(i);
             let deleted = i % 20 == 0;
             stmt.values_panic([
                 record_id(i).into(),

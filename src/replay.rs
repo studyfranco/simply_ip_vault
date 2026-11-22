@@ -18,7 +18,7 @@
 //! follow-up. Three properties changed, each closing a defect the audit found:
 //!
 //! - **Monotonic expiry.** Entries expire against [`tokio::time::Instant`] rather than
-//!   `chrono::Utc::now()`. The previous wall-clock arithmetic (`(now - ts).abs() <= window`) evicted
+//!   `time::OffsetDateTime::now_utc()`. The previous wall-clock arithmetic (`(now - ts).abs() <= window`) evicted
 //!   still-valid entries whenever the system clock stepped in *either* direction, which is precisely
 //!   the moment — an NTP correction — when an operator is least likely to connect the two events.
 //! - **Amortized sweeping.** Pruning runs on an interval instead of scanning the whole map on every

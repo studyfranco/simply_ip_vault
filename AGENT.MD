@@ -1,3 +1,5 @@
+[Project goals and onboarding](GOALS.md)
+
 # Simply IP Vault - AI Agent Context & Directives
 
 Hello AI Agent! You are assisting with the development of `simply_ip_vault`. Read and strictly adhere to these guidelines before inspecting or writing any code.
@@ -113,8 +115,9 @@ directly — do it yourself in that case.
   - **Mandatory `rustdoc`**: All public modules, structs, enums, functions, and Axum handlers MUST be documented using `///` (or `//!` for crates/modules). Enforce `#![warn(missing_docs)]` in `lib.rs`.
   - **Dependency Freshness & Security Auditing (Mandatory):**
     - All external libraries and Cargo dependencies MUST always be kept at their latest compatible versions (`cargo update`, latest semver).
-    - Regular dependency updates and vulnerability scanning are mandatory gates: both `scripts/test_e2e.sh` and GitHub CI enforce `cargo update` and `cargo audit` (`cargo audit --ignore RUSTSEC-2026-0459`).
-    - No build, test suite, or PR may merge with outdated vulnerable dependencies or unresolved audit findings (unless explicitly documented and grandfathered by upstream constraint, such as `RUSTSEC-2026-0459`).
+    - Require `cargo audit --deny warnings` with zero advisory exceptions.
+    - The local SeaORM patch preserves legacy SQLite timestamp comparisons and keeps Chrono out of the lockfile. See [the patch notes](vendor/README.md).
+    - Enable the repository hooks with `git config core.hooksPath .githooks`. Run `./scripts/pre_push.sh` successfully before every push.
 
 ---
 

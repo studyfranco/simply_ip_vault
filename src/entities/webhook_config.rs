@@ -1,7 +1,7 @@
 //! The `webhook_configs` table: HTTP endpoints notified when IP events occur within a specific
 //! IP group.
 
-use sea_orm::entity::prelude::*;
+use sea_orm::entity::prelude::{TimeDateTime as DateTime, *};
 use serde::{Deserialize, Serialize};
 
 /// A single webhook subscription: where to send events for a group, and how to sign/shape them.
@@ -85,6 +85,7 @@ pub struct Model {
     #[serde(default)]
     pub owner_key_id: Option<Uuid>,
     /// Creation timestamp.
+    #[serde(with = "crate::time_serde")]
     pub created_at: DateTime,
 }
 

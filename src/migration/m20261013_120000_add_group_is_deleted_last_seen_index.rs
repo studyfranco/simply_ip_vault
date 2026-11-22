@@ -27,11 +27,16 @@
 //! 2. Serves `ORDER BY last_seen_at DESC, id ASC` in exact B-tree sort order without a temporary B-tree or scan.
 //! 3. Covers all selected columns (`USING COVERING INDEX`), eliminating random bookmark lookups into the membership table.
 
+use super::prelude::*;
 use sea_orm::sea_query::{Index as SqIndex, IndexOrder};
-use sea_orm_migration::prelude::*;
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20261013_120000_add_group_is_deleted_last_seen_index"
+    }
+}
 
 #[derive(DeriveIden)]
 enum Memberships {
@@ -50,7 +55,7 @@ enum Memberships {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .create_index(
                 SqIndex::create()
@@ -73,7 +78,7 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .drop_index(
                 SqIndex::drop()

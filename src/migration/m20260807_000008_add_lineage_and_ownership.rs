@@ -58,7 +58,7 @@
 //! Reads stay defensive regardless: a resource whose `owner_key_id` names a key that no longer exists
 //! is treated as unowned, which withholds authority rather than granting it to nobody in particular.
 
-use sea_orm_migration::prelude::*;
+use super::prelude::*;
 
 /// The `api_keys` table and the lineage column added to it.
 #[derive(DeriveIden)]
@@ -99,12 +99,17 @@ enum ApiKeyGroupPermissions {
     GroupId,
 }
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20260807_000008_add_lineage_and_ownership"
+    }
+}
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()
@@ -200,7 +205,7 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         for (name, table) in [
             ("idx-api_keys-key_hash", ApiKeys::Table),
             ("idx-api_keys-parent_key_id", ApiKeys::Table),

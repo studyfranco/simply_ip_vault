@@ -1,7 +1,12 @@
-use sea_orm_migration::prelude::*;
+use super::prelude::*;
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20261119_130000_add_ip_group_ban_policy"
+    }
+}
 
 #[derive(DeriveIden)]
 enum IpGroups {
@@ -19,7 +24,7 @@ enum IpGroupExclusions {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         use IpGroupExclusions::{ExcludedGroupId, GroupId};
         manager
             .alter_table(
@@ -65,7 +70,7 @@ impl MigrationTrait for Migration {
             .await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .drop_table(Table::drop().table(IpGroupExclusions::Table).to_owned())
             .await?;

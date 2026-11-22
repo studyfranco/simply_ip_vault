@@ -17,7 +17,7 @@ use sea_orm::{
     ColumnTrait, ConnectionTrait, Database, DatabaseConnection, DbBackend, EntityTrait, JoinType,
     QueryFilter, QuerySelect, RelationTrait, Statement,
 };
-use sea_orm_migration::MigratorTrait;
+use simply_ip_vault::migration::MigratorTrait;
 use uuid::Uuid;
 
 use simply_ip_vault::entities::{ip_group, ip_record, ip_record_group_membership};
@@ -49,8 +49,8 @@ async fn fresh_db() -> DatabaseConnection {
 /// soft-deleted well past the retention window (the case its first delete targets). The rest are
 /// live.
 async fn seed(db: &DatabaseConnection) {
-    let now = chrono::Utc::now().naive_utc();
-    let old = now - chrono::Duration::days(200);
+    let now = simply_ip_vault::time_serde::now_utc();
+    let old = now - time::Duration::days(200);
     let stmts = [
         format!(
             "INSERT INTO ip_groups (id, name, group_type, description, owner_key_id, created_at)

@@ -66,11 +66,16 @@
 //! meaningful as "when any field on this address last changed" — only the index built for a query
 //! shape that no longer exists is removed.
 
+use super::prelude::*;
 use sea_orm::DatabaseBackend;
-use sea_orm_migration::prelude::*;
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20260926_120000_add_membership_timestamps"
+    }
+}
 
 #[derive(DeriveIden)]
 enum IpRecordGroupMemberships {
@@ -152,7 +157,7 @@ fn record_timestamp(column: IpRecords) -> Expr {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         let backend = manager.get_database_backend();
 
         // `idx_ip_records_deleted_updated` (`m20260824_150000`) existed solely to serve
@@ -226,7 +231,7 @@ impl MigrationTrait for Migration {
         recreate_indexes(manager).await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .drop_index(
                 Index::drop()

@@ -24,11 +24,16 @@
 //! - `idx_memberships_group_is_deleted_ip_record` on `(group_id, is_deleted, ip_record_id)`:
 //!   Enables fast covering lookups for group-scoped membership existence tests.
 
+use super::prelude::*;
 use sea_orm::sea_query::Index as SqIndex;
-use sea_orm_migration::prelude::*;
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20261111_120000_add_analytics_and_overlap_indexes"
+    }
+}
 
 #[derive(DeriveIden)]
 enum Memberships {
@@ -41,7 +46,7 @@ enum Memberships {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .create_index(
                 SqIndex::create()
@@ -71,7 +76,7 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .drop_index(
                 SqIndex::drop()

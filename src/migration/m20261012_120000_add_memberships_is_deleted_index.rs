@@ -21,11 +21,16 @@
 //! 1. `COUNT(*) ... WHERE is_deleted = ?` performs a fast covering index seek (< 10ms).
 //! 2. Unfiltered page and cursor queries stream in exact sort order without a temporary B-tree.
 
+use super::prelude::*;
 use sea_orm::sea_query::{Index as SqIndex, IndexOrder};
-use sea_orm_migration::prelude::*;
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20261012_120000_add_memberships_is_deleted_index"
+    }
+}
 
 #[derive(DeriveIden)]
 enum Memberships {
@@ -38,7 +43,7 @@ enum Memberships {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .create_index(
                 SqIndex::create()
@@ -55,7 +60,7 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .drop_index(
                 SqIndex::drop()

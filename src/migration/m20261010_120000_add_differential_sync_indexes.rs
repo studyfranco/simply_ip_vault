@@ -43,11 +43,16 @@
 //!   - Serves `GET /api/v1/audit-logs?action=…` (`ORDER BY timestamp DESC LIMIT ?`) directly from
 //!     the B-tree without sorting every matching action row in a temporary B-tree.
 
+use super::prelude::*;
 use sea_orm::sea_query::{Expr, ExprTrait, Index as SqIndex, IndexOrder};
-use sea_orm_migration::prelude::*;
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20261010_120000_add_differential_sync_indexes"
+    }
+}
 
 #[derive(DeriveIden)]
 enum Memberships {
@@ -70,7 +75,7 @@ enum AuditLogs {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .create_index(
                 SqIndex::create()
@@ -113,7 +118,7 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         for (table, name) in [
             (
                 AuditLogs::Table.into_iden(),

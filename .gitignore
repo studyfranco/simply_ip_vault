@@ -4,6 +4,5 @@ target/*
 # WAL mode sidecars, created alongside the database once journal_mode=WAL is set.
 *.db-wal
 *.db-shm
-Cargo.lock
 .claude/*
 example/*

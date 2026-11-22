@@ -33,13 +33,18 @@
 //! `updated_at` would serve that query no better than this one while being wider, and its second
 //! column would be dead weight on every insert.
 
-use sea_orm_migration::prelude::*;
+use super::prelude::*;
 
 /// The index this migration exists to create.
 const UPDATED_AT_INDEX: &str = "idx-ip_records-updated_at";
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20260811_000011_index_ip_record_delta_columns"
+    }
+}
 
 #[derive(DeriveIden)]
 enum IpRecords {
@@ -49,7 +54,7 @@ enum IpRecords {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .create_index(
                 Index::create()
@@ -64,7 +69,7 @@ impl MigrationTrait for Migration {
             .await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .drop_index(
                 Index::drop()

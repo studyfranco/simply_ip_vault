@@ -1,7 +1,7 @@
 //! The `audit_logs` table: the security audit trail tracking mutating operations across the
 //! application.
 
-use sea_orm::entity::prelude::*;
+use sea_orm::entity::prelude::{TimeDateTime as DateTime, *};
 use serde::{Deserialize, Serialize};
 
 /// A single audit trail entry for a mutating operation.
@@ -40,6 +40,7 @@ pub struct Model {
     /// Additional context or a raw payload overview.
     pub details: Option<String>,
     /// Log creation timestamp.
+    #[serde(with = "crate::time_serde")]
     pub timestamp: DateTime,
 }
 

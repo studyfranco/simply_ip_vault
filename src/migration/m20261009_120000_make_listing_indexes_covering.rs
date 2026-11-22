@@ -17,11 +17,16 @@
 //! two indexes store. Worth it for a read path this central, and a one-time migration cost against
 //! a cost paid by every listing request afterwards.
 
+use super::prelude::*;
 use sea_orm::sea_query::{Expr, ExprTrait, Index as SqIndex, IndexOrder};
-use sea_orm_migration::prelude::*;
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20261009_120000_make_listing_indexes_covering"
+    }
+}
 
 #[derive(DeriveIden)]
 enum Memberships {
@@ -52,7 +57,7 @@ fn covering_tail(stmt: &mut IndexCreateStatement) -> &mut IndexCreateStatement {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .drop_index(
                 SqIndex::drop()
@@ -96,7 +101,7 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         // Restores the narrower, non-covering indexes this migration widened.
         manager
             .drop_index(

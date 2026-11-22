@@ -9,7 +9,6 @@ use axum::{
     extract::{Json, State},
     response::IntoResponse,
 };
-use chrono::Utc;
 use ipnet::IpNet;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryFilter,
@@ -382,7 +381,7 @@ pub async fn create_api_key(
     let signing_secret = crate::crypto::generate_signing_secret();
     let stored_signing_secret = state.cipher.seal(&signing_secret)?;
     let id = Uuid::new_v4();
-    let now = Utc::now().naive_utc();
+    let now = crate::time_serde::now_utc();
 
     let model = api_key::ActiveModel {
         id: Set(id),
@@ -475,7 +474,8 @@ pub struct ApiKeySummary {
     pub parent_key_id: Option<Uuid>,
     /// Key creation timestamp. Full view only.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<chrono::NaiveDateTime>,
+    #[serde(with = "crate::time_serde::option")]
+    pub created_at: Option<time::PrimitiveDateTime>,
     /// Per-group permissions. **All** of them in the full view; in the minimal view, only the rows on
     /// groups the caller itself manages.
     pub group_permissions: Vec<MePermission>,
@@ -1276,7 +1276,7 @@ pub async fn update_api_key(
     if let Some(v) = payload.can_create_groups {
         active.can_create_groups = Set(v);
     }
-    active.updated_at = Set(Utc::now().naive_utc());
+    active.updated_at = Set(crate::time_serde::now_utc());
     let updated = active.update(&state.db).await?;
     // Uses the post-update name (not the pre-update one) — if this call renamed the key, the
     // resulting name is what a reader will actually recognize it by later.
@@ -1340,7 +1340,7 @@ pub async fn rotate_api_key(
     active.key_hash = Set(key_hash);
     active.prefix = Set(prefix);
     active.signing_secret = Set(Some(stored_signing_secret));
-    active.updated_at = Set(Utc::now().naive_utc());
+    active.updated_at = Set(crate::time_serde::now_utc());
     active.update(&state.db).await?;
 
     create_audit_log(
@@ -1410,7 +1410,7 @@ pub async fn rotate_signing_secret(
     // separate `api_key_group_permissions` rows are never referenced at all.
     let mut active: api_key::ActiveModel = target.into();
     active.signing_secret = Set(Some(stored_signing_secret));
-    active.updated_at = Set(Utc::now().naive_utc());
+    active.updated_at = Set(crate::time_serde::now_utc());
     active.update(&state.db).await?;
 
     create_audit_log(
@@ -1535,7 +1535,7 @@ pub async fn update_key_group_permissions(
         guard_group_manage(&key, caller_perm.as_ref(), &resolved_group_name, "revoke")?;
     }
 
-    let now = Utc::now().naive_utc();
+    let now = crate::time_serde::now_utc();
     let perm_model = api_key_group_permission::ActiveModel {
         id: Set(Uuid::new_v4()),
         api_key_id: Set(id),

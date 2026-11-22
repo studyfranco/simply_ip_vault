@@ -8,8 +8,8 @@ use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, Database, DatabaseConnection, EntityTrait,
     QueryFilter, QueryOrder,
 };
-use sea_orm_migration::MigratorTrait;
 use serde_json::json;
+use simply_ip_vault::migration::MigratorTrait;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -26,7 +26,7 @@ async fn setup_test_db() -> DatabaseConnection {
 async fn seed_ip_record(
     db: &DatabaseConnection,
     address: &str,
-    created_at: chrono::NaiveDateTime,
+    created_at: time::PrimitiveDateTime,
 ) -> Uuid {
     let id = Uuid::new_v4();
     simply_ip_vault::entities::ip_record::ActiveModel {
@@ -44,16 +44,16 @@ async fn seed_ip_record(
 #[derive(Clone, Debug)]
 struct SeededMembership {
     is_locked: bool,
-    created_at: chrono::NaiveDateTime,
-    last_seen_at: chrono::NaiveDateTime,
+    created_at: time::PrimitiveDateTime,
+    last_seen_at: time::PrimitiveDateTime,
     is_deleted: bool,
-    deleted_at: Option<chrono::NaiveDateTime>,
+    deleted_at: Option<time::PrimitiveDateTime>,
     deleted_by: Option<String>,
 }
 
 impl SeededMembership {
     /// A live, unlocked membership created and last observed at `at`.
-    fn live_at(at: chrono::NaiveDateTime) -> Self {
+    fn live_at(at: time::PrimitiveDateTime) -> Self {
         Self {
             is_locked: false,
             created_at: at,
@@ -95,7 +95,7 @@ async fn seed_cause(
     db: &DatabaseConnection,
     membership_id: Uuid,
     cause: &str,
-    created_at: chrono::NaiveDateTime,
+    created_at: time::PrimitiveDateTime,
 ) {
     simply_ip_vault::entities::ip_record_cause::ActiveModel {
         id: Set(Uuid::new_v4()),
@@ -225,7 +225,7 @@ fn signed_later(
         .and_then(|h| h.get("X-API-Key"))
         .and_then(|v| v.to_str().ok())
         .map(test_signing_secret);
-    let timestamp = (chrono::Utc::now().timestamp() + offset_secs).to_string();
+    let timestamp = (time::OffsetDateTime::now_utc().unix_timestamp() + offset_secs).to_string();
     build_signed_at(builder, derived.as_deref(), &timestamp, body.into())
 }
 
@@ -247,7 +247,7 @@ fn signed_later_with(
     offset_secs: i64,
     body: impl Into<String>,
 ) -> Request<Body> {
-    let timestamp = (chrono::Utc::now().timestamp() + offset_secs).to_string();
+    let timestamp = (time::OffsetDateTime::now_utc().unix_timestamp() + offset_secs).to_string();
     build_signed_at(builder, Some(signing_secret), &timestamp, body.into())
 }
 
@@ -278,7 +278,7 @@ fn build_signed(
     signing_secret: Option<&str>,
     body: String,
 ) -> Request<Body> {
-    let timestamp = chrono::Utc::now().timestamp().to_string();
+    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp().to_string();
     build_signed_at(builder, signing_secret, &timestamp, body)
 }
 
@@ -355,8 +355,8 @@ async fn test_auth_and_cidr_rejection() {
         can_create_groups: Set(false),
         parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
+        updated_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -412,7 +412,7 @@ async fn test_tenant_isolation_mn_rbac() {
         group_type: Set("banlist".to_owned()),
         owner_key_id: Set(None),
         description: Set(None),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -434,8 +434,8 @@ async fn test_tenant_isolation_mn_rbac() {
         can_create_groups: Set(false),
         parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
+        updated_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -467,7 +467,7 @@ async fn test_tenant_isolation_mn_rbac() {
         can_write: Set(true),
         can_delete: Set(false),
         can_manage: Set(false),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -514,8 +514,8 @@ async fn test_auto_provisioning_on_group_creation() {
         can_create_groups: Set(true), // CAN CREATE GROUPS
         parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
+        updated_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -789,8 +789,8 @@ async fn test_explicit_key_group_manipulation() {
         can_create_groups: Set(true),
         parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
+        updated_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -809,8 +809,8 @@ async fn test_explicit_key_group_manipulation() {
         can_create_groups: Set(false),
         parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
+        updated_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -868,8 +868,8 @@ async fn test_multi_group_and_temporal_filtering() {
         can_create_groups: Set(true),
         parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
+        updated_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -892,13 +892,13 @@ async fn test_multi_group_and_temporal_filtering() {
         group_type: Set("banlist".to_owned()),
         owner_key_id: Set(None),
         description: Set(None),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
     .unwrap();
 
-    let old_time = chrono::Utc::now().naive_utc() - chrono::Duration::hours(2);
+    let old_time = simply_ip_vault::time_serde::now_utc() - time::Duration::hours(2);
     let old_record_id = seed_ip_record(&db, "8.8.4.4", old_time).await;
 
     // `since` and `max_age` read the membership's own `last_seen_at`, so the membership must be aged
@@ -932,7 +932,7 @@ async fn test_multi_group_and_temporal_filtering() {
     assert!(items.iter().all(|i| i["target_address"] != "8.8.4.4"));
 
     // `since` filter: a very recent Unix timestamp must also exclude the stale record.
-    let since_ts = (chrono::Utc::now() - chrono::Duration::minutes(5)).timestamp();
+    let since_ts = (time::OffsetDateTime::now_utc() - time::Duration::minutes(5)).unix_timestamp();
     let req = signed(
         api_request("GET", format!("/api/ips?since={since_ts}"), &plaintext),
         "",
@@ -1024,8 +1024,8 @@ async fn test_webhook_hmac_signature_and_delivery() {
         can_create_groups: Set(true),
         parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
+        updated_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -1039,7 +1039,7 @@ async fn test_webhook_hmac_signature_and_delivery() {
         group_type: Set("banlist".to_owned()),
         owner_key_id: Set(None),
         description: Set(None),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -1208,8 +1208,8 @@ async fn test_webhook_event_filtering_skips_non_matching_actions() {
         can_create_groups: Set(true),
         parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
+        updated_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -1223,7 +1223,7 @@ async fn test_webhook_event_filtering_skips_non_matching_actions() {
         group_type: Set("banlist".to_owned()),
         owner_key_id: Set(None),
         description: Set(None),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -1348,8 +1348,8 @@ async fn test_reban_into_same_group_does_not_500() {
         can_create_groups: Set(true),
         parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
+        updated_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -1434,8 +1434,8 @@ async fn test_create_webhook_rejects_invalid_url() {
         can_create_groups: Set(true),
         parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
+        updated_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -1449,7 +1449,7 @@ async fn test_create_webhook_rejects_invalid_url() {
         group_type: Set("banlist".to_owned()),
         owner_key_id: Set(None),
         description: Set(None),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -1562,8 +1562,8 @@ async fn insert_key(
         can_create_groups: Set(scopes.can_create_groups),
         parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
+        updated_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(db)
     .await
@@ -1854,8 +1854,8 @@ async fn insert_key_with_bound_ips(
         can_create_groups: Set(false),
         parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
+        updated_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(db)
     .await
@@ -1947,11 +1947,11 @@ async fn test_concurrent_burst_ban_requests() {
     assert_eq!(items[0]["target_address"], "44.44.44.44");
 
     // last_seen_at must reflect one of the concurrent requests, not be stale/missing.
-    let last_seen: chrono::NaiveDateTime =
-        serde_json::from_value(items[0]["last_seen_at"].clone()).unwrap();
-    let age = chrono::Utc::now().naive_utc() - last_seen;
+    let last_seen =
+        simply_ip_vault::time_serde::parse(items[0]["last_seen_at"].as_str().unwrap()).unwrap();
+    let age = simply_ip_vault::time_serde::now_utc() - last_seen;
     assert!(
-        age < chrono::Duration::seconds(30),
+        age < time::Duration::seconds(30),
         "last_seen_at should have just been updated, age was {age}"
     );
 }
@@ -2259,7 +2259,7 @@ async fn test_webhook_dispatch_does_not_block_api_response() {
         group_type: Set("banlist".to_owned()),
         owner_key_id: Set(None),
         description: Set(None),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -3409,7 +3409,7 @@ async fn grant_perm(
         can_write: Set(capabilities.can_write),
         can_delete: Set(capabilities.can_delete),
         can_manage: Set(manage),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(db)
     .await
@@ -3426,7 +3426,7 @@ async fn insert_group_row(db: &DatabaseConnection, name: &str) -> Uuid {
         group_type: Set("banlist".to_owned()),
         owner_key_id: Set(None),
         description: Set(None),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(db)
     .await
@@ -5072,7 +5072,7 @@ async fn test_each_auth_header_is_individually_required() {
         StatusCode::OK
     );
 
-    let now = chrono::Utc::now().timestamp().to_string();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp().to_string();
     let signature =
         simply_ip_vault::crypto::compute_signature(&secret, "GET", "/api/auth/me", &now, b"")
             .unwrap();
@@ -5158,7 +5158,7 @@ async fn test_anti_replay_timestamp_window_is_enforced_in_both_directions() {
         let key = key.clone();
         let secret = secret.clone();
         async move {
-            let ts = chrono::Utc::now().timestamp() + offset;
+            let ts = time::OffsetDateTime::now_utc().unix_timestamp() + offset;
             let req = signed_at(
                 inject_connect_info(
                     Request::builder()
@@ -5216,7 +5216,7 @@ async fn test_signature_binds_method_path_and_body() {
 
     let (_id, key) = insert_key(&db, "Binder", true, ALL_ADMIN_SCOPES).await;
     let secret = test_signing_secret(&key);
-    let now = chrono::Utc::now().timestamp().to_string();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp().to_string();
 
     let body =
         json!({ "target_address": "51.51.51.51", "group_name": "sig-bind-group" }).to_string();
@@ -5358,8 +5358,8 @@ async fn test_key_without_signing_secret_cannot_authenticate() {
         can_create_groups: Set(true),
         parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
+        updated_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -5666,7 +5666,7 @@ async fn setup_webhook_fixture(
         group_type: Set("banlist".to_owned()),
         owner_key_id: Set(None),
         description: Set(None),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -5750,7 +5750,7 @@ async fn test_canonical_v1_webhook_sends_timestamp_and_canonical_signature() {
     let parsed: i64 = timestamp
         .parse()
         .expect("X-Timestamp must be an integer epoch");
-    let skew = (chrono::Utc::now().timestamp() - parsed).abs();
+    let skew = (time::OffsetDateTime::now_utc().unix_timestamp() - parsed).abs();
     assert!(skew < 300, "X-Timestamp should be current, was {skew}s off");
 
     // `sha256=`-prefixed, byte-identical to what `compute_signature` produces and to what the
@@ -5889,7 +5889,7 @@ async fn test_auth_mode_is_validated_and_exposed_in_listings() {
         group_type: Set("banlist".to_owned()),
         owner_key_id: Set(None),
         description: Set(None),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -6014,7 +6014,7 @@ async fn test_auth_mode_preconditions_are_enforced_at_creation() {
         group_type: Set("banlist".to_owned()),
         owner_key_id: Set(None),
         description: Set(None),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -6411,7 +6411,7 @@ async fn test_rotate_secret_swaps_only_the_signing_secret() {
         group_type: Set("banlist".to_owned()),
         owner_key_id: Set(None),
         description: Set(None),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -6424,7 +6424,7 @@ async fn test_rotate_secret_swaps_only_the_signing_secret() {
         can_write: Set(true),
         can_delete: Set(true),
         can_manage: Set(false),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -6527,8 +6527,8 @@ async fn test_rotate_secret_recovers_a_key_with_no_signing_secret() {
         can_create_groups: Set(false),
         parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
+        updated_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -7487,7 +7487,7 @@ async fn seed_owned_webhook_executions(
                 send_normalized_ipv6: Set(false),
                 events: Set(None),
                 owner_key_id: Set(Some(owner)),
-                created_at: Set(chrono::Utc::now().naive_utc()),
+                created_at: Set(simply_ip_vault::time_serde::now_utc()),
             }
             .insert(&db)
             .await
@@ -7509,7 +7509,7 @@ async fn seed_owned_webhook_executions(
                 resolved_target_url: Set(None),
                 target_address: Set(None),
                 cause: Set(None),
-                created_at: Set(chrono::Utc::now().naive_utc()),
+                created_at: Set(simply_ip_vault::time_serde::now_utc()),
             }
             .insert(&db)
             .await
@@ -7651,7 +7651,7 @@ async fn seed_execution_filter_rows(db: &DatabaseConnection, group_id: Uuid) -> 
                 send_normalized_ipv6: Set(false),
                 events: Set(None),
                 owner_key_id: Set(None),
-                created_at: Set(chrono::Utc::now().naive_utc()),
+                created_at: Set(simply_ip_vault::time_serde::now_utc()),
             }
             .insert(&db)
             .await
@@ -7673,7 +7673,7 @@ async fn seed_execution_filter_rows(db: &DatabaseConnection, group_id: Uuid) -> 
                 resolved_target_url: Set(None),
                 target_address: Set(None),
                 cause: Set(None),
-                created_at: Set(chrono::Utc::now().naive_utc()),
+                created_at: Set(simply_ip_vault::time_serde::now_utc()),
             }
             .insert(&db)
             .await
@@ -7771,7 +7771,8 @@ async fn s4_webhook_executions_endpoint_supports_rich_filters() {
 
     // `from_date` excludes the 200-hour-old row; a cutoff of "now minus 1 hour" as a Unix timestamp
     // keeps only the two rows seeded at age 0.
-    let recent_cutoff = (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp();
+    let recent_cutoff =
+        (time::OffsetDateTime::now_utc() - time::Duration::hours(1)).unix_timestamp();
     let (status, body) = query(format!("?from_date={recent_cutoff}"), 10).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
@@ -7781,7 +7782,8 @@ async fn s4_webhook_executions_endpoint_supports_rich_filters() {
     );
 
     // `to_date` is the mirror image: a cutoff before the two recent rows keeps only the old one.
-    let old_cutoff = (chrono::Utc::now() - chrono::Duration::hours(100)).timestamp();
+    let old_cutoff =
+        (time::OffsetDateTime::now_utc() - time::Duration::hours(100)).unix_timestamp();
     let (status, body) = query(format!("?to_date={old_cutoff}"), 11).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
@@ -7853,7 +7855,7 @@ async fn seed_rich_execution_filter_rows(
                 send_normalized_ipv6: Set(false),
                 events: Set(None),
                 owner_key_id: Set(None),
-                created_at: Set(chrono::Utc::now().naive_utc()),
+                created_at: Set(simply_ip_vault::time_serde::now_utc()),
             }
             .insert(&db)
             .await
@@ -7869,7 +7871,8 @@ async fn seed_rich_execution_filter_rows(
         let is_success = (200..300).contains(&status_code);
         let db = db.clone();
         async move {
-            let created_at = (chrono::Utc::now() - chrono::Duration::hours(age_hours)).naive_utc();
+            let created_at =
+                simply_ip_vault::time_serde::now_utc() - time::Duration::hours(age_hours);
             simply_ip_vault::entities::webhook_execution::ActiveModel {
                 id: Set(Uuid::new_v4()),
                 webhook_id: Set(webhook_id),
@@ -7931,7 +7934,7 @@ async fn s4_webhook_execution_delete_is_scoped_to_ownership() {
                 resolved_target_url: Set(None),
                 target_address: Set(None),
                 cause: Set(None),
-                created_at: Set(chrono::Utc::now().naive_utc()),
+                created_at: Set(simply_ip_vault::time_serde::now_utc()),
             }
             .insert(&db)
             .await
@@ -8024,7 +8027,7 @@ async fn seed_owned_webhook(db: &DatabaseConnection, group_id: Uuid, owner_id: U
         send_normalized_ipv6: Set(false),
         events: Set(None),
         owner_key_id: Set(Some(owner_id)),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(db)
     .await
@@ -8735,7 +8738,7 @@ async fn seed_foreign_webhook(db: &DatabaseConnection, owner_id: Uuid) -> Uuid {
         is_active: Set(true),
         send_normalized_ipv6: Set(false),
         events: Set(None),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(db)
     .await
@@ -9205,7 +9208,7 @@ async fn s6_a_complete_resolution_map_cascades_the_subtree_and_honours_each_reso
     let (survivor_id, _survivor_key) = insert_key(&db, "Survivor", false, NO_ADMIN_SCOPES).await;
 
     // Some IP data in the group, to prove reassignment moves the container without touching contents.
-    let now = chrono::Utc::now().naive_utc();
+    let now = simply_ip_vault::time_serde::now_utc();
     let record_id = seed_ip_record(&db, "203.0.113.5", now).await;
     let membership_id =
         seed_membership(&db, record_id, group_id, SeededMembership::live_at(now)).await;
@@ -9624,7 +9627,10 @@ async fn batch_preserves_created_at_while_advancing_last_seen_at() {
     let first = raw_record_by_address(&db, "45.0.113.10")
         .await
         .expect("record exists");
-    assert_eq!(first.created_at.to_string(), "2020-01-01 00:00:00");
+    assert_eq!(
+        first.created_at,
+        time::macros::datetime!(2020-01-01 00:00:00)
+    );
     let first_membership = raw_membership(&db, "45.0.113.10", "batch-group")
         .await
         .expect("membership exists");
@@ -9664,8 +9670,8 @@ async fn batch_preserves_created_at_while_advancing_last_seen_at() {
         .await
         .expect("membership still exists");
     assert_eq!(
-        second_membership.last_seen_at.to_string(),
-        "2026-06-01 12:00:00"
+        second_membership.last_seen_at,
+        time::macros::datetime!(2026-06-01 12:00:00)
     );
     assert!(
         second_membership.last_seen_at > first_membership.last_seen_at,
@@ -9689,8 +9695,7 @@ async fn batch_skips_locked_records_without_modifying_them() {
     let group_id = insert_group_row(&db, "locked-group").await;
 
     // A locked membership, placed in the group directly.
-    let original =
-        chrono::NaiveDateTime::parse_from_str("2021-03-04 05:06:07", "%Y-%m-%d %H:%M:%S").unwrap();
+    let original = time::macros::datetime!(2021-03-04 05:06:07);
     let record_id = seed_ip_record(&db, "45.0.113.20", original).await;
     let membership_id = seed_membership(
         &db,
@@ -9770,7 +9775,7 @@ async fn full_replace_soft_deletes_omitted_records_and_records_who_did_it() {
     let seed = |address: &'static str, locked: bool| {
         let db = db.clone();
         async move {
-            let now = chrono::Utc::now().naive_utc();
+            let now = simply_ip_vault::time_serde::now_utc();
             let id = seed_ip_record(&db, address, now).await;
             seed_membership(
                 &db,
@@ -10478,7 +10483,7 @@ async fn test_differential_sync_includes_recently_deleted_ips() {
 
     // T0 — an hour ago. Seeded directly so the timestamp is exact; the deletion below still goes
     // through the real endpoint, so the code path that writes the tombstone is the deployed one.
-    let t0 = chrono::Utc::now().naive_utc() - chrono::Duration::hours(1);
+    let t0 = simply_ip_vault::time_serde::now_utc() - time::Duration::hours(1);
     let record_id = seed_ip_record(&db, "198.51.100.77", t0).await;
     let membership_id =
         seed_membership(&db, record_id, group_id, SeededMembership::live_at(t0)).await;
@@ -10527,7 +10532,7 @@ async fn test_differential_sync_includes_recently_deleted_ips() {
         "last_seen_at must NOT move on delete — that is the premise"
     );
 
-    let t1_epoch = t1.and_utc().timestamp();
+    let t1_epoch = t1.assume_utc().unix_timestamp();
 
     // 1. since = T1 → the tombstone must be delivered.
     let (status, body) = get(format!("/api/ips?since={t1_epoch}&include_deleted=true"), 2).await;
@@ -10723,13 +10728,13 @@ async fn test_sync_since_older_than_retention_period() {
     let (app, db, key, dir) = perf_fixture().await;
     let group_id = insert_group_row(&db, "retention-sync").await;
 
-    let long_ago = chrono::Utc::now().naive_utc() - chrono::Duration::days(200);
-    let within_window = chrono::Utc::now().naive_utc() - chrono::Duration::days(50);
-    let recent = chrono::Utc::now().naive_utc() - chrono::Duration::days(1);
+    let long_ago = simply_ip_vault::time_serde::now_utc() - time::Duration::days(200);
+    let within_window = simply_ip_vault::time_serde::now_utc() - time::Duration::days(50);
+    let recent = simply_ip_vault::time_serde::now_utc() - time::Duration::days(1);
 
     let seed = |address: &'static str,
-                last_seen: chrono::NaiveDateTime,
-                deleted: Option<chrono::NaiveDateTime>| {
+                last_seen: time::PrimitiveDateTime,
+                deleted: Option<time::PrimitiveDateTime>| {
         let db = db.clone();
         async move {
             let id = seed_ip_record(&db, address, last_seen).await;
@@ -10760,7 +10765,7 @@ async fn test_sync_since_older_than_retention_period() {
     seed("198.51.100.203", long_ago, None).await;
 
     // 100 days back: older than the retention boundary, and a perfectly ordinary filter value.
-    let since = (chrono::Utc::now() - chrono::Duration::days(100)).timestamp();
+    let since = (time::OffsetDateTime::now_utc() - time::Duration::days(100)).unix_timestamp();
     let req = signed_later(
         inject_connect_info(
             Request::builder()
@@ -10934,8 +10939,8 @@ async fn test_daughter_key_group_listing_is_filtered_to_readable_groups() {
         can_create_groups: Set(false),
         parent_key_id: Set(Some(parent_id)),
         prefix: Set("daught12".to_owned()),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
+        updated_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -11087,12 +11092,9 @@ async fn test_cursor_pagination_single_and_multi_group_handles_ties_and_exact_pa
     let group_a = insert_group_row(&db, "cursor-group-a").await;
     let group_b = insert_group_row(&db, "cursor-group-b").await;
 
-    let t_high =
-        chrono::NaiveDateTime::parse_from_str("2026-06-01 12:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
-    let t_mid =
-        chrono::NaiveDateTime::parse_from_str("2026-06-01 11:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
-    let t_low =
-        chrono::NaiveDateTime::parse_from_str("2026-06-01 10:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+    let t_high = time::macros::datetime!(2026-06-01 12:00:00);
+    let t_mid = time::macros::datetime!(2026-06-01 11:00:00);
+    let t_low = time::macros::datetime!(2026-06-01 10:00:00);
 
     // Seed 6 memberships across two groups, with deliberate timestamp ties at `t_mid` (4 rows share
     // the exact same second across both groups) to exercise the `m.id ASC` tie-breaker.
@@ -11223,9 +11225,9 @@ async fn test_cursor_pagination_with_differential_sync_and_minimal_format() {
     let (_master_id, master_key) = insert_key(&db, "Master", true, ALL_ADMIN_SCOPES).await;
     let group_id = insert_group_row(&db, "diff-minimal-group").await;
 
-    let t_old = chrono::Utc::now().naive_utc() - chrono::Duration::hours(3);
-    let t_recent = chrono::Utc::now().naive_utc() - chrono::Duration::minutes(30);
-    let cutoff = (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp();
+    let t_old = simply_ip_vault::time_serde::now_utc() - time::Duration::hours(3);
+    let t_recent = simply_ip_vault::time_serde::now_utc() - time::Duration::minutes(30);
+    let cutoff = (time::OffsetDateTime::now_utc() - time::Duration::hours(1)).unix_timestamp();
 
     // 1. Untouched old live record -> excluded by `since`.
     let r_old = seed_ip_record(&db, "198.51.100.20", t_old).await;
@@ -11324,7 +11326,7 @@ async fn test_cursor_pagination_validation_and_rbac_scoping() {
     let group_b = insert_group_row(&db, "rbac-cur-b").await;
     grant_perm(&db, scoped_id, group_a, GROUP_READ, false).await;
 
-    let now = chrono::Utc::now().naive_utc();
+    let now = simply_ip_vault::time_serde::now_utc();
     let ra = seed_ip_record(&db, "198.51.100.30", now).await;
     seed_membership(&db, ra, group_a, SeededMembership::live_at(now)).await;
     let rb = seed_ip_record(&db, "198.51.100.31", now).await;

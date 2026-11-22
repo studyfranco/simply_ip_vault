@@ -30,7 +30,6 @@
 //! handler would prove only that the handler refuses, which is a different fact and is already
 //! covered in `tests/security_tests.rs`.
 
-use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseBackend,
     DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter, Statement,
@@ -123,8 +122,8 @@ async fn seed_key(db: &DatabaseConnection, name: &str, parent: Option<Uuid>) -> 
         can_manage_webhooks: Set(false),
         can_create_groups: Set(false),
         parent_key_id: Set(parent),
-        created_at: Set(Utc::now().naive_utc()),
-        updated_at: Set(Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
+        updated_at: Set(simply_ip_vault::time_serde::now_utc()),
     })
     .exec(db)
     .await
@@ -142,7 +141,7 @@ async fn seed_group(db: &DatabaseConnection, name: &str, owner: Option<Uuid>) ->
         group_type: Set("blacklist".to_owned()),
         description: Set(None),
         owner_key_id: Set(owner),
-        created_at: Set(Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     })
     .exec(db)
     .await
@@ -156,7 +155,7 @@ async fn seed_record(db: &DatabaseConnection, address: &str) -> Uuid {
     ip_record::Entity::insert(ip_record::ActiveModel {
         id: Set(id),
         target_address: Set(address.to_owned()),
-        created_at: Set(Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     })
     .exec(db)
     .await
@@ -167,7 +166,7 @@ async fn seed_record(db: &DatabaseConnection, address: &str) -> Uuid {
 /// Links `record` into `group` with a fresh membership, returning the membership's own id.
 async fn seed_membership(db: &DatabaseConnection, record: Uuid, group: Uuid) -> Uuid {
     let id = Uuid::new_v4();
-    let now = Utc::now().naive_utc();
+    let now = simply_ip_vault::time_serde::now_utc();
     ip_record_group_membership::Entity::insert(ip_record_group_membership::ActiveModel {
         id: Set(id),
         ip_record_id: Set(record),
@@ -199,7 +198,7 @@ async fn seed_cause(db: &DatabaseConnection, membership: Uuid, cause: &str) -> U
         id: Set(id),
         membership_id: Set(membership),
         cause: Set(cause.to_owned()),
-        created_at: Set(Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     })
     .exec(db)
     .await
@@ -218,7 +217,7 @@ async fn seed_permission(db: &DatabaseConnection, key: Uuid, group: Uuid) -> Uui
         can_write: Set(true),
         can_delete: Set(false),
         can_manage: Set(false),
-        created_at: Set(Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     })
     .exec(db)
     .await
@@ -251,7 +250,7 @@ async fn seed_webhook(
         send_normalized_ipv6: Set(false),
         events: Set(None),
         owner_key_id: Set(owner),
-        created_at: Set(Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     })
     .exec(db)
     .await
@@ -274,7 +273,7 @@ async fn seed_execution(db: &DatabaseConnection, webhook: Uuid) -> Uuid {
         resolved_target_url: Set(None),
         target_address: Set(None),
         cause: Set(None),
-        created_at: Set(Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     })
     .exec(db)
     .await
@@ -295,7 +294,7 @@ async fn seed_audit_log(db: &DatabaseConnection, key: Uuid, name: &str, action: 
         target_address: Set(Some("198.51.100.4".to_owned())),
         group_names: Set(None),
         details: Set(None),
-        timestamp: Set(Utc::now().naive_utc()),
+        timestamp: Set(simply_ip_vault::time_serde::now_utc()),
     })
     .exec(db)
     .await
@@ -1433,7 +1432,7 @@ async fn list_ips_query_completes_quickly_at_realistic_scale() {
         group_ids.push(seed_group(&db, &format!("bench-group-{g}"), None).await);
     }
 
-    let now = Utc::now().naive_utc();
+    let now = simply_ip_vault::time_serde::now_utc();
     let mut record_models = Vec::with_capacity(GROUPS * RECORDS_PER_GROUP);
     let mut membership_models = Vec::with_capacity(GROUPS * RECORDS_PER_GROUP);
     for (g, &group_id) in group_ids.iter().enumerate() {
@@ -1444,7 +1443,7 @@ async fn list_ips_query_completes_quickly_at_realistic_scale() {
             // through, rather than a pathological all-identical-value case an index could shortcut
             // in a way real data never does.
             let last_seen =
-                now - chrono::Duration::seconds(i64::try_from(g * RECORDS_PER_GROUP + i).unwrap());
+                now - time::Duration::seconds(i64::try_from(g * RECORDS_PER_GROUP + i).unwrap());
             record_models.push(ip_record::ActiveModel {
                 id: Set(id),
                 target_address: Set(format!("10.{g}.{}.{}", i / 250, i % 250)),
@@ -1629,14 +1628,14 @@ async fn seed_count_benchmark(
         group_ids.push(seed_group(db, &format!("count-bench-group-{g}"), None).await);
     }
 
-    let now = Utc::now().naive_utc();
+    let now = simply_ip_vault::time_serde::now_utc();
     let mut record_models = Vec::with_capacity(groups * records_per_group);
     let mut membership_models = Vec::with_capacity(groups * records_per_group);
     for (g, &group_id) in group_ids.iter().enumerate() {
         for i in 0..records_per_group {
             let id = Uuid::new_v4();
             let last_seen =
-                now - chrono::Duration::seconds(i64::try_from(g * records_per_group + i).unwrap());
+                now - time::Duration::seconds(i64::try_from(g * records_per_group + i).unwrap());
             record_models.push(ip_record::ActiveModel {
                 id: Set(id),
                 target_address: Set(format!("10.{g}.{}.{}", i / 250, i % 250)),
@@ -1704,7 +1703,7 @@ async fn list_ips_complex_filters_produce_one_group_id_predicate_not_several() {
         "the test's own fixture must actually overlap"
     );
 
-    let since_threshold = Utc::now().naive_utc() - chrono::Duration::seconds(3600);
+    let since_threshold = simply_ip_vault::time_serde::now_utc() - time::Duration::seconds(3600);
     let condition = Condition::all()
         .add(ip_record_group_membership::Column::IsDeleted.eq(false))
         .add(ip_record_group_membership::Column::GroupId.is_in(intersected))
@@ -1756,7 +1755,7 @@ async fn list_ips_complex_filters_produce_one_group_id_predicate_not_several() {
 /// database where such a row is already impossible.
 #[tokio::test]
 async fn rows_written_before_the_constraint_are_backfilled_not_dropped() {
-    use sea_orm_migration::MigratorTrait;
+    use simply_ip_vault::migration::MigratorTrait;
 
     let tmp = TempDb::new();
     let db = partial_migration_db(&tmp).await;
@@ -1826,7 +1825,7 @@ async fn rows_written_before_the_constraint_are_backfilled_not_dropped() {
 /// case every other fixture in this file happens to construct.
 #[tokio::test]
 async fn upgrading_a_populated_database_backfills_every_membership_including_multi_group_ones() {
-    use sea_orm_migration::MigratorTrait;
+    use simply_ip_vault::migration::MigratorTrait;
 
     let tmp = TempDb::new();
     let db = partial_migration_db(&tmp).await;
@@ -1994,10 +1993,8 @@ async fn seed_legacy_shared_and_solo_records(
 ) -> (LegacyRecordTimes, LegacyRecordTimes) {
     // A record that has existed for a while and was touched more recently — distinct, recognizable
     // values so a wrong column (or a transposition) would be visible, not coincidentally correct.
-    let shared_created =
-        chrono::NaiveDateTime::parse_from_str("2026-06-01 08:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
-    let shared_updated =
-        chrono::NaiveDateTime::parse_from_str("2026-08-15 12:30:00", "%Y-%m-%d %H:%M:%S").unwrap();
+    let shared_created = time::macros::datetime!(2026-06-01 08:00:00);
+    let shared_updated = time::macros::datetime!(2026-08-15 12:30:00);
     // Raw SQL throughout the pre-refactor fixture: the current entity no longer has these columns,
     // and the table as it stands at this version still does.
     let shared_record = Uuid::new_v4();
@@ -2016,10 +2013,8 @@ async fn seed_legacy_shared_and_solo_records(
 
     // A second, single-group record, so the test also covers the ordinary case alongside the
     // multi-group one rather than only the latter.
-    let solo_created =
-        chrono::NaiveDateTime::parse_from_str("2026-07-01 09:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
-    let solo_updated =
-        chrono::NaiveDateTime::parse_from_str("2026-08-20 16:45:00", "%Y-%m-%d %H:%M:%S").unwrap();
+    let solo_created = time::macros::datetime!(2026-07-01 09:00:00);
+    let solo_updated = time::macros::datetime!(2026-08-20 16:45:00);
     let solo_record = Uuid::new_v4();
     db.execute_raw(Statement::from_string(
         DatabaseBackend::Sqlite,
@@ -2074,7 +2069,7 @@ async fn seed_legacy_shared_and_solo_records(
 /// a transposition visible.
 #[tokio::test]
 async fn the_audit_rebuild_did_not_transpose_columns() {
-    use sea_orm_migration::MigratorTrait;
+    use simply_ip_vault::migration::MigratorTrait;
 
     let tmp = TempDb::new();
     let db = partial_migration_db(&tmp).await;
@@ -2217,7 +2212,7 @@ async fn every_spelling_of_one_ipv6_host_is_one_record() {
     let collision = ip_record::Entity::insert(ip_record::ActiveModel {
         id: Set(Uuid::new_v4()),
         target_address: Set(canonical.clone()),
-        created_at: Set(Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     })
     .exec(&db)
     .await;
@@ -2290,7 +2285,7 @@ async fn test_cidr_deduplication_different_host_bits() {
     let collision = ip_record::Entity::insert(ip_record::ActiveModel {
         id: Set(Uuid::new_v4()),
         target_address: Set(second.clone()),
-        created_at: Set(Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     })
     .exec(&db)
     .await;
@@ -2621,7 +2616,7 @@ async fn one_address_in_two_groups_has_independent_lock_and_delete_state() {
     );
 
     // Soft-delete and lock the group-a membership only.
-    let now = Utc::now().naive_utc();
+    let now = simply_ip_vault::time_serde::now_utc();
     ip_record_group_membership::ActiveModel {
         id: Set(in_a),
         is_locked: Set(true),
@@ -2656,6 +2651,6 @@ async fn one_address_in_two_groups_has_independent_lock_and_delete_state() {
 
 struct LegacyRecordTimes {
     id: Uuid,
-    created: chrono::NaiveDateTime,
-    updated: chrono::NaiveDateTime,
+    created: time::PrimitiveDateTime,
+    updated: time::PrimitiveDateTime,
 }

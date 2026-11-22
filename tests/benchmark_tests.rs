@@ -12,7 +12,7 @@ use sea_orm::{
     DbBackend, EntityTrait, JoinType, QueryFilter, QueryOrder, QuerySelect, RelationTrait,
     Statement, sea_query::Expr, sea_query::Func,
 };
-use sea_orm_migration::MigratorTrait;
+use simply_ip_vault::migration::MigratorTrait;
 
 use simply_ip_vault::entities::{ip_group, ip_record, ip_record_group_membership};
 use simply_ip_vault::migration;
@@ -289,8 +289,8 @@ async fn master_key(db: &DatabaseConnection) -> (String, String) {
         can_create_groups: Set(true),
         parent_key_id: Set(None),
         prefix: Set("bench000".to_owned()),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
+        updated_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(db)
     .await
@@ -304,7 +304,7 @@ fn signed_get(
     secret: &str,
     offset: i64,
 ) -> axum::http::Request<axum::body::Body> {
-    let ts = (chrono::Utc::now().timestamp() + offset).to_string();
+    let ts = (time::OffsetDateTime::now_utc().unix_timestamp() + offset).to_string();
     let sig = simply_ip_vault::crypto::compute_signature(secret, "GET", uri, &ts, b"").unwrap();
     axum::http::Request::builder()
         .method("GET")
@@ -506,7 +506,7 @@ async fn differential_sync_with_include_deleted_uses_multi_index_or_and_meets_10
     assert_differential_sync_query_plans(&db).await;
     // 2. Measure the real SeaORM query execution time at 100k rows using `apply_group_and_since_scope`.
     let g = bench_group_id(1);
-    let threshold = (chrono::Utc::now() + chrono::Duration::seconds(60)).naive_utc();
+    let threshold = simply_ip_vault::time_serde::now_utc() + time::Duration::seconds(60);
     let cond = simply_ip_vault::api::apply_group_and_since_scope(
         &sea_orm::Condition::all(),
         Some(ip_record_group_membership::Column::GroupId.eq(g)),

@@ -25,6 +25,7 @@ this before searching the tree, and update it when you add, remove, or repurpose
 | `dispatch.rs` | 1,893 | The outbound webhook dispatcher — the background worker pool that actually sends notifications, with rate limiting and the four authentication modes. Request construction (`prepare_dispatch`) is shared between the real dispatch path and `send_test_dispatch` (the live "Test Webhook" endpoint's backend), so a test exercises the exact bytes a real event would send. `target_url` and `payload_template` share one templating evaluator (`resolve_event_variables`/`substitute_placeholders`) supporting `$target_address`/`$ip`/`$action`/`$event`/`$cause`/`$group_name`/`$group_id`/`$timestamp`, single-pass with no rescanning; `CANONICAL_V1`'s signed path is derived from the resolved URL. Delivery retries transient failures (network errors, `5xx`) with exponential backoff up to `config::webhook_max_retries`; a `4xx` fails on the first attempt (`attempt_delivery`'s classification, `dispatch_with_retries_config`). **Every HTTP attempt, including retried ones, is persisted as its own `webhook_executions` row** (`log_execution`, taking a `DispatchContext`) — the delivery history behind the dashboard's Executions tab, now including the resolved target URL and the triggering event's address/cause. |
 | `maintenance.rs` | 51 | Twelve-hourly SQLite housekeeping: `incremental_vacuum(1000)` then `wal_checkpoint(TRUNCATE)`, with the same shutdown-channel pattern as the retention workers. Spawned from `main.rs`. |
 | `retention.rs` | 284 | Two independent background retention workers, each its own task with its own shutdown channel: `run_retention_worker` permanently drops soft-deleted IP records once they age past the configured window, and `run_webhook_execution_retention_worker` purges `webhook_executions` rows — successes after 24h, failures after 7 days, independently configurable and independently disable-able. |
+| `time_serde.rs` | 164 | UTC clock conversion and RFC 3339 serialization for entity and API timestamps, including nullable fields and legacy input formats. |
 
 ## `src/api/` — HTTP handlers
 
@@ -59,7 +60,8 @@ this before searching the tree, and update it when you add, remove, or repurpose
 
 | File | Lines | Purpose |
 | :--- | ---: | :--- |
-| `mod.rs` | 38 | Migration registry. Migrations run automatically at startup. |
+| `mod.rs` | 85 | Ordered migration registry and shared migration imports. |
+| `runner.rs` | 421 | Runs migrations automatically at startup, preserves the `seaql_migrations` ledger, and probes each backend through sea-schema. |
 | `m20230101_000001_initial_schema.rs` | 340 | Base schema: all core tables, `key_hash` declared `unique_key()` (which implies its index). |
 | `m20260729_000002_add_api_key_signing_secret.rs` | 54 | Adds `api_keys.signing_secret`, the per-key HMAC secret behind `X-Signature-256`. |
 | `m20260730_000003_add_webhook_signature_mode.rs` | 57 | Adds `webhook_configs.signature_mode`. |

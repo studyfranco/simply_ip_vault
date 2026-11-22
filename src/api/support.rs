@@ -12,7 +12,6 @@
 //! instead — otherwise that module comes to mean "guards, plus everything else that happened to be
 //! shared", which is the monolith problem again one level down.
 
-use chrono::Utc;
 use ipnet::IpNet;
 use rand::RngExt;
 use sea_orm::{
@@ -245,7 +244,7 @@ pub(crate) async fn create_audit_log<C: sea_orm::ConnectionTrait>(
         target_address: Set(target_address),
         group_names: Set(group_names),
         details: Set(details),
-        timestamp: Set(Utc::now().naive_utc()),
+        timestamp: Set(crate::time_serde::now_utc()),
     };
     audit_log::Entity::insert(log).exec(db).await?;
     Ok(())
@@ -292,7 +291,7 @@ pub(crate) async fn get_or_create_group_with_status(
         allow_private_ips: Set(false),
         description: Set(None),
         owner_key_id: Set(owner),
-        created_at: Set(Utc::now().naive_utc()),
+        created_at: Set(crate::time_serde::now_utc()),
     };
     ip_group::Entity::insert(new_group)
         .on_conflict(

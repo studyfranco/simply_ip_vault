@@ -9,11 +9,16 @@
 //! Both superseded single-column indexes are dropped in the same migration. Keeping them would
 //! cost a second index write on every insert for no query the composite cannot answer.
 
+use super::prelude::*;
 use sea_orm::sea_query::{Index as SqIndex, IndexOrder};
-use sea_orm_migration::prelude::*;
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20261007_120000_add_webhook_query_indexes"
+    }
+}
 
 #[derive(DeriveIden)]
 enum WebhookConfigs {
@@ -33,7 +38,7 @@ enum WebhookExecutions {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .create_index(
                 SqIndex::create()
@@ -77,7 +82,7 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         // Restores the single-column indexes this migration superseded.
         manager
             .drop_index(

@@ -250,7 +250,7 @@ pub async fn create_webhook(
         .transpose()?;
 
     let id = Uuid::new_v4();
-    let now = chrono::Utc::now().naive_utc();
+    let now = crate::time_serde::now_utc();
     let model = webhook_config::ActiveModel {
         id: Set(id),
         name: Set(payload.name.clone()),
@@ -340,7 +340,8 @@ pub struct WebhookSummary {
     /// When `true`, `$target_address` and `$ip` emit `/48` for non-whitelist bare host IPv6 bans.
     pub send_normalized_ipv6: bool,
     /// Creation timestamp
-    pub created_at: chrono::NaiveDateTime,
+    #[serde(with = "crate::time_serde")]
+    pub created_at: time::PrimitiveDateTime,
 }
 
 impl From<webhook_config::Model> for WebhookSummary {
@@ -863,7 +864,7 @@ pub async fn clone_webhook(
     };
 
     let new_id = Uuid::new_v4();
-    let now = chrono::Utc::now().naive_utc();
+    let now = crate::time_serde::now_utc();
     let cloned = webhook_config::Model {
         id: new_id,
         name: payload.name.clone(),
@@ -1234,15 +1235,17 @@ pub async fn list_webhook_executions(
     }
 
     if let Some(from) = query.from_date {
-        let threshold = chrono::DateTime::from_timestamp(from, 0)
-            .ok_or_else(|| AppError::InvalidInput("Invalid `from_date` timestamp".to_owned()))?
-            .naive_utc();
+        let threshold = crate::time_serde::utc_datetime(
+            time::OffsetDateTime::from_unix_timestamp(from)
+                .map_err(|_| AppError::InvalidInput("Invalid `from_date` timestamp".to_owned()))?,
+        );
         q = q.filter(webhook_execution::Column::CreatedAt.gte(threshold));
     }
     if let Some(to) = query.to_date {
-        let threshold = chrono::DateTime::from_timestamp(to, 0)
-            .ok_or_else(|| AppError::InvalidInput("Invalid `to_date` timestamp".to_owned()))?
-            .naive_utc();
+        let threshold = crate::time_serde::utc_datetime(
+            time::OffsetDateTime::from_unix_timestamp(to)
+                .map_err(|_| AppError::InvalidInput("Invalid `to_date` timestamp".to_owned()))?,
+        );
         q = q.filter(webhook_execution::Column::CreatedAt.lte(threshold));
     }
 

@@ -173,8 +173,8 @@ impl IntoResponse for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::migration::MigratorTrait;
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, Database, EntityTrait, TransactionTrait};
-    use sea_orm_migration::MigratorTrait;
 
     /// A genuine `SQLITE_BUSY`, not a synthetic one — reproduced the same way
     /// [`crate::api::handle_ip_upsert`]'s own module comment describes it happening for real: a
@@ -214,7 +214,7 @@ mod tests {
             group_type: Set("banlist".to_owned()),
             owner_key_id: Set(None),
             description: Set(None),
-            created_at: Set(chrono::Utc::now().naive_utc()),
+            created_at: Set(crate::time_serde::now_utc()),
         }
         .insert(&db)
         .await
@@ -228,7 +228,7 @@ mod tests {
             group_type: Set("banlist".to_owned()),
             owner_key_id: Set(None),
             description: Set(None),
-            created_at: Set(chrono::Utc::now().naive_utc()),
+            created_at: Set(crate::time_serde::now_utc()),
         }
         .insert(&txn)
         .await;
@@ -263,7 +263,7 @@ mod tests {
             group_type: Set("banlist".to_owned()),
             owner_key_id: Set(None),
             description: Set(None),
-            created_at: Set(chrono::Utc::now().naive_utc()),
+            created_at: Set(crate::time_serde::now_utc()),
         };
         make().insert(&db).await.unwrap();
         let err = make()

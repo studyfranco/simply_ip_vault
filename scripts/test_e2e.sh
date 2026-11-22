@@ -441,10 +441,7 @@ fi
 log "cargo update succeeded."
 
 log "Running cargo audit in $PROJECT_ROOT ..."
-# RUSTSEC-2026-0459: upstream unpatched SQLite CVE in libsqlite3-sys 0.37.0 transitively pinned by
-# sqlx-sqlite 0.9.0 (which restricts libsqlite3-sys <0.38.0). Ignored until sqlx publishes a patch release.
-AUDIT_ARGS=(${CARGO_AUDIT_ARGS:---ignore RUSTSEC-2026-0459})
-if ! (cd "$PROJECT_ROOT" && cargo audit "${AUDIT_ARGS[@]}" >"$WORK_DIR/cargo_audit.log" 2>&1); then
+if ! (cd "$PROJECT_ROOT" && cargo audit --deny warnings >"$WORK_DIR/cargo_audit.log" 2>&1); then
     err "cargo audit detected vulnerabilities or failed:"
     cat "$WORK_DIR/cargo_audit.log" >&2
     exit 1

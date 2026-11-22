@@ -7,13 +7,13 @@
 //! 3. `audit_logs`: `idx_audit_logs_api_key_timestamp`.
 //! 4. API keys listing: Batched permission loading vs N+1 queries.
 
-use chrono::{Duration as ChronoDuration, Utc};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, QueryFilter,
     QueryOrder, QuerySelect, Statement,
 };
-use sea_orm_migration::MigratorTrait;
+use simply_ip_vault::migration::MigratorTrait;
 use std::time::Instant;
+use time::Duration;
 use uuid::Uuid;
 
 use simply_ip_vault::entities::{
@@ -55,7 +55,7 @@ async fn bench_webhook_executions_retention_and_status_optimization() {
 
     let group_id = Uuid::new_v4();
     let webhook_id = Uuid::new_v4();
-    let now = Utc::now().naive_utc();
+    let now = simply_ip_vault::time_serde::now_utc();
 
     for db in [&db_before, &db_after] {
         ip_group::Entity::insert(ip_group::ActiveModel {
@@ -105,7 +105,7 @@ async fn bench_webhook_executions_retention_and_status_optimization() {
                 _ => "IP_DELETE",
             };
             let age_hours = i64::from(i % 100);
-            let created_at = now - ChronoDuration::hours(age_hours);
+            let created_at = now - Duration::hours(age_hours);
 
             rows.push(webhook_execution::ActiveModel {
                 id: sea_orm::Set(Uuid::new_v4()),
@@ -270,7 +270,7 @@ async fn seed_audit_benchmark(
     key_id: Uuid,
     other_key_id: Uuid,
 ) {
-    let now = Utc::now().naive_utc();
+    let now = simply_ip_vault::time_serde::now_utc();
 
     for db in [db_before, db_after] {
         for kid in [key_id, other_key_id] {
@@ -308,7 +308,7 @@ async fn seed_audit_benchmark(
                 target_address: sea_orm::Set(Some("192.168.1.1".to_owned())),
                 group_names: sea_orm::Set(Some("bench".to_owned())),
                 details: sea_orm::Set(None),
-                timestamp: sea_orm::Set(now - ChronoDuration::seconds(i64::from(i))),
+                timestamp: sea_orm::Set(now - Duration::seconds(i64::from(i))),
             });
 
             if rows.len() >= 500 {
@@ -378,7 +378,7 @@ async fn seed_api_keys_benchmark(db: &DatabaseConnection) {
             group_type: sea_orm::Set("banlist".to_owned()),
             description: sea_orm::Set(None),
             owner_key_id: sea_orm::Set(None),
-            created_at: sea_orm::Set(Utc::now().naive_utc()),
+            created_at: sea_orm::Set(simply_ip_vault::time_serde::now_utc()),
         })
         .exec(db)
         .await
@@ -387,7 +387,7 @@ async fn seed_api_keys_benchmark(db: &DatabaseConnection) {
     }
 
     // Seed 50 keys, each with 3 group permissions
-    let now = Utc::now().naive_utc();
+    let now = simply_ip_vault::time_serde::now_utc();
     for i in 0..50 {
         let kid = Uuid::new_v4();
         api_key::Entity::insert(api_key::ActiveModel {

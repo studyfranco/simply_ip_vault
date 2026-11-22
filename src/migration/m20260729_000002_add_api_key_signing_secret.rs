@@ -11,7 +11,7 @@
 //! deliberate choice over back-filling random secrets here: a secret generated inside a migration
 //! could never be shown to its owner, so it would be unusable anyway.
 
-use sea_orm_migration::prelude::*;
+use super::prelude::*;
 
 /// Identifiers this migration touches. `Table` is re-declared locally rather than imported from the
 /// initial-schema migration so that module can stay private (exporting it would leak a pile of
@@ -25,12 +25,17 @@ enum ApiKeys {
     SigningSecret,
 }
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20260729_000002_add_api_key_signing_secret"
+    }
+}
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()
@@ -41,7 +46,7 @@ impl MigrationTrait for Migration {
             .await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()

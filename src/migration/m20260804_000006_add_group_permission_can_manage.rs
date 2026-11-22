@@ -19,7 +19,7 @@
 //! spell out `IS NULL OR = false`, which is the kind of condition that eventually gets one branch
 //! wrong — and getting it wrong here means failing *open* on a permission check.
 
-use sea_orm_migration::prelude::*;
+use super::prelude::*;
 
 /// Identifiers this migration touches. `Table` is re-declared locally rather than imported from the
 /// initial-schema migration so that module can stay private; `DeriveIden` maps the variants to the
@@ -32,12 +32,17 @@ enum ApiKeyGroupPermissions {
     CanManage,
 }
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20260804_000006_add_group_permission_can_manage"
+    }
+}
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()
@@ -53,7 +58,7 @@ impl MigrationTrait for Migration {
             .await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()

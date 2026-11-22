@@ -1,7 +1,7 @@
 //! The `ip_groups` table: logical, named collections of IP rules (e.g. `fail2ban`, `sshd`,
 //! `vpn_whitelist`), each tagged as either a `banlist` or a `whitelist`.
 
-use sea_orm::entity::prelude::*;
+use sea_orm::entity::prelude::{TimeDateTime as DateTime, *};
 use serde::{Deserialize, Serialize};
 
 /// A named collection of IP records, tagged as a `banlist` or `whitelist`.
@@ -34,6 +34,7 @@ pub struct Model {
     #[serde(default)]
     pub owner_key_id: Option<Uuid>,
     /// Group creation timestamp.
+    #[serde(with = "crate::time_serde")]
     pub created_at: DateTime,
 }
 

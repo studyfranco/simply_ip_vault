@@ -16,10 +16,15 @@
 //! the failure reason only when no response ever arrived (a network-level error, a timeout) — there
 //! is no body to have kept in that case.
 
-use sea_orm_migration::prelude::*;
+use super::prelude::*;
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20260824_110000_webhook_execution_response_body"
+    }
+}
 
 #[derive(DeriveIden)]
 enum WebhookExecutions {
@@ -30,7 +35,7 @@ enum WebhookExecutions {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()
@@ -44,7 +49,7 @@ impl MigrationTrait for Migration {
             .await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()

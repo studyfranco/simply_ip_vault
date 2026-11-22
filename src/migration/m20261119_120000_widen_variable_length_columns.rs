@@ -1,11 +1,16 @@
 //! Removes inherited VARCHAR limits on fields that hold URLs, sealed secrets, and attribution.
 //! SQLite already gives VARCHAR and TEXT the same affinity and imposes no VARCHAR length limit.
 
+use super::prelude::*;
 use sea_orm::DatabaseBackend;
-use sea_orm_migration::prelude::*;
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20261119_120000_widen_variable_length_columns"
+    }
+}
 
 #[derive(DeriveIden)]
 enum WebhookConfigs {
@@ -28,7 +33,7 @@ enum AuditLogs {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         if manager.get_database_backend() == DatabaseBackend::Sqlite {
             return Ok(());
         }
@@ -72,7 +77,7 @@ impl MigrationTrait for Migration {
             .await
     }
 
-    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, _manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         // Keep the widened types so a rollback preserves values written since the upgrade.
         Ok(())
     }

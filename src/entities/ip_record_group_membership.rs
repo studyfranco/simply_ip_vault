@@ -4,7 +4,7 @@
 //! here, and a change to one never touches the other. `last_seen_at` is the single timestamp for
 //! the latest observation in this group.
 
-use sea_orm::entity::prelude::*;
+use sea_orm::entity::prelude::{TimeDateTime as DateTime, *};
 use serde::{Deserialize, Serialize};
 
 /// One address's stateful membership in one group.
@@ -21,13 +21,16 @@ pub struct Model {
     /// When `true`, this membership cannot be modified or deleted through the API.
     pub is_locked: bool,
     /// When this address was first linked into this group.
+    #[serde(with = "crate::time_serde")]
     pub created_at: DateTime,
     /// The latest observation of this address in this group.
+    #[serde(with = "crate::time_serde")]
     pub last_seen_at: DateTime,
     /// Whether this membership is soft-deleted. Hidden from every read and from webhook dispatch
     /// until restored or purged by retention.
     pub is_deleted: bool,
     /// When the soft delete happened; `None` while live. The retention purge measures against this.
+    #[serde(default, with = "crate::time_serde::option")]
     pub deleted_at: Option<DateTime>,
     /// The `api_keys.id` of whoever soft-deleted it, as text. Not a foreign key, so the attribution
     /// outlives the key that performed the deletion.

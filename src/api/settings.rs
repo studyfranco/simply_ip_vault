@@ -192,9 +192,9 @@ pub async fn update_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::migration::MigratorTrait;
     use axum::Extension;
     use axum::extract::State;
-    use sea_orm_migration::MigratorTrait;
 
     #[tokio::test]
     async fn settings_caches_response_and_reuses_it() {
@@ -206,7 +206,7 @@ mod tests {
         let state = AppState::new(db.clone(), tx).unwrap();
 
         let master_id = uuid::Uuid::new_v4();
-        let now = chrono::Utc::now().naive_utc();
+        let now = crate::time_serde::now_utc();
         let master_key = api_key::ActiveModel {
             id: Set(master_id),
             name: Set("test-master".to_owned()),

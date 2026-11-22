@@ -25,11 +25,16 @@
 //!    `(is_deleted, last_seen_at DESC, id ASC, ip_record_id, group_id, is_locked, created_at, deleted_at, deleted_by)`
 //!    enables SQLite to stream active records without touching table data pages or incurring bookmark lookups.
 
+use super::prelude::*;
 use sea_orm::sea_query::{Index as SqIndex, IndexOrder};
-use sea_orm_migration::prelude::*;
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20261111_190000_fix_sqlite_listing_index_regression"
+    }
+}
 
 #[derive(DeriveIden)]
 enum Memberships {
@@ -48,7 +53,7 @@ enum Memberships {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         // 1. Drop the harmful redundant index that stole group-scoped listing plans and forced temp b-tree sorts.
         manager
             .drop_index(
@@ -93,7 +98,7 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         // Recreate the 3-column index if rolled back
         manager
             .create_index(

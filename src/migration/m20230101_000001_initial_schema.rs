@@ -1,4 +1,4 @@
-use sea_orm_migration::prelude::*;
+use super::prelude::*;
 
 #[derive(DeriveIden)]
 pub enum IpRecords {
@@ -87,12 +87,17 @@ pub enum AuditLogs {
     Timestamp,
 }
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20230101_000001_initial_schema"
+    }
+}
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         create_ip_groups(manager).await?;
         create_ip_records(manager).await?;
         create_ip_record_group_memberships(manager).await?;
@@ -103,7 +108,7 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .drop_table(Table::drop().table(AuditLogs::Table).to_owned())
             .await?;

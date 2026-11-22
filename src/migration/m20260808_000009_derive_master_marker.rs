@@ -56,8 +56,8 @@
 //! message says which one to run. (Creating the unique index would fail on its own anyway; the
 //! explicit check exists to fail with an actionable message instead of a driver's constraint error.)
 
-use sea_orm_migration::prelude::*;
-use sea_orm_migration::sea_orm::{ConnectionTrait, DatabaseBackend};
+use super::prelude::*;
+use sea_orm::{ConnectionTrait, DatabaseBackend};
 
 /// The unique index that does the enforcing. Same name `m20260807_000007…` used, so operators and
 /// the §7 schema assertions keep looking at one index across the two migrations.
@@ -77,8 +77,13 @@ enum ApiKeys {
     MasterMarker,
 }
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20260808_000009_derive_master_marker"
+    }
+}
 
 impl Migration {
     fn add_marker_column(backend: DatabaseBackend) -> TableAlterStatement {
@@ -101,7 +106,7 @@ impl Migration {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         let db = manager.get_connection();
         let backend = db.get_database_backend();
 
@@ -179,7 +184,7 @@ impl MigrationTrait for Migration {
             .await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .drop_index(
                 Index::drop()

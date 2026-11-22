@@ -7,7 +7,7 @@
 //! firewall execution webhooks (e.g., `launch.block.ip`) can explicitly opt in to receiving the
 //! `/48`-normalized network for bare host IPv6 bans.
 
-use sea_orm_migration::prelude::*;
+use super::prelude::*;
 
 /// Identifiers this migration addresses.
 #[derive(DeriveIden)]
@@ -18,12 +18,17 @@ enum WebhookConfigs {
     SendNormalizedIpv6,
 }
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20261114_120000_add_webhook_send_normalized_ipv6"
+    }
+}
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()
@@ -39,7 +44,7 @@ impl MigrationTrait for Migration {
             .await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()

@@ -32,7 +32,7 @@ use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, Database, DatabaseConnection, EntityTrait,
     QueryFilter,
 };
-use sea_orm_migration::MigratorTrait;
+use simply_ip_vault::migration::MigratorTrait;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -126,8 +126,8 @@ async fn insert_test_key(db: &DatabaseConnection, name: &str, is_master: bool) -
         can_create_groups: Set(true),
         parent_key_id: Set(None),
         prefix: Set(plaintext.chars().take(8).collect()),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
+        updated_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(db)
     .await
@@ -144,7 +144,7 @@ async fn insert_group(db: &DatabaseConnection, name: &str) -> Uuid {
         group_type: Set("banlist".to_owned()),
         description: Set(None),
         owner_key_id: Set(None),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(db)
     .await
@@ -155,7 +155,7 @@ async fn insert_group(db: &DatabaseConnection, name: &str) -> Uuid {
 /// Inserts an address and a live, unlocked membership of it in `group_id`. Returns the address id.
 async fn insert_ip_record(db: &DatabaseConnection, address: &str, group_id: Uuid) -> Uuid {
     let id = Uuid::new_v4();
-    let now = chrono::Utc::now().naive_utc();
+    let now = simply_ip_vault::time_serde::now_utc();
     simply_ip_vault::entities::ip_record::ActiveModel {
         id: Set(id),
         target_address: Set(address.to_owned()),
@@ -233,7 +233,7 @@ async fn two_concurrent_identical_signed_requests_only_one_succeeds() {
 
     // One timestamp, so both signatures are the same bytes. That is what makes the second a replay
     // rather than merely a second request.
-    let timestamp = chrono::Utc::now().timestamp();
+    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
     let build = || {
         signed_at(
             inject_connect_info(
@@ -321,7 +321,7 @@ async fn two_concurrent_deletes_of_the_same_record_are_idempotent() {
                     .header("Content-Type", "application/json"),
             ),
             &secret,
-            chrono::Utc::now().timestamp() + offset,
+            time::OffsetDateTime::now_utc().unix_timestamp() + offset,
             &body,
         );
         tasks.spawn(async move { send(&app, request).await });
@@ -422,7 +422,7 @@ async fn malformed_input_is_refused_on_every_extractor() {
         let request = signed_at(
             builder,
             &secret,
-            chrono::Utc::now().timestamp() + tick,
+            time::OffsetDateTime::now_utc().unix_timestamp() + tick,
             body,
         );
         let app = app.clone();
@@ -542,7 +542,7 @@ async fn unknown_fields_are_refused_across_every_domain_payload() {
         let request = signed_at(
             builder,
             &secret,
-            chrono::Utc::now().timestamp() + tick,
+            time::OffsetDateTime::now_utc().unix_timestamp() + tick,
             &body,
         );
         let app = app.clone();
@@ -784,7 +784,7 @@ impl BanPolicyApi {
             app: create_app(state),
             db,
             key,
-            timestamp: chrono::Utc::now().timestamp(),
+            timestamp: time::OffsetDateTime::now_utc().unix_timestamp(),
         }
     }
 

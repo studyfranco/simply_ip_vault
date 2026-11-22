@@ -46,8 +46,8 @@
 //! authority without asking; failing loudly is recoverable in one `UPDATE`, and the message says
 //! which one to run. A single master (the overwhelmingly common case) backfills silently.
 
-use sea_orm_migration::prelude::*;
-use sea_orm_migration::sea_orm::ConnectionTrait;
+use super::prelude::*;
+use sea_orm::ConnectionTrait;
 
 /// The one non-null value this migration's `master_marker` ever carried. Local to this module: the
 /// API-side constant it once mirrored has been deleted along with every write path, because the
@@ -69,12 +69,17 @@ enum ApiKeys {
     MasterMarker,
 }
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20260807_000007_add_api_key_master_marker"
+    }
+}
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         let db = manager.get_connection();
 
         // Checked *before* the column is added, so a database with two masters is left exactly as it
@@ -140,7 +145,7 @@ impl MigrationTrait for Migration {
             .await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .drop_index(
                 Index::drop()

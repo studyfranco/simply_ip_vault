@@ -14,7 +14,7 @@
 //! `SCHEMA.MD`. A FK would either block deleting that key later or null the attribution out via
 //! `ON DELETE SET NULL`, and the point of an attribution field is that it survives the actor.
 
-use sea_orm_migration::prelude::*;
+use super::prelude::*;
 
 /// Identifiers this migration touches. `Table` is re-declared locally rather than imported from the
 /// initial-schema migration so that module can stay private; `DeriveIden` maps the variants to the
@@ -31,12 +31,17 @@ enum IpRecords {
     DeletedBy,
 }
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20260801_000005_add_ip_record_soft_delete"
+    }
+}
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         // One column per `alter_table` call: SQLite's ALTER TABLE accepts a single ADD COLUMN per
         // statement, and SeaORM does not split a multi-column alter for it. Three statements are
         // portable across every backend; one is not.
@@ -96,7 +101,7 @@ impl MigrationTrait for Migration {
             .await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .drop_index(
                 Index::drop()

@@ -15,11 +15,16 @@
 //!    Indexing `(cause, membership_id)` enables SQLite to resolve cause counts
 //!    via index-only scan rather than loading and sorting all cause rows.
 
+use super::prelude::*;
 use sea_orm::sea_query::Index as SqIndex;
-use sea_orm_migration::prelude::*;
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20261111_160000_add_stats_perf_indexes"
+    }
+}
 
 #[derive(DeriveIden)]
 enum Memberships {
@@ -40,7 +45,7 @@ enum Causes {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         // 1. Covering index for active vs locked breakdown
         manager
             .create_index(
@@ -83,7 +88,7 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .drop_index(
                 SqIndex::drop()

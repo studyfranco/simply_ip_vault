@@ -1,3 +1,5 @@
+[Project goals and onboarding](GOALS.md)
+
 # simply_ip_vault
 
 Simply efficient. A homelab firewall.

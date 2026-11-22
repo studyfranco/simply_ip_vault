@@ -65,10 +65,15 @@
 //! first is pinned — which is exactly why it appears on `idx_ip_records_deleted_updated`'s second
 //! column above and would have bought nothing as a standalone index's only column.
 
-use sea_orm_migration::prelude::*;
+use super::prelude::*;
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20260824_150000_add_query_performance_indexes"
+    }
+}
 
 #[derive(DeriveIden)]
 enum IpRecords {
@@ -89,7 +94,7 @@ const GROUP_MEMBERSHIPS_LOOKUP_INDEX: &str = "idx_group_memberships_lookup";
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .create_index(
                 Index::create()
@@ -118,7 +123,7 @@ impl MigrationTrait for Migration {
             .await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .drop_index(
                 Index::drop()

@@ -14,7 +14,6 @@ use axum::{
     extract::{Json, State},
     response::IntoResponse,
 };
-use chrono::Utc;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use sea_orm::{
     ActiveModelTrait,
@@ -225,7 +224,7 @@ pub async fn handle_white(
 async fn find_or_insert_address<C: ConnectionTrait>(
     db: &C,
     address: &str,
-    now: chrono::NaiveDateTime,
+    now: time::PrimitiveDateTime,
 ) -> Result<(ip_record::Model, bool), AppError> {
     if let Some(existing) = ip_record::Entity::find()
         .filter(ip_record::Column::TargetAddress.eq(address))
@@ -334,7 +333,7 @@ async fn resolve_upsert_target_group(
     }
 
     if !key.is_master {
-        let now = Utc::now().naive_utc();
+        let now = crate::time_serde::now_utc();
         let perm = api_key_group_permission::ActiveModel {
             id: Set(Uuid::new_v4()),
             api_key_id: Set(key.id),
@@ -366,7 +365,7 @@ async fn apply_membership_upsert(
     target_group_id: Uuid,
     stored_address: &str,
     cause: Option<&str>,
-    now: chrono::NaiveDateTime,
+    now: time::PrimitiveDateTime,
 ) -> Result<&'static str, AppError> {
     let (address_row, _) = find_or_insert_address(txn, stored_address, now).await?;
 
@@ -459,7 +458,7 @@ pub(crate) async fn handle_ip_upsert(
     }
     let target_group_id = group.id;
     let resolved_group_name = group.name;
-    let now = Utc::now().naive_utc();
+    let now = crate::time_serde::now_utc();
     let cause = payload
         .cause
         .as_deref()
@@ -570,14 +569,17 @@ pub struct IpRecordResponse {
     /// Whether this membership is locked.
     pub is_locked: bool,
     /// When this address was first linked into this group.
-    pub created_at: chrono::NaiveDateTime,
+    #[serde(with = "crate::time_serde")]
+    pub created_at: time::PrimitiveDateTime,
     /// The latest observation of this address in this group.
-    pub last_seen_at: chrono::NaiveDateTime,
+    #[serde(with = "crate::time_serde")]
+    pub last_seen_at: time::PrimitiveDateTime,
     /// Whether this membership is soft-deleted. Always `false` in a normal listing.
     pub is_deleted: bool,
     /// When it was soft-deleted, if it was.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    #[serde(with = "crate::time_serde::option")]
+    pub deleted_at: Option<time::PrimitiveDateTime>,
     /// The key that soft-deleted it. **Master only**; omitted for every other caller.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted_by: Option<String>,
@@ -593,7 +595,8 @@ pub struct MinimalIpRecordResponse {
     /// The address or CIDR range.
     pub target_address: String,
     /// The latest observation of this address in this group.
-    pub last_seen_at: chrono::NaiveDateTime,
+    #[serde(with = "crate::time_serde")]
+    pub last_seen_at: time::PrimitiveDateTime,
     /// Whether this membership is soft-deleted.
     pub is_deleted: bool,
 }
@@ -631,7 +634,7 @@ pub struct IpRecordsCursorEnvelope<T = IpRecordResponse> {
 /// row, matching `ORDER BY last_seen_at DESC, id ASC`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct KeysetCursor {
-    last_seen_at: chrono::NaiveDateTime,
+    last_seen_at: time::PrimitiveDateTime,
     id: Uuid,
 }
 
@@ -639,9 +642,12 @@ impl KeysetCursor {
     /// Encodes a row's sort key into an opaque hex token (`hex("<last_seen_at>|<id>")`).
     ///
     /// Hex is URL-safe without percent-encoding (`0-9a-f` only) and already in the dependency tree.
-    fn encode(last_seen_at: chrono::NaiveDateTime, id: Uuid) -> String {
-        let raw = format!("{}|{id}", last_seen_at.format("%Y-%m-%dT%H:%M:%S%.f"));
-        hex::encode(raw.as_bytes())
+    fn encode(last_seen_at: time::PrimitiveDateTime, id: Uuid) -> Result<String, AppError> {
+        let timestamp = last_seen_at
+            .assume_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|error| AppError::DbError(sea_orm::DbErr::Custom(error.to_string())))?;
+        Ok(hex::encode(format!("{timestamp}|{id}")))
     }
 
     /// Parses an opaque cursor token. Rejects malformed hex, missing delimiters, or invalid
@@ -654,8 +660,7 @@ impl KeysetCursor {
         let (ts_str, id_str) = text.split_once('|').ok_or_else(|| {
             AppError::InvalidInput("Invalid cursor: missing delimiter".to_owned())
         })?;
-        let last_seen_at = chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%dT%H:%M:%S%.f")
-            .or_else(|_| chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S%.f"))
+        let last_seen_at = crate::time_serde::parse(ts_str)
             .map_err(|_| AppError::InvalidInput("Invalid cursor: bad timestamp".to_owned()))?;
         let id = Uuid::parse_str(id_str)
             .map_err(|_| AppError::InvalidInput("Invalid cursor: bad membership id".to_owned()))?;
@@ -777,7 +782,7 @@ impl GroupScope {
 pub fn apply_group_and_since_scope(
     base: &Condition,
     group_pred: Option<sea_orm::sea_query::SimpleExpr>,
-    since_threshold: Option<chrono::NaiveDateTime>,
+    since_threshold: Option<time::PrimitiveDateTime>,
     include_deleted: bool,
 ) -> Condition {
     let mut cond = base.clone();
@@ -897,7 +902,7 @@ async fn count_matching(
 ///
 struct MergedPageFetch<'a> {
     base_condition: &'a Condition,
-    since_threshold: Option<chrono::NaiveDateTime>,
+    since_threshold: Option<time::PrimitiveDateTime>,
     include_deleted: bool,
     cursor: Option<KeysetCursor>,
     group_ids: &'a [Uuid],
@@ -1166,7 +1171,7 @@ fn build_list_filter_condition(
     }
 
     if let Some(age) = filters.max_age {
-        let threshold = Utc::now().naive_utc() - chrono::Duration::seconds(age);
+        let threshold = crate::time_serde::now_utc().saturating_sub(time::Duration::seconds(age));
         condition = condition.add(ip_record_group_membership::Column::LastSeenAt.gte(threshold));
     }
 
@@ -1299,7 +1304,7 @@ struct ListPageRequest<'a> {
     condition: &'a Condition,
     address: Option<&'a Condition>,
     group_predicate: Option<sea_orm::sea_query::SimpleExpr>,
-    since_threshold: Option<chrono::NaiveDateTime>,
+    since_threshold: Option<time::PrimitiveDateTime>,
     include_deleted: bool,
     cursor: Option<KeysetCursor>,
     offset: u64,
@@ -1393,10 +1398,10 @@ fn parse_list_cursor(
     })
 }
 
-fn parse_since_threshold(since: i64) -> Result<chrono::NaiveDateTime, AppError> {
-    chrono::DateTime::from_timestamp(since, 0)
-        .map(|ts| ts.naive_utc())
-        .ok_or_else(|| AppError::InvalidInput("Invalid `since` timestamp".to_owned()))
+fn parse_since_threshold(since: i64) -> Result<time::PrimitiveDateTime, AppError> {
+    time::OffsetDateTime::from_unix_timestamp(since)
+        .map(crate::time_serde::utc_datetime)
+        .map_err(|_| AppError::InvalidInput("Invalid `since` timestamp".to_owned()))
 }
 
 /// Handles `GET /api/ips`: lists memberships, scoped to groups the caller may read.
@@ -1485,6 +1490,7 @@ pub async fn list_ips(
     let next_cursor = if has_more {
         page.last()
             .map(|(m, _)| KeysetCursor::encode(m.last_seen_at, m.id))
+            .transpose()?
     } else {
         None
     };
@@ -1622,7 +1628,7 @@ struct MembershipDeletion<'a> {
     group: &'a ip_group::Model,
     record: &'a ip_record::Model,
     hard: bool,
-    now: chrono::NaiveDateTime,
+    now: time::PrimitiveDateTime,
 }
 
 async fn apply_membership_deletion(
@@ -1750,7 +1756,7 @@ pub async fn delete_ip(
         ));
     }
 
-    let now = Utc::now().naive_utc();
+    let now = crate::time_serde::now_utc();
     let txn = state
         .db
         .begin_with_options(TransactionOptions {
@@ -1971,14 +1977,18 @@ pub struct BatchRecordInput {
     /// Soft-delete state to apply to this membership.
     pub is_deleted: Option<bool>,
     /// When the address was first recorded, and when this membership was created if it is new.
-    pub created_at: Option<chrono::NaiveDateTime>,
+    #[serde(default, with = "crate::time_serde::option")]
+    pub created_at: Option<time::PrimitiveDateTime>,
     /// Deprecated alias for `last_seen_at`, retained so existing sync clients keep working. Ignored
     /// when `last_seen_at` is present.
-    pub updated_at: Option<chrono::NaiveDateTime>,
+    #[serde(default, with = "crate::time_serde::option")]
+    pub updated_at: Option<time::PrimitiveDateTime>,
     /// The observation time for this membership. Defaults to now.
-    pub last_seen_at: Option<chrono::NaiveDateTime>,
+    #[serde(default, with = "crate::time_serde::option")]
+    pub last_seen_at: Option<time::PrimitiveDateTime>,
     /// Soft-delete timestamp. Only meaningful alongside `is_deleted: true`.
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    #[serde(default, with = "crate::time_serde::option")]
+    pub deleted_at: Option<time::PrimitiveDateTime>,
 }
 
 /// Payload for `POST /api/records/batch`.
@@ -2025,9 +2035,9 @@ pub struct BatchRecordsResponse {
 /// at all. Webhook events are buffered and sent only after the commit.
 type MembershipUpdatesByState = std::collections::BTreeMap<
     (
-        chrono::NaiveDateTime,
+        time::PrimitiveDateTime,
         bool,
-        Option<chrono::NaiveDateTime>,
+        Option<time::PrimitiveDateTime>,
         Option<String>,
     ),
     Vec<Uuid>,
@@ -2116,7 +2126,7 @@ struct BatchContext<'a> {
     group: &'a ip_group::Model,
     is_whitelist: bool,
     skip_webhooks: bool,
-    now: chrono::NaiveDateTime,
+    now: time::PrimitiveDateTime,
 }
 
 type BatchRecordModels = std::collections::HashMap<String, ip_record::Model>;
@@ -2492,7 +2502,7 @@ pub async fn batch_records(
         normalized.push((stored_address, canonical_input, record));
     }
 
-    let now = Utc::now().naive_utc();
+    let now = crate::time_serde::now_utc();
     let skip_webhooks = payload.skip_webhooks.unwrap_or(false);
     let mut webhook_events: Vec<WebhookEvent> = Vec::new();
     let ctx = BatchContext {

@@ -749,13 +749,13 @@ assert_present "anti-replay guard is consulted" \
     "src/middleware.rs" "replay\.check_and_record"
 # The guard now lives in its own module on both sides, and keys on the raw digest rather than on
 # header text. Monotonic expiry is the load-bearing part: wall-clock arithmetic let an NTP step
-# evict live entries, so a `chrono` call inside the guard is a regression, not a style choice.
+# evict live entries, so a wall-clock call inside the guard is a regression, not a style choice.
 assert_present "anti-replay tracking has a dedicated module" \
     "src/replay.rs" "pub struct ReplayGuard"
 assert_present "replay entries expire on the monotonic clock" \
     "src/replay.rs" "use tokio::time::Instant"
 assert_absent "replay expiry does not consult the wall clock" \
-    "src/replay.rs" "chrono::Utc::now"
+    "src/replay.rs" "now_utc()"
 assert_absent "a saturated replay guard is never flushed" \
     "src/replay.rs" "seen.clear()"
 assert_present "replay entries are keyed on the raw digest" \

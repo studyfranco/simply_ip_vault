@@ -17,7 +17,7 @@
 //! `hmac_template` is meaningless in every mode except `CANONICAL_V1`. `NULL` reads back as "use the
 //! built-in default template", so existing `CANONICAL_V1` rows keep signing the exact same bytes.
 
-use sea_orm_migration::prelude::*;
+use super::prelude::*;
 
 /// Identifiers this migration touches. `Table` and `SignatureMode` are re-declared locally rather
 /// than imported from the migrations that created them, so those modules can stay private
@@ -46,12 +46,17 @@ enum WebhookConfigs {
 /// see the entity's `DEFAULT_HMAC_TEMPLATE` docs for why.
 const DEFAULT_HMAC_TEMPLATE: &str = r"{method}\n{path}\n{timestamp}\n{body}";
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20260730_000004_add_webhook_auth_modes"
+    }
+}
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()
@@ -114,7 +119,7 @@ impl MigrationTrait for Migration {
             .await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()

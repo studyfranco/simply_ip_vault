@@ -1,7 +1,7 @@
 //! The `webhook_executions` table: one row per outbound HTTP attempt a webhook dispatch makes,
 //! including retries. The delivery history behind the dashboard's "Executions" tab.
 
-use sea_orm::entity::prelude::*;
+use sea_orm::entity::prelude::{TimeDateTime as DateTime, *};
 use serde::{Deserialize, Serialize};
 
 /// One HTTP attempt's outcome, on the way to or from `webhook_configs`.
@@ -52,6 +52,7 @@ pub struct Model {
     /// "unknown" and "genuinely absent" as one state rather than two.
     pub cause: Option<String>,
     /// When this attempt was made.
+    #[serde(with = "crate::time_serde")]
     pub created_at: DateTime,
 }
 

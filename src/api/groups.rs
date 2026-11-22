@@ -200,7 +200,7 @@ pub async fn create_ip_group(
     };
 
     let id = Uuid::new_v4();
-    let now = chrono::Utc::now().naive_utc();
+    let now = crate::time_serde::now_utc();
     let txn = state
         .db
         .begin_with_options(TransactionOptions {

@@ -4085,19 +4085,12 @@ function escapeHtml(unsafe) {
          .replace(/'/g, "&#039;");
 }
 
-// The API's `created_at`/`timestamp` columns are `chrono::NaiveDateTime` — a UTC instant
-// serialized with NO timezone designator, e.g. "2026-08-21T14:12:25.215206". Per the
-// ECMAScript Date Time String spec, `new Date(...)` on a date-time string with no trailing
-// 'Z' or '+HH:MM' offset is parsed as LOCAL time, not UTC. Left alone, that turns an
-// already-UTC value into one silently misread as local before `toLocaleString()` even runs —
-// every displayed time is off by exactly the viewer's UTC offset. Appending 'Z' only when no
-// timezone marker is already present is what makes the browser treat it as the UTC instant it
-// actually is, so `toLocaleString()` converts it to the viewer's real local time correctly —
-// matching how `simply_hook_executor`'s dashboard formats the same shape of timestamp.
+// API timestamps are UTC RFC 3339 strings. Treat older timezone-less values as UTC too.
 function formatTimestamp(raw) {
     if (!raw) return '—';
-    const hasTimezone = /[zZ]|[+-]\d{2}:?\d{2}$/.test(raw);
-    const date = new Date(hasTimezone ? raw : `${raw}Z`);
+    const timestamp = raw.replace(' ', 'T');
+    const hasTimezone = /(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(timestamp);
+    const date = new Date(hasTimezone ? timestamp : `${timestamp}Z`);
     if (Number.isNaN(date.getTime())) return escapeHtml(raw);
     return date.toLocaleString();
 }

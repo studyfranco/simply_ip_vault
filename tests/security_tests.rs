@@ -17,8 +17,8 @@ use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, Database, DatabaseConnection,
     EntityTrait, QueryFilter, QueryOrder,
 };
-use sea_orm_migration::MigratorTrait;
 use serde_json::json;
+use simply_ip_vault::migration::MigratorTrait;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -92,8 +92,8 @@ async fn insert_key(
         can_create_groups: Set(scopes.can_create_groups),
         parent_key_id: Set(None),
         prefix: Set("sectest2".to_owned()),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
+        updated_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(db)
     .await
@@ -111,7 +111,7 @@ async fn insert_group(db: &DatabaseConnection, name: &str) -> Uuid {
         group_type: Set("banlist".to_owned()),
         owner_key_id: Set(None),
         description: Set(None),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(db)
     .await
@@ -138,7 +138,7 @@ async fn grant(
         // The administrative flag is off unless a test asks for it explicitly — the security suite
         // is about the read/write/delete surface.
         can_manage: Set(false),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(db)
     .await
@@ -165,7 +165,7 @@ async fn grant_manager(
         can_write: Set(write),
         can_delete: Set(del),
         can_manage: Set(true),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(db)
     .await
@@ -204,8 +204,8 @@ async fn insert_master_key(db: &DatabaseConnection, name: &str) -> String {
         can_create_groups: Set(true),
         parent_key_id: Set(None),
         prefix: Set("sectest1".to_owned()),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
+        updated_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(db)
     .await
@@ -246,7 +246,12 @@ fn signed_at(
 
 /// Builds a signed request stamped "now".
 fn signed(builder: axum::http::request::Builder, secret: &str, body: &str) -> Request<Body> {
-    signed_at(builder, secret, chrono::Utc::now().timestamp(), body)
+    signed_at(
+        builder,
+        secret,
+        time::OffsetDateTime::now_utc().unix_timestamp(),
+        body,
+    )
 }
 
 /// Builds a signed request stamped `offset_secs` into the future.
@@ -265,7 +270,7 @@ fn signed_later(
     signed_at(
         builder,
         secret,
-        chrono::Utc::now().timestamp() + offset_secs,
+        time::OffsetDateTime::now_utc().unix_timestamp() + offset_secs,
         body,
     )
 }
@@ -297,7 +302,7 @@ async fn attack_timestamp_forgery_outside_the_window_is_rejected_both_directions
     // The clock is read **inside** each probe, and only after waiting clear of a second boundary.
     //
     // Both details are load-bearing, and this test was intermittently red without them. It used to
-    // capture `now` once and derive every offset from it, but the middleware reads `Utc::now()` again
+    // capture `now` once and derive every offset from it, but the middleware reads `time::OffsetDateTime::now_utc()` again
     // when the request arrives — so the effective skew is `offset - elapsed`, where `elapsed` is
     // however long the *previous* probes took. One second of accumulated runtime turned `probe(301)`
     // into a skew of exactly 300, which is inside the inclusive window and answers `200`. It passed
@@ -311,7 +316,7 @@ async fn attack_timestamp_forgery_outside_the_window_is_rejected_both_directions
     let probe = |offset: i64| {
         let (app, key, secret) = (app.clone(), key.clone(), secret.clone());
         async move {
-            let subsec = u64::from(chrono::Utc::now().timestamp_subsec_millis());
+            let subsec = u64::from(time::OffsetDateTime::now_utc().millisecond());
             if subsec > 800 {
                 tokio::time::sleep(std::time::Duration::from_millis(1_200 - subsec)).await;
             }
@@ -322,7 +327,7 @@ async fn attack_timestamp_forgery_outside_the_window_is_rejected_both_directions
                         .header("X-API-Key", &key),
                 ),
                 &secret,
-                chrono::Utc::now().timestamp() + offset,
+                time::OffsetDateTime::now_utc().unix_timestamp() + offset,
                 "",
             );
             app.oneshot(req).await.unwrap().status()
@@ -386,7 +391,7 @@ async fn attack_omitting_the_timestamp_header_does_not_skip_the_replay_check() {
 
     let key = insert_master_key(&db, "No Timestamp").await;
     let secret = test_signing_secret(&key);
-    let now = chrono::Utc::now().timestamp().to_string();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp().to_string();
 
     // An otherwise perfect request: correct key, correct signature over the current time — with the
     // timestamp header simply left off.
@@ -466,7 +471,7 @@ async fn attack_signature_forgery_by_last_character_flip_is_rejected() {
 
     let key = insert_master_key(&db, "Forger").await;
     let secret = test_signing_secret(&key);
-    let now = chrono::Utc::now().timestamp().to_string();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp().to_string();
 
     let authentic = crypto::compute_signature(&secret, "GET", "/api/auth/me", &now, b"").unwrap();
     // Mutations are applied to the digest and re-tagged, so every case below reaches the MAC
@@ -546,7 +551,7 @@ async fn attack_signature_forgery_by_last_character_flip_is_rejected() {
     // doing the rejecting — the control request at the top of this test already consumed that
     // digest — and the check would then report 401 just as loudly with the format rule deleted.
     // Verified by mutation: with both the `crypto` and middleware checks removed, this fails.
-    let unused_now = (chrono::Utc::now().timestamp() - 7).to_string();
+    let unused_now = (time::OffsetDateTime::now_utc().unix_timestamp() - 7).to_string();
     let unused =
         crypto::compute_signature(&secret, "GET", "/api/auth/me", &unused_now, b"").unwrap();
     let unused_digest = unused
@@ -1695,8 +1700,8 @@ async fn attack_a_second_master_cannot_be_written_even_bypassing_the_api() {
         can_create_groups: Set(true),
         parent_key_id: Set(None),
         prefix: Set("usurper1".to_owned()),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
+        updated_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await;
@@ -3372,7 +3377,7 @@ async fn update_webhook_rejects_api_key_only_transition_without_a_key() {
 /// address (`ip_records`) id.
 async fn insert_ip_record(db: &DatabaseConnection, address: &str, group_id: Uuid) -> Uuid {
     let id = Uuid::new_v4();
-    let now = chrono::Utc::now().naive_utc();
+    let now = simply_ip_vault::time_serde::now_utc();
     simply_ip_vault::entities::ip_record::ActiveModel {
         id: Set(id),
         target_address: Set(address.to_owned()),
@@ -3877,9 +3882,9 @@ async fn purge_removes_only_records_past_the_92_day_retention_window() {
     let recent = insert_ip_record(&db, "203.0.113.2", group_id).await;
     let live = insert_ip_record(&db, "203.0.113.3", group_id).await;
 
-    let age = |days: i64| (chrono::Utc::now() - chrono::Duration::days(days)).naive_utc();
+    let age = |days: i64| simply_ip_vault::time_serde::now_utc() - time::Duration::days(days);
 
-    let mark_deleted = |id: Uuid, at: chrono::NaiveDateTime, deleted: bool| {
+    let mark_deleted = |id: Uuid, at: time::PrimitiveDateTime, deleted: bool| {
         let (db, group) = (db.clone(), group_id);
         async move {
             let membership = raw_membership(&db, id, group).await.unwrap();
@@ -3992,7 +3997,8 @@ async fn webhook_execution_retention_purges_each_outcome_on_its_own_window() {
     let group_id = insert_group(&db, "exec-retention-group").await;
 
     let webhook_id = seed_retention_webhook(&db, group_id).await;
-    let age_hours = |hours: i64| (chrono::Utc::now() - chrono::Duration::hours(hours)).naive_utc();
+    let age_hours =
+        |hours: i64| simply_ip_vault::time_serde::now_utc() - time::Duration::hours(hours);
     let insert_execution = |is_success: bool, hours_old: i64| {
         let db = db.clone();
         async move {
@@ -4101,7 +4107,7 @@ async fn seed_retention_webhook(db: &DatabaseConnection, group_id: Uuid) -> Uuid
         send_normalized_ipv6: Set(false),
         events: Set(None),
         owner_key_id: Set(None),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(db)
     .await
@@ -4130,7 +4136,7 @@ async fn purge_endpoint_reports_the_number_of_records_removed() {
         membership.into();
     active.is_deleted = Set(true);
     active.deleted_at = Set(Some(
-        (chrono::Utc::now() - chrono::Duration::days(200)).naive_utc(),
+        simply_ip_vault::time_serde::now_utc() - time::Duration::days(200),
     ));
     active.update(&db).await.unwrap();
 
@@ -4317,7 +4323,7 @@ async fn an_intercepted_signed_request_cannot_be_replayed_within_the_window() {
 
     // One authentic request, captured on the wire. Building it once and cloning the parts is the
     // point: the attacker resends the *same bytes*, not a re-signed equivalent.
-    let timestamp = chrono::Utc::now().timestamp();
+    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
     let body =
         json!({ "target_address": "45.0.113.200", "group_name": "replay-group" }).to_string();
     let build = || {
@@ -4413,7 +4419,7 @@ async fn replay_tracking_is_scoped_per_key() {
         None,
     )
     .await;
-    let timestamp = chrono::Utc::now().timestamp();
+    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
 
     for key in [&first, &second] {
         let req = signed_at(
@@ -4545,7 +4551,7 @@ async fn tampering_with_the_query_string_invalidates_the_signature() {
     let secret = test_signing_secret(&master);
     let group_id = insert_group(&db, "tamper-group").await;
     let record_id = insert_ip_record(&db, "198.51.100.77", group_id).await;
-    let timestamp = chrono::Utc::now().timestamp();
+    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
 
     // Signed for the plain path...
     let plain_path = format!("/api/ips?target_address=198.51.100.77&group_id={group_id}");

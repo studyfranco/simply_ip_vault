@@ -1,12 +1,17 @@
 //! Cover membership counts, last-seen listing scopes, and address-first lookups.
 
+use super::prelude::*;
 use sea_orm::sea_query::{Index as SqIndex, IndexOrder, IntoIndexColumn};
-use sea_orm_migration::prelude::*;
 
 use crate::entities::ip_record_group_membership::{Column, Entity};
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20261119_140000_add_membership_lookup_indexes"
+    }
+}
 
 const NAMES: [&str; 4] = [
     "idx_memberships_active_group_count",
@@ -17,7 +22,7 @@ const NAMES: [&str; 4] = [
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         use Column::{GroupId, Id, IpRecordId, IsDeleted, LastSeenAt};
 
         let seen = (LastSeenAt, IndexOrder::Desc).into_index_column();
@@ -48,7 +53,7 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         for name in NAMES {
             manager
                 .drop_index(

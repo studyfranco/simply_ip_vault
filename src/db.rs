@@ -86,6 +86,7 @@
 //! URL query parameters were tried first and rejected outright — `SQLx` answers
 //! `unknown query parameter 'synchronous' while parsing connection URL`.
 
+use crate::migration::{MigratorTrait, SchemaManager};
 use sea_orm::sea_query::{Alias, Query};
 use sea_orm::sqlx::sqlite::{
     SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
@@ -95,7 +96,6 @@ use sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, DbErr,
     SqlxSqliteConnector,
 };
-use sea_orm_migration::{MigratorTrait, SchemaManager};
 
 /// How long SQLite waits on a locked database before returning `SQLITE_BUSY`, in milliseconds.
 ///
@@ -790,7 +790,7 @@ mod tests {
             can_write: sea_orm::ActiveValue::Set(false),
             can_delete: sea_orm::ActiveValue::Set(false),
             can_manage: sea_orm::ActiveValue::Set(false),
-            created_at: sea_orm::ActiveValue::Set(chrono::Utc::now().naive_utc()),
+            created_at: sea_orm::ActiveValue::Set(crate::time_serde::now_utc()),
         };
         let outcome = sea_orm::EntityTrait::insert(orphan).exec(&db).await;
         assert!(

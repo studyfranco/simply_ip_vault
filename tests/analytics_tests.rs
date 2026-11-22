@@ -3,10 +3,9 @@
 //! `GET /api/stats/intersection`
 
 use axum::{body::Body, http::Request, http::StatusCode};
-use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, Database, DatabaseConnection};
-use sea_orm_migration::MigratorTrait;
 use serde_json::Value;
+use simply_ip_vault::migration::MigratorTrait;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -36,8 +35,8 @@ async fn setup() -> (DatabaseConnection, axum::Router) {
         can_create_groups: Set(true),
         parent_key_id: Set(None),
         prefix: Set("00000000".to_owned()),
-        created_at: Set(Utc::now().naive_utc()),
-        updated_at: Set(Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
+        updated_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -50,7 +49,7 @@ async fn setup() -> (DatabaseConnection, axum::Router) {
 
 fn signed_request(method: &str, uri: &str, body: &str) -> Request<Body> {
     let secret = format!("signing-secret-for-{MASTER_KEY}");
-    let ts = Utc::now().timestamp().to_string();
+    let ts = time::OffsetDateTime::now_utc().unix_timestamp().to_string();
     let sig =
         simply_ip_vault::crypto::compute_signature(&secret, method, uri, &ts, body.as_bytes())
             .unwrap();
@@ -72,7 +71,7 @@ fn signed_request(method: &str, uri: &str, body: &str) -> Request<Body> {
 #[tokio::test]
 async fn test_analytics_and_intersection_endpoints() {
     let (db, app) = setup().await;
-    let now = Utc::now().naive_utc();
+    let now = simply_ip_vault::time_serde::now_utc();
 
     let (ip2_id, ip3_id) = seed_analytics_fixture(&db, now).await;
     // Test 1: GET /api/stats/analytics
@@ -182,7 +181,7 @@ async fn test_analytics_and_intersection_endpoints() {
 
 async fn seed_analytics_fixture(
     db: &DatabaseConnection,
-    now: chrono::NaiveDateTime,
+    now: time::PrimitiveDateTime,
 ) -> (Uuid, Uuid) {
     // Create 2 groups: GroupA and GroupB
     let fail2ban = add_test_group(db, "Fail2ban", Some("Host bans"), now).await;
@@ -295,7 +294,7 @@ async fn seed_analytics_fixture(
 async fn assert_multi_group_intersection(
     db: DatabaseConnection,
     app: axum::Router,
-    now: chrono::NaiveDateTime,
+    now: time::PrimitiveDateTime,
     ip2_id: Uuid,
     ip3_id: Uuid,
 ) {
@@ -355,7 +354,7 @@ async fn assert_multi_group_intersection(
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 }
 
-async fn add_test_ip(db: &DatabaseConnection, ip_str: &str, now: chrono::NaiveDateTime) -> Uuid {
+async fn add_test_ip(db: &DatabaseConnection, ip_str: &str, now: time::PrimitiveDateTime) -> Uuid {
     let ip_id = Uuid::new_v4();
     ip_record::ActiveModel {
         id: Set(ip_id),
@@ -373,9 +372,9 @@ async fn add_test_membership(
     ip_id: Uuid,
     grp_id: Uuid,
     is_locked: bool,
-    created: chrono::NaiveDateTime,
-    seen: chrono::NaiveDateTime,
-    deleted: Option<chrono::NaiveDateTime>,
+    created: time::PrimitiveDateTime,
+    seen: time::PrimitiveDateTime,
+    deleted: Option<time::PrimitiveDateTime>,
 ) -> Uuid {
     let m_id = Uuid::new_v4();
     ip_record_group_membership::ActiveModel {
@@ -398,7 +397,7 @@ async fn add_test_membership(
 #[tokio::test]
 async fn test_analytics_new_statistics_and_pagination() {
     let (db, app) = setup().await;
-    let now = Utc::now().naive_utc();
+    let now = simply_ip_vault::time_serde::now_utc();
     seed_pagination_fixture(&db, now).await;
     // Test GET /api/stats/analytics
     let req = signed_request("GET", "/api/stats/analytics", "");
@@ -478,9 +477,9 @@ async fn test_analytics_new_statistics_and_pagination() {
     assert_intersection_pagination(db, app, now).await;
 }
 
-async fn seed_pagination_fixture(db: &DatabaseConnection, now: chrono::NaiveDateTime) {
-    let two_days_ago = now - chrono::Duration::days(2);
-    let ten_days_ago = now - chrono::Duration::days(10);
+async fn seed_pagination_fixture(db: &DatabaseConnection, now: time::PrimitiveDateTime) {
+    let two_days_ago = now - time::Duration::days(2);
+    let ten_days_ago = now - time::Duration::days(10);
 
     // Create 3 groups: Alpha, Beta, Gamma
     let g1_id = add_test_group(db, "Alpha", None, now).await;
@@ -556,7 +555,7 @@ async fn seed_pagination_fixture(db: &DatabaseConnection, now: chrono::NaiveDate
 async fn assert_intersection_pagination(
     db: DatabaseConnection,
     app: axum::Router,
-    now: chrono::NaiveDateTime,
+    now: time::PrimitiveDateTime,
 ) {
     // Intersection pagination tests between Alpha and Beta:
     // Common IPs in Alpha and Beta: ip1 and ip2 (total overlap = 2)
@@ -640,7 +639,7 @@ async fn add_test_group(
     db: &DatabaseConnection,
     name: &str,
     description: Option<&str>,
-    now: chrono::NaiveDateTime,
+    now: time::PrimitiveDateTime,
 ) -> Uuid {
     let id = Uuid::new_v4();
     ip_group::ActiveModel {
@@ -663,9 +662,9 @@ async fn seed_listing_benchmark(db: &DatabaseConnection, base: i64) -> Vec<Uuid>
 
     let groups: Vec<_> = (1..=4).map(Uuid::from_u128).collect();
     let stamp = |seconds| {
-        chrono::DateTime::from_timestamp(base + seconds, 0)
-            .unwrap()
-            .naive_utc()
+        simply_ip_vault::time_serde::utc_datetime(
+            time::OffsetDateTime::from_unix_timestamp(base + seconds).unwrap(),
+        )
     };
     for (index, &id) in groups.iter().enumerate() {
         ip_group::ActiveModel {
@@ -823,7 +822,7 @@ async fn benchmark_membership_count_global_group_and_address_search() {
 #[tokio::test]
 async fn cached_membership_count_is_invalidated_by_soft_delete() {
     let (db, app) = setup().await;
-    let now = Utc::now().naive_utc();
+    let now = simply_ip_vault::time_serde::now_utc();
     seed_analytics_fixture(&db, now).await;
 
     let before = timed_listing(

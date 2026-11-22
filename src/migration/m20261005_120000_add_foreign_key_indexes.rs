@@ -14,10 +14,15 @@
 //! Additive and idempotent (`IF NOT EXISTS`). A deployment that created one of these by hand first
 //! is not blocked from applying it.
 
-use sea_orm_migration::prelude::*;
+use super::prelude::*;
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20261005_120000_add_foreign_key_indexes"
+    }
+}
 
 #[derive(DeriveIden)]
 enum AuditLogs {
@@ -36,7 +41,7 @@ const WEBHOOK_CONFIGS_GROUP_INDEX: &str = "idx-webhook_configs-group_id";
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .create_index(
                 Index::create()
@@ -59,7 +64,7 @@ impl MigrationTrait for Migration {
             .await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .drop_index(
                 Index::drop()

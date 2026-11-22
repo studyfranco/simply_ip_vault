@@ -8,8 +8,8 @@
 
 use axum::{body::Body, http::Request};
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, Database, DatabaseConnection, EntityTrait};
-use sea_orm_migration::MigratorTrait;
 use serde_json::json;
+use simply_ip_vault::migration::MigratorTrait;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -41,8 +41,8 @@ async fn setup() -> (
         can_create_groups: Set(true),
         parent_key_id: Set(None),
         prefix: Set("00000000".to_owned()),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
+        updated_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -55,7 +55,7 @@ async fn setup() -> (
 
 fn signed_request(method: &str, uri: &str, body: String, offset: i64) -> Request<Body> {
     let secret = format!("signing-secret-for-{MASTER_KEY}");
-    let ts = (chrono::Utc::now().timestamp() + offset).to_string();
+    let ts = (time::OffsetDateTime::now_utc().unix_timestamp() + offset).to_string();
     let sig =
         simply_ip_vault::crypto::compute_signature(&secret, method, uri, &ts, body.as_bytes())
             .unwrap();
@@ -581,8 +581,8 @@ async fn webhook_credentials_are_sealed_at_rest_across_create_update_clone() {
         can_create_groups: Set(true),
         parent_key_id: Set(None),
         prefix: Set("00000000".to_owned()),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_ip_vault::time_serde::now_utc()),
+        updated_at: Set(simply_ip_vault::time_serde::now_utc()),
     }
     .insert(&db)
     .await
