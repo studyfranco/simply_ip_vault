@@ -48,7 +48,7 @@ METHOD\nTARGET\nTIMESTAMP\nRAW_BODY
 METHOD="POST"
 TARGET="/api/ban"
 TS="$(date -u +%s)"
-BODY='{"address":"198.51.100.42","group_name":"fail2ban","cause":"ssh-bruteforce"}'
+BODY='{"target_address":"198.51.100.42","group_name":"fail2ban","cause":"ssh-bruteforce"}'
 SIG=$(printf '%s\n%s\n%s\n%s' "$METHOD" "$TARGET" "$TS" "$BODY" \
   | openssl dgst -sha256 -hmac "$SIGNING_SECRET" -hex | awk '{print $NF}')
 
@@ -81,11 +81,58 @@ curl -sS -X "$METHOD" "https://vault.example.test${TARGET}" \
 
 ### Groups & Permissions
 
-- `GET /api/groups` / `POST /api/groups` (aliases: `/api/ip_groups`) — List or create groups (`group_type`: `"banlist"` or `"whitelist"`). Banlist groups support `allow_private_ips` (opt-in for RFC1918/CGNAT/ULA) and `excluded_whitelist_ids` (list of whitelist group IDs whose active ranges cannot be banned in that banlist).
+- `GET /api/groups` / `POST /api/groups` (aliases: `/api/ip_groups`) — List or create groups (`group_type`: `"banlist"` or `"whitelist"`). Banlist groups support `allow_private_ips` (opt-in for RFC1918/CGNAT/ULA) and `excluded_whitelist_ids` (list of whitelist group IDs whose active ranges cannot be banned in that banlist). Both `POST` and `PUT` enforce `deny_unknown_fields`.
 - `PUT /api/groups/{id}` / `DELETE /api/groups/{id}` — Update or delete a group (Master or `owner_key_id`). Updating `excluded_whitelist_ids` on a banlist—as well as adding, batch-upserting, or restoring an IP/CIDR on a linked whitelist—automatically and retroactively soft-deletes any overlapping active bans in linked banlists and emits `IP_DELETE` webhooks (`cause`: `"Excluded by whitelist <name>"`, respecting `skip_webhooks` on batch).
 - `PUT /api/groups/{id}/owner` — Reassign group ownership (Master only).
 - `POST /api/keys/{id}/permissions` (legacy alias: `/api/keys/{id}/groups`) — Grant/update per-group `can_read`/`can_write`/`can_delete`/`can_manage`.
 - `DELETE /api/keys/{id}/permissions/{group_identifier}` — Revoke a key's grant on a group.
+
+Concrete JSON payloads (flat schemas; unknown fields are rejected):
+
+- **`POST /api/groups`** (`name` required; `group_type` defaults to `"banlist"`, `allow_private_ips` defaults to `false`, `excluded_whitelist_ids` defaults to `[]`; ban policy fields are rejected on `"whitelist"` groups):
+
+  ```json
+  {
+    "name": "fail2ban",
+    "group_type": "banlist",
+    "allow_private_ips": false,
+    "excluded_whitelist_ids": ["11111111-1111-1111-1111-111111111111"]
+  }
+  ```
+
+- **`PUT /api/groups/{id}`** (all fields optional; supplying `excluded_whitelist_ids` replaces the exclusion list and retroactively soft-deletes overlapping active bans in that banlist, emitting `IP_DELETE` webhooks):
+
+  ```json
+  {
+    "name": "fail2ban-strict",
+    "allow_private_ips": false,
+    "excluded_whitelist_ids": ["11111111-1111-1111-1111-111111111111"]
+  }
+  ```
+
+- **`POST /api/keys/{id}/permissions`** (flat top-level object—`GroupCapabilities` is flattened, not nested; provide `group_id` or `group_name`, not both; `can_read`, `can_write`, and `can_delete` are required, while `can_manage` defaults to `false`; `can_write` or `can_delete` require `can_read: true`):
+
+  ```json
+  {
+    "group_name": "fail2ban",
+    "can_read": true,
+    "can_write": true,
+    "can_delete": false,
+    "can_manage": false
+  }
+  ```
+
+  Or targeting an existing group by UUID (`group_id` also accepts a group name string, though an unresolvable `group_id` returns `404` rather than auto-creating):
+
+  ```json
+  {
+    "group_id": "22222222-2222-2222-2222-222222222222",
+    "can_read": true,
+    "can_write": false,
+    "can_delete": false,
+    "can_manage": false
+  }
+  ```
 
 ### API Keys & Secret Rotation
 
