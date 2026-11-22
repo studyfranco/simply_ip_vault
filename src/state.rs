@@ -63,7 +63,9 @@ pub enum StartupConfigError {
     TrustedProxies(#[from] crate::config::InvalidTrustedProxies),
 }
 
-pub(crate) const MEMBERSHIP_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3);
+pub(crate) const MEMBERSHIP_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+pub(crate) const ANALYTICS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const SETTINGS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 struct MembershipCount {
     revision: u64,
@@ -76,7 +78,12 @@ pub type AnalyticsCache = Arc<
     tokio::sync::RwLock<
         std::collections::HashMap<
             Option<Vec<uuid::Uuid>>,
-            (u64, std::time::Instant, serde_json::Value),
+            (
+                u64,
+                std::time::Instant,
+                std::time::Duration,
+                serde_json::Value,
+            ),
         >,
     >,
 >;

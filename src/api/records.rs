@@ -6,7 +6,7 @@
 //! Every endpoint here that changes state therefore acts on a `(target_address, group)` pair, and
 //! a change in one group never touches the same address's membership in another.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use axum::{
@@ -19,8 +19,8 @@ use sea_orm::{
     ActiveModelTrait,
     ActiveValue::Set,
     ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction, EntityTrait, JoinType,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait, RelationTrait, SqlErr,
-    SqliteTransactionMode, TransactionOptions, TransactionTrait,
+    QueryFilter, QueryOrder, QuerySelect, QueryTrait, RelationTrait, SqlErr, SqliteTransactionMode,
+    TransactionOptions, TransactionTrait,
     sea_query::{Expr, ExprTrait, Func, Query},
 };
 use serde::{Deserialize, Serialize};
@@ -131,7 +131,7 @@ pub(crate) fn guard_bannable_address(
     Ok(())
 }
 
-async fn load_protected_networks(
+pub(crate) async fn load_protected_networks(
     db: &impl ConnectionTrait,
     group_id: Uuid,
 ) -> Result<Vec<(IpNet, String)>, AppError> {
@@ -188,6 +188,323 @@ fn validate_ban_networks(
         guard_bannable_address(&stored, allow_private_ips)?;
     }
     Ok(stored)
+}
+
+async fn load_excluding_banlists(
+    db: &impl ConnectionTrait,
+    whitelist_group_id: Uuid,
+) -> Result<Vec<(Uuid, String)>, AppError> {
+    ip_group_exclusion::Entity::find()
+        .select_only()
+        .column(ip_group::Column::Id)
+        .column(ip_group::Column::Name)
+        .join(
+            JoinType::InnerJoin,
+            ip_group_exclusion::Relation::Group.def(),
+        )
+        .filter(ip_group_exclusion::Column::ExcludedGroupId.eq(whitelist_group_id))
+        .into_tuple::<(Uuid, String)>()
+        .all(db)
+        .await
+        .map_err(Into::into)
+}
+
+fn collect_exact_and_supernet_candidates(net: &IpNet, out: &mut HashSet<String>) {
+    let trunc = net.trunc();
+    out.insert(trunc.to_string());
+    match trunc {
+        IpNet::V4(v4) => {
+            if v4.prefix_len() == 32 {
+                out.insert(v4.network().to_string());
+            }
+            for prefix in 0..v4.prefix_len() {
+                out.insert(
+                    Ipv4Net::new_assert(v4.network(), prefix)
+                        .trunc()
+                        .to_string(),
+                );
+            }
+        }
+        IpNet::V6(v6) => {
+            if v6.prefix_len() == 128 {
+                out.insert(v6.network().to_string());
+            }
+            if v6.network().to_ipv4_mapped().is_none() {
+                out.insert(Ipv6Net::new_assert(v6.network(), 48).trunc().to_string());
+            }
+            for prefix in 0..v6.prefix_len() {
+                out.insert(
+                    Ipv6Net::new_assert(v6.network(), prefix)
+                        .trunc()
+                        .to_string(),
+                );
+            }
+        }
+    }
+}
+
+enum SubnetRange {
+    Range { start: String, end: String },
+    FullBanlistScan,
+}
+
+fn subnet_candidate_ranges(net: &IpNet) -> Vec<SubnetRange> {
+    match net.trunc() {
+        IpNet::V4(v4) if v4.prefix_len() < 32 => {
+            let [a, b, c, _] = v4.network().octets();
+            let prefix = v4.prefix_len();
+            if prefix >= 24 {
+                vec![SubnetRange::Range {
+                    start: format!("{a}.{b}.{c}."),
+                    end: format!("{a}.{b}.{c}/"),
+                }]
+            } else if prefix >= 16 {
+                vec![SubnetRange::Range {
+                    start: format!("{a}.{b}."),
+                    end: format!("{a}.{b}/"),
+                }]
+            } else if prefix >= 8 {
+                vec![SubnetRange::Range {
+                    start: format!("{a}."),
+                    end: format!("{a}/"),
+                }]
+            } else {
+                let count = 1u16 << (8 - prefix);
+                if count <= 16 {
+                    (0..count)
+                        .map(|delta| {
+                            let octet = u16::from(a) + delta;
+                            SubnetRange::Range {
+                                start: format!("{octet}."),
+                                end: format!("{octet}/"),
+                            }
+                        })
+                        .collect()
+                } else {
+                    vec![SubnetRange::FullBanlistScan]
+                }
+            }
+        }
+        IpNet::V6(v6) if v6.prefix_len() < 128 => {
+            let segments = v6.network().segments();
+            let h1 = segments[0];
+            let h2 = segments[1];
+            let prefix = v6.prefix_len();
+            if prefix >= 16 && h1 != 0 {
+                if prefix >= 32 && h2 != 0 {
+                    vec![SubnetRange::Range {
+                        start: format!("{h1:x}:{h2:x}:"),
+                        end: format!("{h1:x}:{h2:x};"),
+                    }]
+                } else {
+                    vec![SubnetRange::Range {
+                        start: format!("{h1:x}:"),
+                        end: format!("{h1:x};"),
+                    }]
+                }
+            } else {
+                vec![SubnetRange::FullBanlistScan]
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+async fn find_matching_excluded_records(
+    txn: &DatabaseTransaction,
+    banlist_ids: &[Uuid],
+    protected: &[(IpNet, String)],
+) -> Result<HashMap<Uuid, (String, String)>, AppError> {
+    let mut exact_candidates = HashSet::new();
+    let mut range_scans = Vec::new();
+    let mut needs_full_banlist_scan = false;
+
+    for (net, _) in protected {
+        collect_exact_and_supernet_candidates(net, &mut exact_candidates);
+        for range in subnet_candidate_ranges(net) {
+            match range {
+                SubnetRange::FullBanlistScan => {
+                    needs_full_banlist_scan = true;
+                    break;
+                }
+                SubnetRange::Range { start, end } => range_scans.push((start, end)),
+            }
+        }
+    }
+
+    let mut candidates: HashMap<Uuid, String> = HashMap::new();
+    if needs_full_banlist_scan {
+        let rows = ip_record_group_membership::Entity::find()
+            .select_only()
+            .column(ip_record::Column::Id)
+            .column(ip_record::Column::TargetAddress)
+            .join(
+                JoinType::InnerJoin,
+                ip_record_group_membership::Relation::IpRecord.def(),
+            )
+            .filter(ip_record_group_membership::Column::IsDeleted.eq(false))
+            .filter(ip_record_group_membership::Column::GroupId.is_in(banlist_ids.iter().copied()))
+            .into_tuple::<(Uuid, String)>()
+            .all(txn)
+            .await?;
+        candidates.extend(rows);
+    } else {
+        let exact_vec: Vec<String> = exact_candidates.into_iter().collect();
+        for chunk in exact_vec.chunks(500) {
+            let rows = ip_record::Entity::find()
+                .filter(ip_record::Column::TargetAddress.is_in(chunk.iter().cloned()))
+                .select_only()
+                .column(ip_record::Column::Id)
+                .column(ip_record::Column::TargetAddress)
+                .into_tuple::<(Uuid, String)>()
+                .all(txn)
+                .await?;
+            candidates.extend(rows);
+        }
+
+        for (start, end) in range_scans {
+            let rows = ip_record::Entity::find()
+                .filter(ip_record::Column::TargetAddress.gte(start))
+                .filter(ip_record::Column::TargetAddress.lt(end))
+                .select_only()
+                .column(ip_record::Column::Id)
+                .column(ip_record::Column::TargetAddress)
+                .into_tuple::<(Uuid, String)>()
+                .all(txn)
+                .await?;
+            candidates.extend(rows);
+        }
+    }
+
+    let mut matched = HashMap::new();
+    for (id, addr) in candidates {
+        let Ok(candidate_net) = super::support::parse_cidr_or_ip(&addr) else {
+            continue;
+        };
+        if let Some((_, wl_name)) = protected
+            .iter()
+            .find(|(protected_net, _)| networks_overlap(&candidate_net, protected_net))
+        {
+            matched.insert(id, (addr, wl_name.clone()));
+        }
+    }
+    Ok(matched)
+}
+
+async fn soft_delete_excluded_memberships(
+    txn: &DatabaseTransaction,
+    key: &api_key::Model,
+    client_ip: std::net::IpAddr,
+    banlist_groups: &[(Uuid, String)],
+    matched: &HashMap<Uuid, (String, String)>,
+    now: time::PrimitiveDateTime,
+    skip_webhooks: bool,
+) -> Result<Vec<WebhookEvent>, AppError> {
+    let banlist_ids: Vec<Uuid> = banlist_groups.iter().map(|(id, _)| *id).collect();
+    let banlist_name_by_id: HashMap<Uuid, &str> = banlist_groups
+        .iter()
+        .map(|(id, name)| (*id, name.as_str()))
+        .collect();
+    let matched_ids: Vec<Uuid> = matched.keys().copied().collect();
+    let mut webhook_events = Vec::new();
+
+    for chunk in matched_ids.chunks(500) {
+        let memberships = ip_record_group_membership::Entity::find()
+            .filter(ip_record_group_membership::Column::IsDeleted.eq(false))
+            .filter(ip_record_group_membership::Column::GroupId.is_in(banlist_ids.iter().copied()))
+            .filter(ip_record_group_membership::Column::IpRecordId.is_in(chunk.iter().copied()))
+            .all(txn)
+            .await?;
+
+        if memberships.is_empty() {
+            continue;
+        }
+
+        let membership_ids: Vec<Uuid> = memberships.iter().map(|m| m.id).collect();
+        ip_record_group_membership::Entity::update_many()
+            .col_expr(
+                ip_record_group_membership::Column::IsDeleted,
+                Expr::value(true),
+            )
+            .col_expr(
+                ip_record_group_membership::Column::DeletedAt,
+                Expr::value(Some(now)),
+            )
+            .col_expr(
+                ip_record_group_membership::Column::DeletedBy,
+                Expr::value(Some(key.id.to_string())),
+            )
+            .filter(ip_record_group_membership::Column::Id.is_in(membership_ids))
+            .exec(txn)
+            .await?;
+
+        for m in memberships {
+            let Some((address, wl_name)) = matched.get(&m.ip_record_id) else {
+                continue;
+            };
+            let ban_name = banlist_name_by_id
+                .get(&m.group_id)
+                .copied()
+                .unwrap_or_default()
+                .to_owned();
+            let reason = format!("Excluded by whitelist {wl_name}");
+            create_audit_log(
+                txn,
+                key,
+                client_ip,
+                "IP_SOFT_DELETE",
+                Some(address.clone()),
+                Some(ban_name.clone()),
+                Some(reason.clone()),
+            )
+            .await?;
+            if !skip_webhooks {
+                webhook_events.push(WebhookEvent {
+                    action: "IP_DELETE".to_owned(),
+                    address: address.clone(),
+                    is_whitelist: false,
+                    group_id: Some(m.group_id),
+                    group_name: Some(ban_name),
+                    cause: Some(reason),
+                });
+            }
+        }
+    }
+
+    Ok(webhook_events)
+}
+
+/// Retroactively soft-deletes active bans in `banlist_groups` that overlap any network in
+/// `protected`, using indexed exact/supernet/range lookups (never a full `ip_records` scan).
+pub(crate) async fn purge_excluded_bans_for_networks(
+    txn: &DatabaseTransaction,
+    key: &api_key::Model,
+    client_ip: std::net::IpAddr,
+    banlist_groups: &[(Uuid, String)],
+    protected: &[(IpNet, String)],
+    now: time::PrimitiveDateTime,
+    skip_webhooks: bool,
+) -> Result<Vec<WebhookEvent>, AppError> {
+    if banlist_groups.is_empty() || protected.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let banlist_ids: Vec<Uuid> = banlist_groups.iter().map(|(id, _)| *id).collect();
+    let matched = find_matching_excluded_records(txn, &banlist_ids, protected).await?;
+    if matched.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    soft_delete_excluded_memberships(
+        txn,
+        key,
+        client_ip,
+        banlist_groups,
+        &matched,
+        now,
+        skip_webhooks,
+    )
+    .await
 }
 
 async fn enforce_exclusions(
@@ -475,6 +792,21 @@ pub(crate) async fn handle_ip_upsert(
     )
     .await?;
 
+    let purge_events = if is_whitelist {
+        let banlists = load_excluding_banlists(&txn, target_group_id).await?;
+        if banlists.is_empty() {
+            Vec::new()
+        } else {
+            let protected = vec![(network, resolved_group_name.clone())];
+            purge_excluded_bans_for_networks(
+                &txn, &key, client_ip, &banlists, &protected, now, false,
+            )
+            .await?
+        }
+    } else {
+        Vec::new()
+    };
+
     create_audit_log(
         &txn,
         &key,
@@ -496,6 +828,9 @@ pub(crate) async fn handle_ip_upsert(
         group_name: Some(resolved_group_name),
         cause,
     });
+    for event in purge_events {
+        state.enqueue_webhook(event);
+    }
 
     Ok(axum::http::StatusCode::OK)
 }
@@ -1648,11 +1983,16 @@ async fn apply_membership_deletion(
         ip_record_group_membership::Entity::delete_by_id(membership.id)
             .exec(txn)
             .await?;
-        let remaining = ip_record_group_membership::Entity::find()
+        let no_remaining = ip_record_group_membership::Entity::find()
             .filter(ip_record_group_membership::Column::IpRecordId.eq(record.id))
-            .count(txn)
-            .await?;
-        if remaining == 0 {
+            .select_only()
+            .column(ip_record_group_membership::Column::Id)
+            .limit(1)
+            .into_tuple::<Uuid>()
+            .one(txn)
+            .await?
+            .is_none();
+        if no_remaining {
             ip_record::Entity::delete_by_id(record.id).exec(txn).await?;
         }
         create_audit_log(
@@ -1867,6 +2207,28 @@ pub async fn restore_ip_record(
     active.deleted_at = Set(None);
     active.deleted_by = Set(None);
     active.update(&txn).await?;
+    let purge_events = if group.group_type == "whitelist" {
+        let banlists = load_excluding_banlists(&txn, group.id).await?;
+        if banlists.is_empty() {
+            Vec::new()
+        } else {
+            let network = super::support::parse_cidr_or_ip(&stored_address)
+                .map_err(|()| AppError::Internal)?;
+            let protected = vec![(network, group.name.clone())];
+            purge_excluded_bans_for_networks(
+                &txn,
+                &key,
+                client_ip.0,
+                &banlists,
+                &protected,
+                crate::time_serde::now_utc(),
+                false,
+            )
+            .await?
+        }
+    } else {
+        Vec::new()
+    };
     create_audit_log(
         &txn,
         &key,
@@ -1878,6 +2240,9 @@ pub async fn restore_ip_record(
     )
     .await?;
     state.commit_membership_write(txn).await?;
+    for event in purge_events {
+        state.enqueue_webhook(event);
+    }
 
     Ok(Json(serde_json::json!({
         "target_address": stored_address,
@@ -2459,6 +2824,40 @@ async fn sweep_full_replace_omissions(
     Ok(())
 }
 
+async fn purge_batch_whitelist_exclusions(
+    txn: &DatabaseTransaction,
+    ctx: &BatchContext<'_>,
+    client_ip: std::net::IpAddr,
+    normalized: &[(String, String, &BatchRecordInput)],
+    webhook_events: &mut Vec<WebhookEvent>,
+) -> Result<(), AppError> {
+    if !ctx.is_whitelist || normalized.is_empty() {
+        return Ok(());
+    }
+    let banlists = load_excluding_banlists(txn, ctx.group.id).await?;
+    if banlists.is_empty() {
+        return Ok(());
+    }
+    let mut batch_protected = Vec::with_capacity(normalized.len());
+    for (stored_address, _, _) in normalized {
+        let net =
+            super::support::parse_cidr_or_ip(stored_address).map_err(|()| AppError::Internal)?;
+        batch_protected.push((net, ctx.group.name.clone()));
+    }
+    let purge_events = purge_excluded_bans_for_networks(
+        txn,
+        ctx.key,
+        client_ip,
+        &banlists,
+        &batch_protected,
+        ctx.now,
+        ctx.skip_webhooks,
+    )
+    .await?;
+    webhook_events.extend(purge_events);
+    Ok(())
+}
+
 pub async fn batch_records(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
@@ -2521,6 +2920,9 @@ pub async fn batch_records(
         sweep_full_replace_omissions(&txn, &ctx, &seen_stored, &mut summary, &mut webhook_events)
             .await?;
     }
+
+    purge_batch_whitelist_exclusions(&txn, &ctx, client_ip.0, &normalized, &mut webhook_events)
+        .await?;
 
     create_audit_log(
         &txn,

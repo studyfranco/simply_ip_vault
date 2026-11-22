@@ -81,8 +81,8 @@ curl -sS -X "$METHOD" "https://vault.example.test${TARGET}" \
 
 ### Groups & Permissions
 
-- `GET /api/groups` / `POST /api/groups` (aliases: `/api/ip_groups`) — List or create groups (`group_type`: `"banlist"` or `"whitelist"`).
-- `PUT /api/groups/{id}` / `DELETE /api/groups/{id}` — Update or delete a group (Master or `owner_key_id`).
+- `GET /api/groups` / `POST /api/groups` (aliases: `/api/ip_groups`) — List or create groups (`group_type`: `"banlist"` or `"whitelist"`). Banlist groups support `allow_private_ips` (opt-in for RFC1918/CGNAT/ULA) and `excluded_whitelist_ids` (list of whitelist group IDs whose active ranges cannot be banned in that banlist).
+- `PUT /api/groups/{id}` / `DELETE /api/groups/{id}` — Update or delete a group (Master or `owner_key_id`). Updating `excluded_whitelist_ids` on a banlist—as well as adding, batch-upserting, or restoring an IP/CIDR on a linked whitelist—automatically and retroactively soft-deletes any overlapping active bans in linked banlists and emits `IP_DELETE` webhooks (`cause`: `"Excluded by whitelist <name>"`, respecting `skip_webhooks` on batch).
 - `PUT /api/groups/{id}/owner` — Reassign group ownership (Master only).
 - `POST /api/keys/{id}/permissions` (legacy alias: `/api/keys/{id}/groups`) — Grant/update per-group `can_read`/`can_write`/`can_delete`/`can_manage`.
 - `DELETE /api/keys/{id}/permissions/{group_identifier}` — Revoke a key's grant on a group.

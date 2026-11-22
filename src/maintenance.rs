@@ -17,12 +17,25 @@ pub const MAINTENANCE_INTERVAL: Duration = Duration::from_hours(12);
 /// and never holds the SQLite write lock long enough to trigger slow statement alerts (threshold 1s).
 pub const VACUUM_PAGES_PER_PASS: u32 = 50;
 
-/// Runs one maintenance pass: reclaim up to [`VACUUM_PAGES_PER_PASS`] free pages, truncate the
-/// WAL, and refresh query planner statistics. Failures are logged rather than returned, so one bad
-/// pass cannot stop the schedule.
+/// Free pages reclaimed per chunk inside a pass, yielding between chunks so concurrent writers
+/// are never starved.
+pub const VACUUM_PAGES_PER_CHUNK: u32 = 10;
+
+/// Runs one maintenance pass: reclaim up to [`VACUUM_PAGES_PER_PASS`] free pages in chunks of
+/// [`VACUUM_PAGES_PER_CHUNK`], truncate the WAL, and refresh query planner statistics. Failures are
+/// logged rather than returned, so one bad pass cannot stop the schedule.
 pub async fn run_once(db: &DatabaseConnection) {
-    if let Err(e) = crate::db::run_incremental_vacuum(db, VACUUM_PAGES_PER_PASS).await {
-        tracing::error!("Maintenance: incremental vacuum failed: {e}");
+    let mut remaining = VACUUM_PAGES_PER_PASS;
+    while remaining > 0 {
+        let chunk = remaining.min(VACUUM_PAGES_PER_CHUNK);
+        if let Err(e) = crate::db::run_incremental_vacuum(db, chunk).await {
+            tracing::error!("Maintenance: incremental vacuum failed: {e}");
+            break;
+        }
+        remaining -= chunk;
+        if remaining > 0 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
     if let Err(e) = crate::db::wal_checkpoint_truncate(db).await {
         tracing::error!("Maintenance: WAL checkpoint failed: {e}");

@@ -8,8 +8,8 @@ use axum::response::IntoResponse;
 use axum::{Extension, Json};
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Func, Query as SqQuery};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect, QueryTrait,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect, QueryTrait,
 };
 use serde::{Deserialize, Serialize};
 use time::PrimitiveDateTime;
@@ -215,6 +215,21 @@ fn to_subnet_prefix(raw: &str) -> Option<String> {
     }
 }
 
+/// Counts rows matching an `ip_record_group_memberships` query directly via `SELECT COUNT(*)`
+/// without allocating `SeaORM`'s 9-column paginator subquery.
+async fn count_memberships(
+    db: &DatabaseConnection,
+    select: sea_orm::Select<ip_record_group_membership::Entity>,
+) -> Result<u64, AppError> {
+    let count: Option<i64> = select
+        .select_only()
+        .expr_as(Func::count(Expr::col(sea_orm::sea_query::Asterisk)), "cnt")
+        .into_tuple::<i64>()
+        .one(db)
+        .await?;
+    Ok(nonnegative_count(count.unwrap_or(0)))
+}
+
 /// Calculates added/seen and soft-deleted membership velocity for a given threshold window.
 async fn compute_velocity(
     db: &sea_orm::DatabaseConnection,
@@ -232,7 +247,7 @@ async fn compute_velocity(
         active_q = active_q
             .filter(ip_record_group_membership::Column::GroupId.is_in(allowed.iter().copied()));
     }
-    let active_added_or_seen = active_q.count(db).await?;
+    let active_added_or_seen = count_memberships(db, active_q).await?;
 
     let mut deleted_q = ip_record_group_membership::Entity::find()
         .filter(ip_record_group_membership::Column::IsDeleted.eq(true))
@@ -241,7 +256,7 @@ async fn compute_velocity(
         deleted_q = deleted_q
             .filter(ip_record_group_membership::Column::GroupId.is_in(allowed.iter().copied()));
     }
-    let soft_deleted = deleted_q.count(db).await?;
+    let soft_deleted = count_memberships(db, deleted_q).await?;
 
     Ok(VelocityStat {
         active_added_or_seen,
@@ -312,13 +327,34 @@ pub async fn get_analytics(
         v
     });
 
+    let current_revision = state.membership_revision();
     {
         let cache_read = state.analytics_cache.read().await;
-        if let Some((revision, ts, payload)) = cache_read.get(&cache_key)
-            && *revision == state.membership_revision()
-            && ts.elapsed() < crate::state::MEMBERSHIP_CACHE_TTL
-        {
-            return Ok(Json(payload.clone()).into_response());
+        if let Some((revision, ts, compute_time, payload)) = cache_read.get(&cache_key) {
+            let is_fresh_revision =
+                *revision == current_revision && ts.elapsed() < crate::state::ANALYTICS_CACHE_TTL;
+            let is_expensive = *compute_time >= std::time::Duration::from_millis(500);
+            if is_fresh_revision
+                || (is_expensive && ts.elapsed() < crate::state::ANALYTICS_CACHE_TTL)
+            {
+                return Ok(Json(payload.clone()).into_response());
+            }
+            if is_expensive {
+                if let Ok(guard) = state.analytics_lock.clone().try_lock_owned() {
+                    let state_clone = state.clone();
+                    let auth_clone = authorized_groups.clone();
+                    let key_clone = cache_key.clone();
+                    tokio::spawn(async move {
+                        let _guard = guard;
+                        if let Err(e) =
+                            compute_and_cache_analytics(state_clone, auth_clone, key_clone).await
+                        {
+                            tracing::warn!("Background analytics refresh failed: {e}");
+                        }
+                    });
+                }
+                return Ok(Json(payload.clone()).into_response());
+            }
         }
     }
 
@@ -327,14 +363,19 @@ pub async fn get_analytics(
     // ensures that even if an impatient HTTP proxy disconnects mid-flight, the computation
     // finishes and populates `analytics_cache` for the retry.
     let singleflight_guard = state.analytics_lock.clone().lock_owned().await;
+    let current_revision = state.membership_revision();
 
     {
         let cache_read = state.analytics_cache.read().await;
-        if let Some((revision, ts, payload)) = cache_read.get(&cache_key)
-            && *revision == state.membership_revision()
-            && ts.elapsed() < crate::state::MEMBERSHIP_CACHE_TTL
-        {
-            return Ok(Json(payload.clone()).into_response());
+        if let Some((revision, ts, compute_time, payload)) = cache_read.get(&cache_key) {
+            let is_fresh_revision =
+                *revision == current_revision && ts.elapsed() < crate::state::ANALYTICS_CACHE_TTL;
+            let is_expensive = *compute_time >= std::time::Duration::from_millis(500);
+            if is_fresh_revision
+                || (is_expensive && ts.elapsed() < crate::state::ANALYTICS_CACHE_TTL)
+            {
+                return Ok(Json(payload.clone()).into_response());
+            }
         }
     }
 
@@ -357,6 +398,7 @@ async fn compute_and_cache_analytics(
     authorized_groups: Option<HashSet<Uuid>>,
     cache_key: Option<Vec<Uuid>>,
 ) -> Result<AnalyticsResponse, AppError> {
+    let started = std::time::Instant::now();
     let revision = state.membership_revision();
     // 1. Groups & active counts by group
     let mut groups_query = ip_group::Entity::find();
@@ -424,7 +466,7 @@ async fn compute_and_cache_analytics(
         locked_q = locked_q
             .filter(ip_record_group_membership::Column::GroupId.is_in(allowed.iter().copied()));
     }
-    let locked_count = locked_q.count(&state.db).await?;
+    let locked_count = count_memberships(&state.db, locked_q).await?;
     let total_active = std::cmp::max(total_active_memberships, locked_count);
     let dynamic_count = total_active.saturating_sub(locked_count);
     let locked_breakdown = LockedBreakdown {
@@ -456,12 +498,18 @@ async fn compute_and_cache_analytics(
     };
 
     if let Ok(val) = serde_json::to_value(&response) {
+        let compute_time = started.elapsed();
+        let is_expensive = compute_time >= std::time::Duration::from_millis(500);
         let mut cache_write = state.analytics_cache.write().await;
-        cache_write.retain(|_, (cached_revision, ts, _)| {
-            *cached_revision == revision && ts.elapsed() < crate::state::MEMBERSHIP_CACHE_TTL
+        cache_write.retain(|_, (cached_revision, ts, ct, _)| {
+            ts.elapsed() < crate::state::ANALYTICS_CACHE_TTL
+                && (*cached_revision == revision || *ct >= std::time::Duration::from_millis(500))
         });
-        if cache_write.len() < 256 && revision == state.membership_revision() {
-            cache_write.insert(cache_key, (revision, std::time::Instant::now(), val));
+        if cache_write.len() < 256 && (is_expensive || revision == state.membership_revision()) {
+            cache_write.insert(
+                cache_key,
+                (revision, std::time::Instant::now(), compute_time, val),
+            );
         }
     }
 
@@ -803,26 +851,33 @@ async fn latest_causes_by_ip(
     db: &DatabaseConnection,
     membership_to_ip: &HashMap<Uuid, Uuid>,
 ) -> Result<HashMap<Uuid, Vec<String>>, AppError> {
-    // Batch fetch latest causes directly by `membership_id IN (...)` via `idx-irc-membership_id`
-    let mut causes_by_ip: HashMap<Uuid, Vec<String>> = HashMap::new();
-    if !membership_to_ip.is_empty() {
-        let cause_rows: Vec<(Uuid, String)> = ip_record_cause::Entity::find()
-            .filter(ip_record_cause::Column::MembershipId.is_in(membership_to_ip.keys().copied()))
+    // Bounded per-membership covering-index lookups via `idx_causes_membership_created`
+    // `(membership_id, created_at DESC, cause)` — avoids `WHERE membership_id IN (...)` +
+    // `USE TEMP B-TREE` over large cause histories.
+    let mut raw_by_ip: HashMap<Uuid, Vec<(PrimitiveDateTime, String)>> = HashMap::new();
+    for (&membership_id, &ip_id) in membership_to_ip {
+        let rows: Vec<(PrimitiveDateTime, String)> = ip_record_cause::Entity::find()
+            .filter(ip_record_cause::Column::MembershipId.eq(membership_id))
             .order_by_desc(ip_record_cause::Column::CreatedAt)
+            .limit(3)
             .select_only()
-            .column(ip_record_cause::Column::MembershipId)
+            .column(ip_record_cause::Column::CreatedAt)
             .column(ip_record_cause::Column::Cause)
-            .into_tuple::<(Uuid, String)>()
+            .into_tuple::<(PrimitiveDateTime, String)>()
             .all(db)
             .await?;
+        raw_by_ip.entry(ip_id).or_default().extend(rows);
+    }
 
-        for (membership_id, cause) in cause_rows {
-            if !cause.trim().is_empty()
-                && let Some(&ip_id) = membership_to_ip.get(&membership_id)
-            {
-                let list = causes_by_ip.entry(ip_id).or_default();
-                if list.len() < 3 && !list.contains(&cause) {
-                    list.push(cause);
+    let mut causes_by_ip: HashMap<Uuid, Vec<String>> = HashMap::with_capacity(raw_by_ip.len());
+    for (ip_id, mut entries) in raw_by_ip {
+        entries.sort_by_key(|a| std::cmp::Reverse(a.0));
+        let list = causes_by_ip.entry(ip_id).or_default();
+        for (_, cause) in entries {
+            if !cause.trim().is_empty() && !list.contains(&cause) {
+                list.push(cause);
+                if list.len() == 3 {
+                    break;
                 }
             }
         }
@@ -842,19 +897,30 @@ async fn load_top_recidivists(
     } else {
         let top_ids: Vec<Uuid> = top_rec_tuples.iter().map(|(id, _)| *id).collect();
 
-        // Batch fetch records
+        // Batch fetch projected address columns only.
         let records = ip_record::Entity::find()
             .filter(ip_record::Column::Id.is_in(top_ids.iter().copied()))
+            .select_only()
+            .column(ip_record::Column::Id)
+            .column(ip_record::Column::TargetAddress)
+            .into_tuple::<(Uuid, String)>()
             .all(db)
             .await?;
-        let records_map: HashMap<Uuid, ip_record::Model> =
-            records.into_iter().map(|r| (r.id, r)).collect();
+        let records_map: HashMap<Uuid, String> = records.into_iter().collect();
 
-        // Fetch all memberships for the top 50 IPs via `idx-irgm-ip_record_id` without
+        // Fetch projected membership columns for the top 50 IPs via `idx-irgm-ip_record_id` without
         // filtering on `is_deleted` in SQL (which would tempt SQLite's planner into scanning
         // `idx_memberships_is_deleted_last_seen` across millions of rows).
         let top_memberships = ip_record_group_membership::Entity::find()
             .filter(ip_record_group_membership::Column::IpRecordId.is_in(top_ids.iter().copied()))
+            .select_only()
+            .column(ip_record_group_membership::Column::Id)
+            .column(ip_record_group_membership::Column::IpRecordId)
+            .column(ip_record_group_membership::Column::GroupId)
+            .column(ip_record_group_membership::Column::IsDeleted)
+            .column(ip_record_group_membership::Column::CreatedAt)
+            .column(ip_record_group_membership::Column::LastSeenAt)
+            .into_tuple::<(Uuid, Uuid, Uuid, bool, PrimitiveDateTime, PrimitiveDateTime)>()
             .all(db)
             .await?;
 
@@ -863,22 +929,20 @@ async fn load_top_recidivists(
             HashMap::new();
         let mut membership_to_ip: HashMap<Uuid, Uuid> = HashMap::new();
 
-        for m in top_memberships {
-            let entry = times_by_ip.entry(m.ip_record_id).or_insert((None, None));
+        for (id, ip_record_id, group_id, is_deleted, created_at, last_seen_at) in top_memberships {
+            let entry = times_by_ip.entry(ip_record_id).or_insert((None, None));
             entry.0 = Some(match entry.0 {
-                Some(prev) => std::cmp::min(prev, m.created_at),
-                None => m.created_at,
+                Some(prev) => std::cmp::min(prev, created_at),
+                None => created_at,
             });
             entry.1 = Some(match entry.1 {
-                Some(prev) => std::cmp::max(prev, m.last_seen_at),
-                None => m.last_seen_at,
+                Some(prev) => std::cmp::max(prev, last_seen_at),
+                None => last_seen_at,
             });
 
-            if !m.is_deleted
-                && let Some(grp_name) = group_name_by_id.get(&m.group_id)
-            {
-                membership_to_ip.insert(m.id, m.ip_record_id);
-                let list = group_names_by_ip.entry(m.ip_record_id).or_default();
+            if !is_deleted && let Some(grp_name) = group_name_by_id.get(&group_id) {
+                membership_to_ip.insert(id, ip_record_id);
+                let list = group_names_by_ip.entry(ip_record_id).or_default();
                 if !list.contains(grp_name) {
                     list.push(grp_name.clone());
                 }
@@ -889,7 +953,7 @@ async fn load_top_recidivists(
 
         let mut result = Vec::with_capacity(top_rec_tuples.len());
         for (rec_id, grp_cnt) in top_rec_tuples {
-            let Some(r) = records_map.get(&rec_id) else {
+            let Some(target_address) = records_map.get(&rec_id) else {
                 continue;
             };
             let empty_groups = Vec::new();
@@ -904,7 +968,7 @@ async fn load_top_recidivists(
 
             result.push(RecidivistIp {
                 ip_record_id: rec_id,
-                target_address: r.target_address.clone(),
+                target_address: target_address.clone(),
                 group_count: std::cmp::max(nonnegative_count(grp_cnt), group_names.len() as u64),
                 group_names,
                 first_seen,
@@ -937,17 +1001,17 @@ async fn subnet_distribution(
         .all(db)
         .await?;
 
-    let addresses: Vec<String> = if ip_ids.is_empty() {
-        Vec::new()
-    } else {
-        ip_record::Entity::find()
-            .filter(ip_record::Column::Id.is_in(ip_ids))
+    let mut addresses = Vec::with_capacity(ip_ids.len());
+    for chunk in ip_ids.chunks(900) {
+        let rows = ip_record::Entity::find()
+            .filter(ip_record::Column::Id.is_in(chunk.iter().copied()))
             .select_only()
             .column(ip_record::Column::TargetAddress)
             .into_tuple::<String>()
             .all(db)
-            .await?
-    };
+            .await?;
+        addresses.extend(rows);
+    }
 
     let mut subnet_counts: HashMap<String, u64> = HashMap::new();
     for addr in addresses {

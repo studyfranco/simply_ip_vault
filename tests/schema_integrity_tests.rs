@@ -2656,3 +2656,60 @@ struct LegacyRecordTimes {
     created: time::PrimitiveDateTime,
     updated: time::PrimitiveDateTime,
 }
+
+#[tokio::test]
+async fn wave3_stats_and_causes_query_plans_use_covering_indexes() {
+    let tmp = TempDb::new();
+    let db = fresh_db(&tmp).await;
+
+    let plan_lines = |sql: &'static str| {
+        let db = db.clone();
+        async move {
+            db.query_all_raw(Statement::from_string(DatabaseBackend::Sqlite, sql))
+                .await
+                .expect("EXPLAIN QUERY PLAN runs")
+                .into_iter()
+                .map(|row| row.try_get::<String>("", "detail").unwrap_or_default())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    for (label, sql) in [
+        (
+            "compute_velocity active",
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) AS cnt FROM ip_record_group_memberships WHERE is_deleted = 0 AND last_seen_at >= '2026-01-01 00:00:00'",
+        ),
+        (
+            "compute_velocity deleted",
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) AS cnt FROM ip_record_group_memberships WHERE is_deleted = 1 AND deleted_at >= '2026-01-01 00:00:00'",
+        ),
+        (
+            "locked_count",
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) AS cnt FROM ip_record_group_memberships WHERE is_deleted = 0 AND is_locked = 1",
+        ),
+    ] {
+        let plan = plan_lines(sql).await.join(" | ");
+        assert!(
+            plan.contains("USING COVERING INDEX"),
+            "{label} must use a covering index, got: {plan}"
+        );
+        assert!(
+            !plan.contains("SUBQUERY") && !plan.contains("CO-ROUTINE"),
+            "{label} must not allocate a subquery or co-routine, got: {plan}"
+        );
+    }
+
+    let causes_plan = plan_lines(
+        "EXPLAIN QUERY PLAN SELECT created_at, cause FROM ip_record_causes WHERE membership_id = '00000000-0000-0000-0000-000000000000' ORDER BY created_at DESC LIMIT 3",
+    )
+    .await
+    .join(" | ");
+    assert!(
+        causes_plan.contains("USING COVERING INDEX idx_causes_membership_created"),
+        "latest_causes_by_ip must use covering index idx_causes_membership_created, got: {causes_plan}"
+    );
+    assert!(
+        !causes_plan.contains("USE TEMP B-TREE"),
+        "latest_causes_by_ip must not use TEMP B-TREE, got: {causes_plan}"
+    );
+}

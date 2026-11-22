@@ -306,6 +306,7 @@ mod tests {
             "m20261119_120000_widen_variable_length_columns",
             "m20261119_130000_add_ip_group_ban_policy",
             "m20261119_140000_add_membership_lookup_indexes",
+            "m20261122_120000_cover_causes_latest_lookup",
         ];
         let migrations = Migrator::migrations();
         assert_eq!(

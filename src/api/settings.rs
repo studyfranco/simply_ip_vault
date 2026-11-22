@@ -66,42 +66,12 @@ pub struct SettingsResponse {
     pub audit_log_count: u64,
 }
 
-/// Handles `GET /api/settings`. Master-only.
-pub async fn get_settings(
-    State(state): State<AppState>,
-    Extension(caller): Extension<api_key::Model>,
-) -> Result<impl IntoResponse, AppError> {
-    if !caller.is_master {
-        return Err(AppError::Forbidden(
-            "System settings are visible to the Master key only".to_owned(),
-        ));
-    }
+fn overlay_live_flags(state: &AppState, mut response: SettingsResponse) -> SettingsResponse {
+    response.normalize_ipv6_to_48 = state.is_ipv6_48_normalization_enabled();
+    response
+}
 
-    // Fast check: return cached settings if fresh (< 120s / 2 minutes).
-    // Prevents repeated expensive full table counts when multiple tabs or dashboard pollers refresh.
-    {
-        let cache_read = state.settings_cache.read().await;
-        if let Some((ts, payload)) = &*cache_read
-            && ts.elapsed() < std::time::Duration::from_secs(120)
-        {
-            return Ok(Json(payload.clone()).into_response());
-        }
-    }
-
-    // Acquire singleflight lock to serialize concurrent settings requests
-    // and prevent database lock contention / disk cache thrashing.
-    let _singleflight_guard = state.settings_lock.lock().await;
-
-    // Double-checked locking: check cache again after acquiring lock.
-    {
-        let cache_read = state.settings_cache.read().await;
-        if let Some((ts, payload)) = &*cache_read
-            && ts.elapsed() < std::time::Duration::from_secs(120)
-        {
-            return Ok(Json(payload.clone()).into_response());
-        }
-    }
-
+async fn compute_and_cache_settings(state: &AppState) -> Result<SettingsResponse, AppError> {
     let ip_record_count = count_entity::<ip_record::Entity, _>(&state.db).await?;
     let ip_group_count = count_entity::<ip_group::Entity, _>(&state.db).await?;
     let api_key_count = count_entity::<api_key::Entity, _>(&state.db).await?;
@@ -138,6 +108,64 @@ pub async fn get_settings(
         *cache_write = Some((std::time::Instant::now(), response.clone()));
     }
 
+    Ok(response)
+}
+
+/// Handles `GET /api/settings`. Master-only.
+pub async fn get_settings(
+    State(state): State<AppState>,
+    Extension(caller): Extension<api_key::Model>,
+) -> Result<impl IntoResponse, AppError> {
+    if !caller.is_master {
+        return Err(AppError::Forbidden(
+            "System settings are visible to the Master key only".to_owned(),
+        ));
+    }
+
+    // Fast path with Stale-While-Revalidate (SWR): if a cached snapshot exists, overlay live
+    // runtime flags and return immediately. When older than `SETTINGS_CACHE_TTL`, trigger a
+    // detached singleflight background refresh without blocking the HTTP response.
+    {
+        let cache_read = state.settings_cache.read().await;
+        if let Some((ts, payload)) = &*cache_read {
+            let response = overlay_live_flags(&state, payload.clone());
+            if ts.elapsed() >= crate::state::SETTINGS_CACHE_TTL
+                && let Ok(guard) = state.settings_lock.clone().try_lock_owned()
+            {
+                let state_clone = state.clone();
+                tokio::spawn(async move {
+                    let _guard = guard;
+                    if let Err(e) = compute_and_cache_settings(&state_clone).await {
+                        tracing::warn!("Background settings refresh failed: {e}");
+                    }
+                });
+            }
+            return Ok(Json(response).into_response());
+        }
+    }
+
+    // Cold cache: acquire singleflight lock to serialize concurrent initial computations.
+    let singleflight_guard = state.settings_lock.clone().lock_owned().await;
+
+    // Double-checked locking: check cache again after acquiring lock.
+    {
+        let cache_read = state.settings_cache.read().await;
+        if let Some((_, payload)) = &*cache_read {
+            return Ok(Json(overlay_live_flags(&state, payload.clone())).into_response());
+        }
+    }
+
+    let state_clone = state.clone();
+    let handle = tokio::spawn(async move {
+        let _guard = singleflight_guard;
+        compute_and_cache_settings(&state_clone).await
+    });
+
+    let response = handle.await.map_err(|e| {
+        tracing::error!("Settings background task failed: {e}");
+        AppError::Internal
+    })??;
+
     Ok(Json(response).into_response())
 }
 
@@ -149,8 +177,9 @@ pub struct UpdateSettingsPayload {
     pub normalize_ipv6_to_48: bool,
 }
 
-/// Handles `PUT /api/settings`. Master-only: updates toggleable runtime flags and clears the
-/// cached `GET /api/settings` snapshot so callers immediately observe the change.
+/// Handles `PUT /api/settings`. Master-only: updates toggleable runtime flags and updates the
+/// cached `GET /api/settings` snapshot in-place so callers immediately observe the change without
+/// forcing a full-table `COUNT(*)` recomputation.
 pub async fn update_settings(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
@@ -166,7 +195,9 @@ pub async fn update_settings(
     state.set_ipv6_48_normalization(payload.normalize_ipv6_to_48);
     {
         let mut cache_write = state.settings_cache.write().await;
-        *cache_write = None;
+        if let Some((_, cached)) = cache_write.as_mut() {
+            cached.normalize_ipv6_to_48 = payload.normalize_ipv6_to_48;
+        }
     }
 
     create_audit_log(
@@ -266,7 +297,7 @@ mod tests {
         assert!(matches!(err, AppError::Forbidden(_)));
         assert!(state.is_ipv6_48_normalization_enabled());
 
-        // Master toggles setting and invalidates cache
+        // Master toggles setting and updates cached snapshot in-place
         let _ = update_settings(
             State(state.clone()),
             Extension(master_key.clone()),
@@ -280,7 +311,17 @@ mod tests {
         .await
         .unwrap();
         assert!(!state.is_ipv6_48_normalization_enabled());
-        assert!(state.settings_cache.read().await.is_none());
+        assert!(state.settings_cache.read().await.is_some());
+        assert!(
+            !state
+                .settings_cache
+                .read()
+                .await
+                .as_ref()
+                .unwrap()
+                .1
+                .normalize_ipv6_to_48
+        );
 
         let _ = get_settings(State(state.clone()), Extension(master_key))
             .await
@@ -294,5 +335,101 @@ mod tests {
             .1
             .clone();
         assert!(!refreshed.normalize_ipv6_to_48);
+    }
+
+    #[tokio::test]
+    async fn settings_swr_serves_stale_immediately_and_refreshes_in_background() {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        crate::migration::Migrator::up(&db, None).await.unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(10);
+        let state = AppState::new(db.clone(), tx).unwrap();
+
+        let now = crate::time_serde::now_utc();
+        let master_key = api_key::ActiveModel {
+            id: Set(uuid::Uuid::new_v4()),
+            name: Set("swr-master".to_owned()),
+            key_hash: Set("hash-swr".to_owned()),
+            signing_secret: Set(None),
+            prefix: Set("prefswr1".to_owned()),
+            bound_ips: Set(None),
+            is_master: Set(true),
+            can_manage_keys: Set(true),
+            can_manage_webhooks: Set(true),
+            can_create_groups: Set(true),
+            parent_key_id: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        let _ = get_settings(State(state.clone()), Extension(master_key.clone()))
+            .await
+            .unwrap();
+
+        // Add a group after the cache was populated, then mark the cached snapshot stale.
+        ip_group::ActiveModel {
+            id: Set(uuid::Uuid::new_v4()),
+            name: Set("swr-test-group".to_owned()),
+            group_type: Set("blacklist".to_owned()),
+            description: Set(None),
+            allow_private_ips: Set(false),
+            owner_key_id: Set(None),
+            created_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        {
+            let mut cache_write = state.settings_cache.write().await;
+            let (ts, _) = cache_write.as_mut().unwrap();
+            *ts = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(600))
+                .unwrap();
+        }
+        state.set_ipv6_48_normalization(false);
+
+        let resp = get_settings(State(state.clone()), Extension(master_key))
+            .await
+            .unwrap()
+            .into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Immediate stale response still has old group count (0) but live flag overlaid (false).
+        assert_eq!(json["ip_group_count"], 0);
+        assert_eq!(json["normalize_ipv6_to_48"], false);
+
+        for _ in 0..50 {
+            if state
+                .settings_cache
+                .read()
+                .await
+                .as_ref()
+                .unwrap()
+                .1
+                .ip_group_count
+                == 1
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            state
+                .settings_cache
+                .read()
+                .await
+                .as_ref()
+                .unwrap()
+                .1
+                .ip_group_count,
+            1
+        );
     }
 }

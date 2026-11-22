@@ -771,13 +771,14 @@ struct BanPolicyApi {
     db: DatabaseConnection,
     key: String,
     timestamp: i64,
+    webhook_rx: tokio::sync::mpsc::Receiver<simply_ip_vault::state::WebhookEvent>,
 }
 
 impl BanPolicyApi {
     async fn new(normalize_ipv6: bool) -> Self {
         let db = setup_test_db().await;
         let key = insert_master_key(&db, "Policy administrator").await;
-        let (webhook_tx, _rx) = tokio::sync::mpsc::channel(32);
+        let (webhook_tx, webhook_rx) = tokio::sync::mpsc::channel(64);
         let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new())
             .with_ipv6_48_normalization(normalize_ipv6);
         Self {
@@ -785,7 +786,16 @@ impl BanPolicyApi {
             db,
             key,
             timestamp: time::OffsetDateTime::now_utc().unix_timestamp(),
+            webhook_rx,
         }
+    }
+
+    fn drain_webhooks(&mut self) -> Vec<simply_ip_vault::state::WebhookEvent> {
+        let mut events = Vec::new();
+        while let Ok(ev) = self.webhook_rx.try_recv() {
+            events.push(ev);
+        }
+        events
     }
 
     async fn call(
@@ -1137,7 +1147,7 @@ async fn exclusions_cover_both_cidr_directions_and_ipv6_storage() {
 
 #[tokio::test]
 async fn full_replace_excludes_protected_bans_and_keeps_processing_the_batch() {
-    use serde_json::json;
+    use serde_json::{Value, json};
     use simply_ip_vault::entities::audit_log;
     let mut api = BanPolicyApi::new(false).await;
     let white = api.group("trusted", "whitelist").await;
@@ -1153,6 +1163,20 @@ async fn full_replace_excludes_protected_bans_and_keeps_processing_the_batch() {
     api.record("/api/ban", "protected", "8.8.8.8", StatusCode::OK)
         .await;
     api.record("/api/white", "trusted", "8.8.8.0/24", StatusCode::OK)
+        .await;
+    // Retroactive purge: 8.8.8.8 is already soft-deleted right after POST /api/white.
+    let active_after_white = api
+        .call(
+            "GET",
+            "/api/ips?group_name=protected",
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(active_after_white.as_array().unwrap().len(), 0);
+
+    // Add a non-excluded IP so full_replace still exercises soft-deleting an omitted active ban.
+    api.record("/api/ban", "protected", "2.2.2.2", StatusCode::OK)
         .await;
     let summary = api
         .call(
@@ -1181,6 +1205,192 @@ async fn full_replace_excludes_protected_bans_and_keeps_processing_the_batch() {
             .unwrap()
             .contains("skipped_excluded=1")
     );
+}
+
+#[tokio::test]
+async fn linking_whitelist_to_existing_banlist_purges_overlapping_bans_and_emits_webhooks() {
+    use serde_json::{Value, json};
+
+    let mut api = BanPolicyApi::new(true).await;
+    let white = api.group("trusted", "whitelist").await;
+    let ban = api.group("ban", "banlist").await;
+    let other_ban = api.group("other-ban", "banlist").await;
+
+    // Seed overlapping bans before linking the whitelist.
+    for addr in [
+        "8.8.8.8",           // exact IPv4
+        "1.1.1.42",          // inside whitelisted 1.1.1.0/24
+        "45.33.0.0/16",      // supernet containing whitelisted 45.33.10.5
+        "2606:4700:1111::1", // stored as 2606:4700:1111::/48
+        "9.9.9.9",           // non-overlapping control
+    ] {
+        api.record("/api/ban", "ban", addr, StatusCode::OK).await;
+    }
+    api.record("/api/ban", "other-ban", "8.8.8.8", StatusCode::OK)
+        .await;
+
+    // Seed whitelist entries.
+    for addr in ["8.8.8.8", "1.1.1.0/24", "45.33.10.5", "2606:4700:1111::/48"] {
+        api.record("/api/white", "trusted", addr, StatusCode::OK)
+            .await;
+    }
+    let _ = api.drain_webhooks();
+
+    // Link whitelist to `ban` via PUT /api/groups/{id}.
+    let ban_id = ban["id"].as_str().unwrap();
+    api.call(
+        "PUT",
+        &format!("/api/groups/{ban_id}"),
+        json!({"excluded_whitelist_ids":[white["id"]]}),
+        StatusCode::OK,
+    )
+    .await;
+
+    let active_ban = api
+        .call(
+            "GET",
+            "/api/ips?group_name=ban",
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    let active_addrs: Vec<&str> = active_ban
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["target_address"].as_str().unwrap())
+        .collect();
+    assert_eq!(active_addrs, vec!["9.9.9.9"]);
+
+    // Unlinked banlist is untouched.
+    let active_other = api
+        .call(
+            "GET",
+            "/api/ips?group_name=other-ban",
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(active_other.as_array().unwrap().len(), 1);
+    assert_eq!(
+        active_other.as_array().unwrap()[0]["target_address"],
+        "8.8.8.8"
+    );
+
+    // Check IP_DELETE webhooks emitted for each purged ban.
+    let events = api.drain_webhooks();
+    let delete_addrs: std::collections::BTreeSet<String> = events
+        .iter()
+        .filter(|e| e.action == "IP_DELETE" && !e.is_whitelist)
+        .map(|e| e.address.clone())
+        .collect();
+    assert_eq!(
+        delete_addrs,
+        ["1.1.1.42", "2606:4700:1111::/48", "45.33.0.0/16", "8.8.8.8",]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    );
+    for ev in events.iter().filter(|e| e.action == "IP_DELETE") {
+        assert_eq!(ev.group_name.as_deref(), Some("ban"));
+        assert_eq!(ev.cause.as_deref(), Some("Excluded by whitelist trusted"));
+    }
+    let _ = other_ban;
+}
+
+#[tokio::test]
+async fn whitelisting_ip_batch_and_restore_retroactively_purge_linked_banlists() {
+    use serde_json::{Value, json};
+
+    let mut api = BanPolicyApi::new(false).await;
+    let white = api.group("trusted", "whitelist").await;
+    api.call(
+        "POST",
+        "/api/groups",
+        json!({"name":"ban", "excluded_whitelist_ids":[white["id"]]}),
+        StatusCode::OK,
+    )
+    .await;
+
+    // 1. POST /api/white retroactively purges existing ban + emits IP_DELETE webhook.
+    api.record("/api/ban", "ban", "8.8.8.8", StatusCode::OK)
+        .await;
+    let _ = api.drain_webhooks();
+    api.record("/api/white", "trusted", "8.8.8.8", StatusCode::OK)
+        .await;
+    let active = api
+        .call(
+            "GET",
+            "/api/ips?group_name=ban",
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(active.as_array().unwrap().len(), 0);
+    let events = api.drain_webhooks();
+    assert!(events.iter().any(|e| {
+        e.action == "IP_DELETE"
+            && e.address == "8.8.8.8"
+            && !e.is_whitelist
+            && e.group_name.as_deref() == Some("ban")
+            && e.cause.as_deref() == Some("Excluded by whitelist trusted")
+    }));
+
+    // 2. POST /api/records/batch on whitelist retroactively purges overlapping ban + emits IP_DELETE.
+    api.record("/api/ban", "ban", "1.1.1.5", StatusCode::OK)
+        .await;
+    let _ = api.drain_webhooks();
+    api.call(
+        "POST",
+        "/api/records/batch",
+        json!({
+            "group_name":"trusted",
+            "mode":"upsert",
+            "records":[{"target_address":"1.1.1.0/24"}]
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let active = api
+        .call(
+            "GET",
+            "/api/ips?group_name=ban",
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(active.as_array().unwrap().len(), 0);
+    let events = api.drain_webhooks();
+    assert!(events.iter().any(|e| {
+        e.action == "IP_DELETE" && e.address == "1.1.1.5" && e.group_name.as_deref() == Some("ban")
+    }));
+
+    // 3. POST /api/ips/restore on whitelist retroactively purges overlapping ban + emits IP_DELETE.
+    api.record("/api/white", "trusted", "9.9.9.9", StatusCode::OK)
+        .await;
+    api.record("/api/ips", "trusted", "9.9.9.9", StatusCode::NO_CONTENT)
+        .await;
+    api.record("/api/ban", "ban", "9.9.9.9", StatusCode::OK)
+        .await;
+    let _ = api.drain_webhooks();
+    api.record("/api/ips/restore", "trusted", "9.9.9.9", StatusCode::OK)
+        .await;
+    let active = api
+        .call(
+            "GET",
+            "/api/ips?group_name=ban",
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(active.as_array().unwrap().len(), 0);
+    let events = api.drain_webhooks();
+    assert!(events.iter().any(|e| {
+        e.action == "IP_DELETE"
+            && e.address == "9.9.9.9"
+            && e.group_name.as_deref() == Some("ban")
+            && e.cause.as_deref() == Some("Excluded by whitelist trusted")
+    }));
 }
 
 #[tokio::test]

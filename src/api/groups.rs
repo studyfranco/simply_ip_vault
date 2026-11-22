@@ -314,12 +314,27 @@ pub async fn update_ip_group(
         .update(&txn)
         .await
         .map_err(|err| group_write_error(err, &name))?;
+    let mut purge_events = Vec::new();
     if payload.excluded_whitelist_ids.is_some() {
+        let has_exclusions = !excluded_ids.is_empty();
         ip_group_exclusion::Entity::delete_many()
             .filter(ip_group_exclusion::Column::GroupId.eq(id))
             .exec(&txn)
             .await?;
         insert_exclusions(&txn, id, excluded_ids).await?;
+        if has_exclusions && group.group_type != "whitelist" {
+            let protected = super::records::load_protected_networks(&txn, id).await?;
+            purge_events = super::records::purge_excluded_bans_for_networks(
+                &txn,
+                &key,
+                client_ip.0,
+                &[(group.id, group.name.clone())],
+                &protected,
+                crate::time_serde::now_utc(),
+                false,
+            )
+            .await?;
+        }
     }
     create_audit_log(
         &txn,
@@ -336,6 +351,9 @@ pub async fn update_ip_group(
         .pop()
         .ok_or(AppError::Internal)?;
     state.commit_membership_write(txn).await?;
+    for event in purge_events {
+        state.enqueue_webhook(event);
+    }
     Ok(Json(response))
 }
 
