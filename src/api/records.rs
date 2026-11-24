@@ -135,34 +135,76 @@ pub(crate) async fn load_protected_networks(
     db: &impl ConnectionTrait,
     group_id: Uuid,
 ) -> Result<Vec<(IpNet, String)>, AppError> {
-    let rows = ip_group_exclusion::Entity::find()
+    let excluded_groups = ip_group_exclusion::Entity::find()
         .select_only()
-        .column(ip_record::Column::TargetAddress)
+        .column(ip_group_exclusion::Column::ExcludedGroupId)
         .column(ip_group::Column::Name)
         .join(
             JoinType::InnerJoin,
             ip_group_exclusion::Relation::ExcludedGroup.def(),
         )
-        .join(
-            JoinType::InnerJoin,
-            ip_group::Relation::IpRecordGroupMembership.def(),
-        )
-        .join(
-            JoinType::InnerJoin,
-            ip_record_group_membership::Relation::IpRecord.def(),
-        )
         .filter(ip_group_exclusion::Column::GroupId.eq(group_id))
-        .filter(ip_record_group_membership::Column::IsDeleted.eq(false))
-        .into_tuple::<(String, String)>()
+        .into_tuple::<(Uuid, String)>()
         .all(db)
         .await?;
-    rows.into_iter()
-        .map(|(address, name)| {
+    if excluded_groups.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut memberships_by_group: Vec<(String, Vec<Uuid>)> =
+        Vec::with_capacity(excluded_groups.len());
+    let mut unique_record_ids: Vec<Uuid> = Vec::new();
+    let mut seen_record_ids: HashSet<Uuid> = HashSet::new();
+
+    for (excluded_group_id, group_name) in excluded_groups {
+        let record_ids = ip_record_group_membership::Entity::find()
+            .select_only()
+            .column(ip_record_group_membership::Column::IpRecordId)
+            .filter(ip_record_group_membership::Column::GroupId.eq(excluded_group_id))
+            .filter(ip_record_group_membership::Column::IsDeleted.eq(false))
+            .into_tuple::<Uuid>()
+            .all(db)
+            .await?;
+        for &record_id in &record_ids {
+            if seen_record_ids.insert(record_id) {
+                unique_record_ids.push(record_id);
+            }
+        }
+        memberships_by_group.push((group_name, record_ids));
+    }
+
+    if unique_record_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut networks_by_id: HashMap<Uuid, IpNet> = HashMap::with_capacity(unique_record_ids.len());
+    for chunk in unique_record_ids.chunks(500) {
+        let rows = ip_record::Entity::find()
+            .select_only()
+            .column(ip_record::Column::Id)
+            .column(ip_record::Column::TargetAddress)
+            .filter(ip_record::Column::Id.is_in(chunk.iter().copied()))
+            .into_tuple::<(Uuid, String)>()
+            .all(db)
+            .await?;
+        for (id, address) in rows {
             let network =
                 super::support::parse_cidr_or_ip(&address).map_err(|()| AppError::Internal)?;
-            Ok((network, name))
-        })
-        .collect()
+            networks_by_id.insert(id, network);
+        }
+    }
+
+    let mut protected = Vec::new();
+    for (group_name, record_ids) in memberships_by_group {
+        for record_id in record_ids {
+            let network = networks_by_id
+                .get(&record_id)
+                .copied()
+                .ok_or(AppError::Internal)?;
+            protected.push((network, group_name.clone()));
+        }
+    }
+    Ok(protected)
 }
 
 fn matching_whitelists(
@@ -334,20 +376,34 @@ async fn find_matching_excluded_records(
 
     let mut candidates: HashMap<Uuid, String> = HashMap::new();
     if needs_full_banlist_scan {
-        let rows = ip_record_group_membership::Entity::find()
-            .select_only()
-            .column(ip_record::Column::Id)
-            .column(ip_record::Column::TargetAddress)
-            .join(
-                JoinType::InnerJoin,
-                ip_record_group_membership::Relation::IpRecord.def(),
-            )
-            .filter(ip_record_group_membership::Column::IsDeleted.eq(false))
-            .filter(ip_record_group_membership::Column::GroupId.is_in(banlist_ids.iter().copied()))
-            .into_tuple::<(Uuid, String)>()
-            .all(txn)
-            .await?;
-        candidates.extend(rows);
+        let mut unique_record_ids: Vec<Uuid> = Vec::new();
+        let mut seen_record_ids: HashSet<Uuid> = HashSet::new();
+        for &banlist_id in banlist_ids {
+            let record_ids = ip_record_group_membership::Entity::find()
+                .select_only()
+                .column(ip_record_group_membership::Column::IpRecordId)
+                .filter(ip_record_group_membership::Column::GroupId.eq(banlist_id))
+                .filter(ip_record_group_membership::Column::IsDeleted.eq(false))
+                .into_tuple::<Uuid>()
+                .all(txn)
+                .await?;
+            for record_id in record_ids {
+                if seen_record_ids.insert(record_id) {
+                    unique_record_ids.push(record_id);
+                }
+            }
+        }
+        for chunk in unique_record_ids.chunks(500) {
+            let rows = ip_record::Entity::find()
+                .select_only()
+                .column(ip_record::Column::Id)
+                .column(ip_record::Column::TargetAddress)
+                .filter(ip_record::Column::Id.is_in(chunk.iter().copied()))
+                .into_tuple::<(Uuid, String)>()
+                .all(txn)
+                .await?;
+            candidates.extend(rows);
+        }
     } else {
         let exact_vec: Vec<String> = exact_candidates.into_iter().collect();
         for chunk in exact_vec.chunks(500) {

@@ -8,8 +8,9 @@
 //! 4. API keys listing: Batched permission loading vs N+1 queries.
 
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Statement,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
+    EntityTrait, JoinType, QueryFilter, QueryOrder, QuerySelect, QueryTrait, RelationTrait,
+    Statement,
 };
 use simply_ip_vault::migration::MigratorTrait;
 use std::time::Instant;
@@ -17,7 +18,8 @@ use time::Duration;
 use uuid::Uuid;
 
 use simply_ip_vault::entities::{
-    api_key, api_key_group_permission, audit_log, ip_group, webhook_config, webhook_execution,
+    api_key, api_key_group_permission, audit_log, ip_group, ip_group_exclusion, ip_record,
+    ip_record_group_membership, webhook_config, webhook_execution,
 };
 
 /// Boots an in-memory SQLite database up to a specific migration step, or all if `None`.
@@ -457,4 +459,402 @@ async fn time_batched_key_listing(db: &DatabaseConnection) -> std::time::Duratio
         .collect();
     assert_eq!(summaries.len(), 50);
     started.elapsed()
+}
+
+struct ExclusionBenchFixture {
+    ban_group: Uuid,
+    wl_alpha: Uuid,
+    wl_beta: Uuid,
+    shared_record: Uuid,
+    alpha_record: Uuid,
+}
+
+async fn seed_exclusion_join_benchmark(db: &DatabaseConnection) -> ExclusionBenchFixture {
+    let ban_group = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    let wl_alpha = Uuid::parse_str("00000000-0000-0000-0000-000000000011").unwrap();
+    let wl_beta = Uuid::parse_str("00000000-0000-0000-0000-000000000012").unwrap();
+    let now = simply_ip_vault::time_serde::now_utc();
+
+    let stmts = [
+        "INSERT INTO ip_groups (id, name, group_type, allow_private_ips, description, owner_key_id, created_at)
+         WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM g WHERE n < 10)
+         SELECT unhex(printf('%032x', n)), 'ban-group-' || n, 'banlist', 0, NULL, NULL, datetime('now') FROM g",
+        "INSERT INTO ip_records (id, target_address, created_at)
+         WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n < 50000)
+         SELECT unhex(printf('%032x', n)), printf('198.18.%d.%d', (n>>8)&255, n&255), datetime('now') FROM s",
+        "INSERT INTO ip_record_group_memberships
+            (id, ip_record_id, group_id, is_locked, created_at, last_seen_at, is_deleted, deleted_at, deleted_by)
+         WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n < 50000)
+         SELECT unhex(printf('%032x', n + 1000000)),
+                unhex(printf('%032x', n)),
+                unhex(printf('%032x', (n % 10) + 1)),
+                0, datetime('now'), datetime('now'), 0, NULL, NULL
+         FROM s",
+    ];
+    for sql in stmts {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+
+    for (id, name) in [(wl_alpha, "wl-alpha"), (wl_beta, "wl-beta")] {
+        ip_group::Entity::insert(ip_group::ActiveModel {
+            id: sea_orm::Set(id),
+            name: sea_orm::Set(name.to_owned()),
+            allow_private_ips: sea_orm::Set(false),
+            group_type: sea_orm::Set("whitelist".to_owned()),
+            description: sea_orm::Set(None),
+            owner_key_id: sea_orm::Set(None),
+            created_at: sea_orm::Set(now),
+        })
+        .exec(db)
+        .await
+        .unwrap();
+    }
+
+    let alpha_record = Uuid::new_v4();
+    let shared_record = Uuid::new_v4();
+    for (rid, addr) in [
+        (alpha_record, "203.10.10.0/24"),
+        (shared_record, "203.10.20.5"),
+    ] {
+        ip_record::Entity::insert(ip_record::ActiveModel {
+            id: sea_orm::Set(rid),
+            target_address: sea_orm::Set(addr.to_owned()),
+            created_at: sea_orm::Set(now),
+        })
+        .exec(db)
+        .await
+        .unwrap();
+    }
+    for (rid, gid) in [
+        (alpha_record, wl_alpha),
+        (shared_record, wl_alpha),
+        (shared_record, wl_beta),
+    ] {
+        ip_record_group_membership::Entity::insert(ip_record_group_membership::ActiveModel {
+            id: sea_orm::Set(Uuid::new_v4()),
+            ip_record_id: sea_orm::Set(rid),
+            group_id: sea_orm::Set(gid),
+            is_locked: sea_orm::Set(false),
+            created_at: sea_orm::Set(now),
+            last_seen_at: sea_orm::Set(now),
+            is_deleted: sea_orm::Set(false),
+            deleted_at: sea_orm::Set(None),
+            deleted_by: sea_orm::Set(None),
+        })
+        .exec(db)
+        .await
+        .unwrap();
+    }
+
+    ExclusionBenchFixture {
+        ban_group,
+        wl_alpha,
+        wl_beta,
+        shared_record,
+        alpha_record,
+    }
+}
+
+async fn assert_load_protected_networks_query_plans(
+    db: &DatabaseConnection,
+    fx: &ExclusionBenchFixture,
+    phase: &str,
+) {
+    let step1_stmt = ip_group_exclusion::Entity::find()
+        .select_only()
+        .column(ip_group_exclusion::Column::ExcludedGroupId)
+        .column(ip_group::Column::Name)
+        .join(
+            JoinType::InnerJoin,
+            ip_group_exclusion::Relation::ExcludedGroup.def(),
+        )
+        .filter(ip_group_exclusion::Column::GroupId.eq(fx.ban_group))
+        .build(DatabaseBackend::Sqlite);
+    let step1_plan = db
+        .query_all_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            format!("EXPLAIN QUERY PLAN {}", step1_stmt.sql),
+            step1_stmt.values.map_or_else(Vec::new, |v| v.0),
+        ))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.try_get::<String>("", "detail").unwrap())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    println!("load_protected_networks Step 1 plan ({phase}): {step1_plan}");
+    assert!(
+        step1_plan.contains("SEARCH ip_group_exclusions USING"),
+        "Step 1 must seek ip_group_exclusions via index ({phase}): {step1_plan}"
+    );
+    assert!(
+        !step1_plan.contains("ip_record_group_memberships") && !step1_plan.contains("ip_records"),
+        "Step 1 must NEVER reference ip_record_group_memberships or ip_records ({phase}): {step1_plan}"
+    );
+
+    let step2_stmt = ip_record_group_membership::Entity::find()
+        .select_only()
+        .column(ip_record_group_membership::Column::IpRecordId)
+        .filter(ip_record_group_membership::Column::GroupId.eq(fx.wl_alpha))
+        .filter(ip_record_group_membership::Column::IsDeleted.eq(false))
+        .build(DatabaseBackend::Sqlite);
+    let step2_plan = db
+        .query_all_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            format!("EXPLAIN QUERY PLAN {}", step2_stmt.sql),
+            step2_stmt.values.map_or_else(Vec::new, |v| v.0),
+        ))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.try_get::<String>("", "detail").unwrap())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    println!("load_protected_networks Step 2 membership plan ({phase}): {step2_plan}");
+    assert!(
+        step2_plan.contains("SEARCH ip_record_group_memberships USING COVERING INDEX")
+            && (step2_plan.contains("(group_id=? AND is_deleted=?)")
+                || step2_plan.contains("(is_deleted=? AND group_id=?)")),
+        "Step 2 must use covering index on (group_id, is_deleted) ({phase}): {step2_plan}"
+    );
+    assert!(
+        !step2_plan.contains("SCAN ip_record_group_memberships"),
+        "Step 2 must NEVER scan ip_record_group_memberships ({phase}): {step2_plan}"
+    );
+
+    let pk_stmt = ip_record::Entity::find()
+        .select_only()
+        .column(ip_record::Column::Id)
+        .column(ip_record::Column::TargetAddress)
+        .filter(ip_record::Column::Id.is_in([fx.alpha_record, fx.shared_record]))
+        .build(DatabaseBackend::Sqlite);
+    let pk_plan = db
+        .query_all_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            format!("EXPLAIN QUERY PLAN {}", pk_stmt.sql),
+            pk_stmt.values.map_or_else(Vec::new, |v| v.0),
+        ))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.try_get::<String>("", "detail").unwrap())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    println!("load_protected_networks Step 2 record PK plan ({phase}): {pk_plan}");
+    assert!(
+        pk_plan.contains("SEARCH ip_records USING INDEX") && !pk_plan.contains("SCAN ip_records"),
+        "Step 2 record batch lookup must use PK index ({phase}): {pk_plan}"
+    );
+}
+
+fn signed_ban_request(
+    key: &str,
+    secret: &str,
+    target_address: &str,
+    group_name: &str,
+    ts_offset: i64,
+) -> axum::http::Request<axum::body::Body> {
+    let body = serde_json::json!({
+        "target_address": target_address,
+        "group_name": group_name,
+        "cause": "exclusion bench"
+    })
+    .to_string();
+    let ts = (time::OffsetDateTime::now_utc().unix_timestamp() + ts_offset).to_string();
+    let sig = simply_ip_vault::crypto::compute_signature(
+        secret,
+        "POST",
+        "/api/ban",
+        &ts,
+        body.as_bytes(),
+    )
+    .unwrap();
+    axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("Content-Type", "application/json")
+        .header("X-API-Key", key)
+        .header("X-Timestamp", ts)
+        .header("X-Signature-256", sig)
+        .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            8080,
+        ))))
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
+async fn seed_bench_master_key(db: &DatabaseConnection) -> (String, String) {
+    let key = "exbench000000000000000000000000000000000000000000000000000000001".to_owned();
+    let secret = format!("signing-secret-for-{key}");
+    api_key::ActiveModel {
+        id: sea_orm::Set(Uuid::new_v4()),
+        key_hash: sea_orm::Set(simply_ip_vault::api::hash_key(&key)),
+        signing_secret: sea_orm::Set(Some(format!("v1.plain.{}", hex::encode(&secret)))),
+        name: sea_orm::Set("Exclusion Bench Master".to_owned()),
+        bound_ips: sea_orm::Set(None),
+        is_master: sea_orm::Set(true),
+        can_manage_keys: sea_orm::Set(true),
+        can_manage_webhooks: sea_orm::Set(true),
+        can_create_groups: sea_orm::Set(true),
+        parent_key_id: sea_orm::Set(None),
+        prefix: sea_orm::Set("exbench0".to_owned()),
+        created_at: sea_orm::Set(simply_ip_vault::time_serde::now_utc()),
+        updated_at: sea_orm::Set(simply_ip_vault::time_serde::now_utc()),
+    }
+    .insert(db)
+    .await
+    .unwrap();
+    (key, secret)
+}
+
+async fn assert_excluded_whitelist_ban_enforcement(
+    db: &DatabaseConnection,
+    app: &axum::Router,
+    fx: &ExclusionBenchFixture,
+    key: &str,
+    secret: &str,
+) {
+    use tower::ServiceExt as _;
+
+    let max_ban_budget = std::time::Duration::from_millis(50);
+    let t2 = Instant::now();
+    let ok_res = app
+        .clone()
+        .oneshot(signed_ban_request(
+            key,
+            secret,
+            "203.10.99.9",
+            "ban-group-1",
+            4,
+        ))
+        .await
+        .unwrap();
+    let elapsed_one_ok = t2.elapsed();
+    assert_eq!(ok_res.status(), axum::http::StatusCode::OK);
+    assert!(
+        elapsed_one_ok < max_ban_budget,
+        "POST /api/ban with 1 excluded whitelist took {elapsed_one_ok:?}"
+    );
+
+    let t3 = Instant::now();
+    let conflict_res = app
+        .clone()
+        .oneshot(signed_ban_request(
+            key,
+            secret,
+            "203.10.10.42",
+            "ban-group-1",
+            6,
+        ))
+        .await
+        .unwrap();
+    let elapsed_one_conflict = t3.elapsed();
+    assert_eq!(conflict_res.status(), axum::http::StatusCode::CONFLICT);
+    assert!(
+        elapsed_one_conflict < max_ban_budget,
+        "POST /api/ban conflict check with 1 excluded whitelist took {elapsed_one_conflict:?}"
+    );
+
+    ip_group_exclusion::ActiveModel {
+        group_id: sea_orm::Set(fx.ban_group),
+        excluded_group_id: sea_orm::Set(fx.wl_beta),
+    }
+    .insert(db)
+    .await
+    .unwrap();
+    let multi_res = app
+        .clone()
+        .oneshot(signed_ban_request(
+            key,
+            secret,
+            "203.10.20.5",
+            "ban-group-1",
+            8,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(multi_res.status(), axum::http::StatusCode::CONFLICT);
+    let body_bytes = axum::body::to_bytes(multi_res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_text = String::from_utf8_lossy(&body_bytes);
+    assert!(
+        body_text.contains("wl-alpha, wl-beta"),
+        "Shared IP across multiple excluded whitelists must report all whitelist names: {body_text}"
+    );
+}
+
+#[tokio::test]
+async fn load_protected_networks_avoids_join_inversion_before_and_after_analyze() {
+    use tower::ServiceExt as _;
+
+    let db = bench_db_with_migrations(None).await;
+    let fx = seed_exclusion_join_benchmark(&db).await;
+    let (key, secret) = seed_bench_master_key(&db).await;
+    let (tx, _rx) = tokio::sync::mpsc::channel(256);
+    let state = simply_ip_vault::state::AppState::with_trusted_proxies(db.clone(), tx, Vec::new());
+    let app = simply_ip_vault::create_app(state);
+    let max_ban_budget = std::time::Duration::from_millis(50);
+
+    // 1. Empty ip_group_exclusions BEFORE ANALYZE
+    assert_load_protected_networks_query_plans(&db, &fx, "empty exclusions, pre-ANALYZE").await;
+    let t0 = Instant::now();
+    let res = app
+        .clone()
+        .oneshot(signed_ban_request(
+            &key,
+            &secret,
+            "203.10.20.5",
+            "ban-group-1",
+            0,
+        ))
+        .await
+        .unwrap();
+    let elapsed_empty_pre = t0.elapsed();
+    assert_eq!(res.status(), axum::http::StatusCode::OK);
+    assert!(
+        elapsed_empty_pre < max_ban_budget,
+        "POST /api/ban with 0 exclusions pre-ANALYZE took {elapsed_empty_pre:?}"
+    );
+
+    // 2. Empty ip_group_exclusions AFTER ANALYZE
+    db.execute_unprepared("ANALYZE").await.unwrap();
+    assert_load_protected_networks_query_plans(&db, &fx, "empty exclusions, post-ANALYZE").await;
+    let t1 = Instant::now();
+    let res = app
+        .clone()
+        .oneshot(signed_ban_request(
+            &key,
+            &secret,
+            "203.10.21.1",
+            "ban-group-1",
+            2,
+        ))
+        .await
+        .unwrap();
+    let elapsed_empty_post = t1.elapsed();
+    assert_eq!(res.status(), axum::http::StatusCode::OK);
+    assert!(
+        elapsed_empty_post < max_ban_budget,
+        "POST /api/ban with 0 exclusions post-ANALYZE took {elapsed_empty_post:?}"
+    );
+
+    // 3. Link 1 excluded whitelist (wl-alpha) on ban-group-1 (plus a bystander exclusion on ban-group-2),
+    //    test BEFORE and AFTER ANALYZE
+    let ban_group_2_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+    for gid in [fx.ban_group, ban_group_2_id] {
+        ip_group_exclusion::ActiveModel {
+            group_id: sea_orm::Set(gid),
+            excluded_group_id: sea_orm::Set(fx.wl_alpha),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+    }
+    assert_load_protected_networks_query_plans(&db, &fx, "1 exclusion, pre-ANALYZE").await;
+    db.execute_unprepared("ANALYZE").await.unwrap();
+    assert_load_protected_networks_query_plans(&db, &fx, "1 exclusion, post-ANALYZE").await;
+
+    assert_excluded_whitelist_ban_enforcement(&db, &app, &fx, &key, &secret).await;
 }

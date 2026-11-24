@@ -49,18 +49,16 @@ async fn fresh_db() -> DatabaseConnection {
 /// soft-deleted well past the retention window (the case its first delete targets). The rest are
 /// live.
 async fn seed(db: &DatabaseConnection) {
-    let now = simply_ip_vault::time_serde::now_utc();
-    let old = now - time::Duration::days(200);
     let stmts = [
         format!(
             "INSERT INTO ip_groups (id, name, group_type, description, owner_key_id, created_at)
              WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM g WHERE n < {GROUPS})
-             SELECT unhex(printf('%032x', n)), 'audit-group-' || n, 'banlist', NULL, NULL, '{now}' FROM g"
+             SELECT unhex(printf('%032x', n)), 'audit-group-' || n, 'banlist', NULL, NULL, datetime('now') FROM g"
         ),
         format!(
             "INSERT INTO ip_records (id, target_address, created_at)
              WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n < {RECORDS})
-             SELECT unhex(printf('%032x', n)), printf('203.%d.%d.%d', (n>>16)&255, (n>>8)&255, n&255), '{now}'
+             SELECT unhex(printf('%032x', n)), printf('203.%d.%d.%d', (n>>16)&255, (n>>8)&255, n&255), datetime('now')
              FROM s"
         ),
         // Live memberships: every record except the last ORPHANS of them.
@@ -69,9 +67,9 @@ async fn seed(db: &DatabaseConnection) {
                 (id, ip_record_id, group_id, is_locked, created_at, last_seen_at, is_deleted, deleted_at, deleted_by)
              WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n < {RECORDS} - {ORPHANS})
              SELECT unhex(printf('%032x', n + 1000000)), unhex(printf('%032x', n)), unhex(printf('%032x', (n % {GROUPS}) + 1)),
-                    0, '{now}', '{now}',
+                    0, datetime('now'), datetime('now'),
                     CASE WHEN n <= {SOFT_DELETED_AGED} THEN 1 ELSE 0 END,
-                    CASE WHEN n <= {SOFT_DELETED_AGED} THEN '{old}' ELSE NULL END,
+                    CASE WHEN n <= {SOFT_DELETED_AGED} THEN datetime('now', '-200 days') ELSE NULL END,
                     CASE WHEN n <= {SOFT_DELETED_AGED} THEN 'audit' ELSE NULL END
              FROM s"
         ),
